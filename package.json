@@ -1,0 +1,17 @@
+{
+  "name": "fsmcp",
+  "version": "1.0.0",
+  "description": "MCP server providing file system tools via stdio",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "glob": "^11.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
