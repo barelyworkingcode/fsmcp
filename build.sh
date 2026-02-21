@@ -10,11 +10,18 @@ npm ci
 echo "Building fsMCP..."
 npx tsc
 
+# Resolve node path at build time (GUI apps like Relay don't have nvm in PATH)
+NODE_BIN="$(command -v node)"
+if [ -z "$NODE_BIN" ]; then
+    echo "Error: node not found in PATH" >&2
+    exit 1
+fi
+
 # Create launcher script
 mkdir -p "$INSTALL_DIR"
 cat > "$INSTALL_DIR/fsmcp" << SCRIPT
 #!/bin/bash
-exec node "$SCRIPT_DIR/dist/main.js" "\$@"
+exec "$NODE_BIN" "$SCRIPT_DIR/dist/main.js" "\$@"
 SCRIPT
 chmod +x "$INSTALL_DIR/fsmcp"
 echo "Installed: $INSTALL_DIR/fsmcp"
