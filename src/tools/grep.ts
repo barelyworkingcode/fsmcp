@@ -23,7 +23,7 @@ export function registerGrep(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp('Regex pattern to search for'),
-          path: stringProp('File or directory to search in (defaults to cwd)'),
+          path: stringProp('File or directory to search in (defaults to allowed directories, or cwd if unrestricted)'),
           glob: stringProp("Glob to filter files (e.g. '*.ts')"),
           type: stringProp("File type filter (e.g. 'ts', 'js', 'py')"),
           output_mode: enumProp('Output mode', [
@@ -41,24 +41,34 @@ export function registerGrep(registry: ToolRegistry): void {
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const pattern = args.pattern as string;
-      const searchPath = (args.path as string) ?? process.cwd();
       const globFilter = args.glob as string | undefined;
       const typeFilter = args.type as string | undefined;
       const outputMode = (args.output_mode as string) ?? 'files_with_matches';
       const contextLines = args.context as number | undefined;
       const headLimit = args.head_limit as number | undefined;
 
-      const pathErr = validatePath(searchPath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
+      // Determine search paths ("." is treated as omitted)
+      let searchPaths: string[];
+      if (args.path && args.path !== '.') {
+        const p = args.path as string;
+        const pathErr = validatePath(p, ctx.allowedDirs);
+        if (pathErr) return errorResult(pathErr);
+        searchPaths = [p];
+      } else if (ctx.allowedDirs.length > 0) {
+        searchPaths = ctx.allowedDirs.filter((d) => fs.existsSync(d));
+        if (searchPaths.length === 0) return errorResult('none of the allowed directories exist');
+      } else {
+        searchPaths = [process.cwd()];
+      }
 
       if (rgAvailable) {
         return grepWithRg(
-          pattern, searchPath, globFilter, typeFilter,
+          pattern, searchPaths, globFilter, typeFilter,
           outputMode, contextLines, headLimit
         );
       }
       return grepFallback(
-        pattern, searchPath, globFilter, typeFilter,
+        pattern, searchPaths, globFilter, typeFilter,
         outputMode, contextLines, headLimit
       );
     }
@@ -67,7 +77,7 @@ export function registerGrep(registry: ToolRegistry): void {
 
 function grepWithRg(
   pattern: string,
-  searchPath: string,
+  searchPaths: string[],
   globFilter: string | undefined,
   typeFilter: string | undefined,
   outputMode: string,
@@ -95,7 +105,7 @@ function grepWithRg(
   if (typeFilter) rgArgs.push('--type', typeFilter);
   if (headLimit) rgArgs.push('--max-count', String(headLimit));
 
-  rgArgs.push('--', pattern, searchPath);
+  rgArgs.push('--', pattern, ...searchPaths);
 
   try {
     const output = execSync(rgArgs.join(' '), {
@@ -119,7 +129,7 @@ function grepWithRg(
 
 function grepFallback(
   pattern: string,
-  searchPath: string,
+  searchPaths: string[],
   globFilter: string | undefined,
   typeFilter: string | undefined,
   outputMode: string,
@@ -133,7 +143,7 @@ function grepFallback(
     return errorResult(`invalid regex: ${pattern}`);
   }
 
-  const files = walkFiles(searchPath, globFilter, typeFilter);
+  const files = searchPaths.flatMap((p) => walkFiles(p, globFilter, typeFilter));
   const results: string[] = [];
   let resultCount = 0;
 

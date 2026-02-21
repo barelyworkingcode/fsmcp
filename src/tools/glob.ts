@@ -16,7 +16,7 @@ export function registerGlob(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp("Glob pattern (e.g. '**/*.ts')"),
-          path: stringProp('Directory to search in (defaults to cwd)'),
+          path: stringProp('Directory to search in (defaults to allowed directories, or cwd if unrestricted)'),
         },
         ['pattern']
       ),
@@ -25,29 +25,43 @@ export function registerGlob(registry: ToolRegistry): void {
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const pattern = args.pattern as string;
-      const searchPath = (args.path as string) ?? process.cwd();
 
-      if (args.path && !path.isAbsolute(searchPath)) {
-        return errorResult('path must be absolute');
+      // Determine search directories ("." is treated as omitted)
+      let searchDirs: string[];
+      if (args.path && args.path !== '.') {
+        const p = args.path as string;
+        if (!path.isAbsolute(p)) return errorResult('path must be absolute');
+        const pathErr = validatePath(p, ctx.allowedDirs);
+        if (pathErr) return errorResult(pathErr);
+        if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
+        searchDirs = [p];
+      } else if (ctx.allowedDirs.length > 0) {
+        searchDirs = ctx.allowedDirs.filter((d) => fs.existsSync(d));
+        if (searchDirs.length === 0) return errorResult('none of the allowed directories exist');
+      } else {
+        searchDirs = [process.cwd()];
       }
 
-      const pathErr = validatePath(searchPath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
-
-      if (!fs.existsSync(searchPath)) {
-        return errorResult(`directory not found: ${searchPath}`);
-      }
-
-      let matches: string[];
-      try {
-        matches = globSync(pattern, { cwd: searchPath, absolute: true, nodir: true });
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return errorResult(`glob error: ${msg}`);
+      // Run glob against each directory and collect unique matches
+      const seen = new Set<string>();
+      const allMatches: string[] = [];
+      for (const dir of searchDirs) {
+        try {
+          const hits = globSync(pattern, { cwd: dir, absolute: true, nodir: true });
+          for (const h of hits) {
+            if (!seen.has(h)) {
+              seen.add(h);
+              allMatches.push(h);
+            }
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return errorResult(`glob error: ${msg}`);
+        }
       }
 
       // Sort by mtime descending
-      const withMtime = matches.map((f) => {
+      const withMtime = allMatches.map((f) => {
         try {
           return { path: f, mtime: fs.statSync(f).mtimeMs };
         } catch {
@@ -59,8 +73,8 @@ export function registerGlob(registry: ToolRegistry): void {
       const capped = withMtime.slice(0, MAX_RESULTS);
       const result = capped.map((f) => f.path).join('\n');
 
-      const suffix = matches.length > MAX_RESULTS
-        ? `\n\n(showing ${MAX_RESULTS} of ${matches.length} matches)`
+      const suffix = allMatches.length > MAX_RESULTS
+        ? `\n\n(showing ${MAX_RESULTS} of ${allMatches.length} matches)`
         : '';
 
       return textResult(result + suffix);
