@@ -70,8 +70,12 @@ Add to your MCP client config:
 }
 ```
 
-## Related Projects
+## Ecosystem
 
-- **[macMCP](../macMCP)** -- MCP server for macOS-native tools (calendar, contacts, mail, etc.)
-- **[Relay](../relay)** -- MCP orchestrator with per-token security and directory scoping
-- **[Eve](../eve)** -- Multi-provider LLM web interface
+fsMCP is part of the Relay ecosystem. Each project works independently, but together they provide LLMs with secure access to macOS.
+
+- **[Relay](https://github.com/barelyworkingcode/relay)** -- MCP orchestrator. Proxies fsMCP tools with per-token directory scoping.
+- **[macMCP](https://github.com/barelyworkingcode/macMCP)** -- Swift MCP server with 41 macOS-native tools. Complements fsMCP's file system tools.
+- **[Eve](https://github.com/barelyworkingcode/eve)** -- Browser-based LLM frontend.
+- **[relayLLM](https://github.com/barelyworkingcode/relayLLM)** -- LLM engine service.
+- **[relayScheduler](https://github.com/barelyworkingcode/relayScheduler)** -- Task scheduler for automated LLM prompts.

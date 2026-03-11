@@ -55,3 +55,10 @@ npm ci && npx tsc   # build
 5. Return via `textResult()` or `errorResult()` from types
 6. Accept `ToolContext` as second arg; call `validatePath()` for any file paths
 7. Import and call `registerFoo(registry)` in `main.ts`
+
+## Ecosystem
+
+fsMCP is part of the Relay ecosystem. It complements macMCP's macOS-native tools with file system operations.
+
+- `../relay/` -- MCP orchestrator. Proxies fsMCP tools through token-authenticated connections with per-token directory scoping.
+- `../macMCP/` -- Swift MCP server with 41 macOS-native tools. Complements fsMCP's file system tools.
