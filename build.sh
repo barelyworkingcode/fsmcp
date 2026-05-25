@@ -26,6 +26,12 @@ SCRIPT
 chmod +x "$INSTALL_DIR/fsmcp"
 echo "Installed: $INSTALL_DIR/fsmcp"
 
+# No codesign step: fsMCP runs as `node dist/main.js` via the launcher above.
+# The Mach-O process is node itself, not anything we ship, so codesign has
+# nothing meaningful to attach to. TCC will key any file-access prompts off
+# whatever cdhash your node binary happens to have (re-prompts on node upgrade);
+# bundling fsMCP into its own .app would be the only way to fix that.
+
 # Register with Relay (best-effort, relay may not be installed)
 RELAY="/Applications/Relay.app/Contents/MacOS/relay"
 if [ -x "$RELAY" ]; then

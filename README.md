@@ -29,6 +29,10 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 ./build.sh    # builds, installs to ~/.local/bin/fsmcp, registers with Relay
 ```
 
+### Code signing (note)
+
+fsMCP isn't codesigned because it runs as `node dist/main.js` via a shell launcher — the Mach-O process at runtime is `node` itself, not anything fsMCP ships. macOS TCC keys file-access prompts off the node binary's cdhash, so a node upgrade can trigger a one-time re-prompt for Files & Folders access. Bundling fsMCP into its own .app would be the only way to make those grants permanently rebuild-stable.
+
 ## Directory Scoping
 
 fsMCP restricts file operations to allowed directories. Two sources:
