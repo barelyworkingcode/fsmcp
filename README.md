@@ -40,11 +40,20 @@ fsMCP restricts file operations to allowed directories. Two sources:
 1. **Relay per-token context** -- Relay discovers fsMCP's `contextSchema` during handshake and renders directory configuration in the Settings UI per token. Configured directories are injected as `_meta.allowed_dirs` in tool calls.
 2. **CLI flags** -- `--allowed-dir /path` (repeatable) for standalone mode.
 
-If neither is configured, all paths are allowed.
+If neither is configured, every path-governed tool call (`fs_read`, `fs_write`,
+`fs_edit`, `fs_glob`, `fs_grep`, `fs_bash`) is refused. Emptiness is never
+read as "unrestricted" -- an absent or empty scope means deny, on both the
+CLI and the `_meta` side. Running `fsmcp` with no `--allowed-dir` and no
+Relay context is therefore a server that answers every call with an error,
+not one with the run of the filesystem.
 
 ```bash
 # Standalone with directory restriction
 fsmcp --allowed-dir /Users/me/projects/myapp
+
+# Standalone, deliberately unrestricted (must be spelled out explicitly --
+# there is no flag or default that means "no restriction")
+fsmcp --allowed-dir /
 ```
 
 ## Configuration
