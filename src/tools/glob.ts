@@ -20,7 +20,8 @@ export function registerGlob(registry: ToolRegistry): void {
         },
         ['pattern']
       ),
-      annotations: { readOnlyHint: true },
+      // Matches file names against the local filesystem only.
+      annotations: { readOnlyHint: true, openWorldHint: false },
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {

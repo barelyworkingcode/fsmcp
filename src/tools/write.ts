@@ -17,6 +17,9 @@ export function registerWrite(registry: ToolRegistry): void {
         },
         ['file_path', 'content']
       ),
+      // Creates/overwrites a local file; never contacts anything off this
+      // machine.
+      annotations: { readOnlyHint: false, openWorldHint: false },
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
