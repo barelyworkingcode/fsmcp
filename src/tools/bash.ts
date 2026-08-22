@@ -60,6 +60,14 @@ export function registerBash(registry: ToolRegistry): void {
         },
         ['command']
       ),
+      // Runs an arbitrary shell command, so it reaches outside this machine
+      // by construction: `curl`, `ssh`, `nc`, or anything else the command
+      // chooses to invoke can open a socket regardless of what any one
+      // invocation happens to do. openWorldHint is a property of what the
+      // call *can* reach, not of what a particular command did, so this is
+      // true unconditionally -- and it is also not read-only, whatever the
+      // command happens to be.
+      annotations: { readOnlyHint: false, openWorldHint: true },
       category: 'Shell',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {

@@ -81,7 +81,9 @@ export function registerGrep(registry: ToolRegistry): void {
         },
         ['pattern']
       ),
-      annotations: { readOnlyHint: true },
+      // Searches local files (ripgrep or the Node fallback), both confined
+      // to this machine's filesystem.
+      annotations: { readOnlyHint: true, openWorldHint: false },
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {

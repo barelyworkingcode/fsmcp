@@ -24,7 +24,8 @@ export function registerRead(registry: ToolRegistry): void {
         },
         ['file_path']
       ),
-      annotations: { readOnlyHint: true },
+      // Reads a local file only; never contacts anything off this machine.
+      annotations: { readOnlyHint: true, openWorldHint: false },
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext): ReturnType<typeof textResult> => {

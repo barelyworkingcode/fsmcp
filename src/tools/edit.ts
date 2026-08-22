@@ -19,6 +19,9 @@ export function registerEdit(registry: ToolRegistry): void {
         },
         ['file_path', 'old_string', 'new_string']
       ),
+      // Mutates a local file in place; never contacts anything off this
+      // machine.
+      annotations: { readOnlyHint: false, openWorldHint: false },
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
