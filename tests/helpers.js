@@ -13,9 +13,14 @@ const MAIN_JS = path.join(__dirname, '..', 'dist', 'main.js');
  * actually combine at the wire, not just how validatePath() behaves in
  * isolation.
  */
-function spawnServer(args = []) {
+function spawnServer(args = [], opts = {}) {
   const child = spawn(process.execPath, [MAIN_JS, ...args], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    // `env` lets a test put a stand-in executable early on PATH. fs_grep
+    // resolves `rg` through PATH in the *server* process, so this is the only
+    // way to observe the argv ripgrep is actually handed on a host that has
+    // no ripgrep installed.
+    env: opts.env ? { ...process.env, ...opts.env } : { ...process.env },
   });
 
   let nextId = 1;

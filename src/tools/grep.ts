@@ -1,14 +1,22 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, intProp, enumProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
-// Detect ripgrep at load time
+// Detect ripgrep at load time.
+//
+// execFileSync, not execSync: nothing in this file may reach a shell. The
+// probe's own arguments are constants and would have been harmless either
+// way, but a shell-running spawn sitting in the same file as the search is
+// how the search came to use one -- and it changes the answer, too. execSync
+// consults the user's shell, so an `rg` that is a shell function or alias
+// reports available and then is not there for the real search; execFileSync
+// resolves an executable on PATH, which is exactly what the search does.
 let rgAvailable = false;
 try {
-  execSync('rg --version', { stdio: 'pipe' });
+  execFileSync('rg', ['--version'], { stdio: 'pipe' });
   rgAvailable = true;
 } catch {
   // rg not installed
@@ -77,7 +85,34 @@ export function registerGrep(registry: ToolRegistry): void {
   );
 }
 
-function grepWithRg(
+/**
+ * Build ripgrep's argument vector.
+ *
+ * This returns an **argv array**, and it is the caller's contract that it is
+ * passed to `execFileSync` as one -- never joined into a string. Exported so
+ * the construction can be pinned by a test on a host with no ripgrep on it.
+ *
+ * `--` before the pattern stops *ripgrep* reading a pattern that begins with
+ * a dash as a flag. It says nothing about a shell and never did: this code
+ * used to hand `rgArgs.join(' ')` to `execSync`, which runs /bin/sh, so the
+ * caller-supplied `pattern` (and `glob`, and `type`) were shell source. A
+ * pattern of `hello; touch /tmp/pwned; echo done` became
+ *
+ *     rg -n -- hello; touch /tmp/pwned; echo done /some/allowed/dir
+ *
+ * -- three commands, of which ripgrep ran one. That is arbitrary command
+ * execution with no relation to `allowed_dirs`, from a tool annotated
+ * `readOnlyHint: true`, i.e. from the most restricted grant relay can issue.
+ * It did not fire on the development host only because the `rg` there is a
+ * shell function, so the old `execSync('rg --version')` probe reported it
+ * unavailable and the pure-Node fallback ran instead. That is a property of
+ * one machine, not a mitigation.
+ *
+ * The fix is not to quote or to escape: it is that no shell parses any of
+ * this. Every element below is one argv element, so a `;`, a backtick, a
+ * `$(...)` or a newline in a pattern reaches ripgrep as the text it is.
+ */
+export function buildRgArgs(
   pattern: string,
   searchPaths: string[],
   globFilter: string | undefined,
@@ -85,8 +120,8 @@ function grepWithRg(
   outputMode: string,
   contextLines: number | undefined,
   headLimit: number | undefined,
-) {
-  const rgArgs: string[] = ['rg'];
+): string[] {
+  const rgArgs: string[] = [];
 
   switch (outputMode) {
     case 'files_with_matches':
@@ -109,8 +144,25 @@ function grepWithRg(
 
   rgArgs.push('--', pattern, ...searchPaths);
 
+  return rgArgs;
+}
+
+function grepWithRg(
+  pattern: string,
+  searchPaths: string[],
+  globFilter: string | undefined,
+  typeFilter: string | undefined,
+  outputMode: string,
+  contextLines: number | undefined,
+  headLimit: number | undefined,
+) {
+  const rgArgs = buildRgArgs(
+    pattern, searchPaths, globFilter, typeFilter,
+    outputMode, contextLines, headLimit
+  );
+
   try {
-    const output = execSync(rgArgs.join(' '), {
+    const output = execFileSync('rg', rgArgs, {
       encoding: 'utf-8',
       timeout: 30000,
       maxBuffer: 10 * 1024 * 1024,
