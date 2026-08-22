@@ -22,6 +22,43 @@ try {
   // rg not installed
 }
 
+/**
+ * Wall-clock bound on a single fs_grep call, in milliseconds.
+ *
+ * Both search paths use it, so they behave alike: the ripgrep path passes it
+ * as execFileSync's `timeout`, the Node fallback checks it as it walks. It
+ * used to exist only on the ripgrep path, which left the fallback -- the path
+ * every host without ripgrep takes, including the one this was found on --
+ * with no bound at all.
+ *
+ * That is a process-wide hazard rather than a slow call. fsmcp is one
+ * synchronous stdio loop, so a search that does not return does not degrade
+ * itself; it takes every tool with it for every caller, the same shape as the
+ * deeply-nested MIME message that killed macmcp outright. And `pattern` is
+ * caller-supplied and compiled with `new RegExp`, so the caller chooses the
+ * work: `(a+)+$` against a few dozen non-matching characters backtracks for
+ * longer than the machine will be up.
+ *
+ * The pattern itself is deliberately NOT inspected. Catastrophic backtracking
+ * cannot be decided statically -- any heuristic refuses legitimate patterns
+ * and still misses crafted ones -- so the work is bounded and the input is
+ * not judged.
+ *
+ * FSMCP_GREP_TIMEOUT_MS overrides it. That is a test seam: it lets the
+ * truncation behaviour be pinned in milliseconds rather than by burning 30
+ * real seconds in the suite.
+ */
+export const GREP_TIMEOUT_MS = 30_000;
+
+export function grepBudgetMs(): number {
+  const raw = process.env.FSMCP_GREP_TIMEOUT_MS;
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return GREP_TIMEOUT_MS;
+}
+
 export function registerGrep(registry: ToolRegistry): void {
   registry.register(
     {
@@ -161,27 +198,76 @@ function grepWithRg(
     outputMode, contextLines, headLimit
   );
 
+  const budgetMs = grepBudgetMs();
+
   try {
     const output = execFileSync('rg', rgArgs, {
       encoding: 'utf-8',
-      timeout: 30000,
+      timeout: budgetMs,
       maxBuffer: 10 * 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     return textResult(output.trimEnd());
   } catch (err: unknown) {
+    const e = (err ?? {}) as {
+      status?: number | null;
+      code?: string;
+      stderr?: unknown;
+      stdout?: unknown;
+      message?: string;
+    };
+
     // rg exits 1 when no matches found
-    if (err && typeof err === 'object' && 'status' in err && (err as { status: number }).status === 1) {
+    if (e.status === 1) {
       return textResult('No matches found.');
     }
-    const stderr = err && typeof err === 'object' && 'stderr' in err
-      ? String((err as { stderr: unknown }).stderr)
-      : String(err);
-    return errorResult(`grep error: ${stderr}`);
+
+    // A timeout kills rg with SIGTERM, so `status` is null (never 1) and
+    // whatever rg had already written is on `e.stdout`. That partial is
+    // discarded rather than returned: it is a prefix of an answer with no way
+    // to say so on this path, and returning it would make "these are the
+    // matches" and "these are the matches I got to" the same reply. What was
+    // missing is that the caller was told any of it -- rg writes nothing to
+    // stderr when it is killed, so this used to return the string
+    // "grep error: " and nothing else.
+    if (e.code === 'ETIMEDOUT') {
+      const partial = typeof e.stdout === 'string' && e.stdout.length > 0
+        ? ` Partial output (${e.stdout.length} bytes) was discarded because it cannot be `
+          + `distinguished from a complete result.`
+        : '';
+      return errorResult(
+        `grep timed out after ${budgetMs}ms and was stopped.${partial} Narrow the search `
+          + `with path, glob or type, or simplify the pattern.`
+      );
+    }
+
+    // Any other failure. stderr first, but it is empty for a whole class of
+    // spawn failures, and an error message with nothing in it is the one
+    // thing this must not produce.
+    const stderr = typeof e.stderr === 'string' ? e.stderr.trim() : '';
+    const detail = stderr || e.message || String(err);
+    return errorResult(`grep error: ${detail}`);
   }
 }
 
-function grepFallback(
+/**
+ * The pure-Node search, used on any host without ripgrep on PATH.
+ *
+ * `budgetMs` bounds the whole call in wall-clock time and defaults to the
+ * same budget the ripgrep path spends. The deadline is checked between files
+ * and between lines, which is the only place it CAN be checked: JavaScript
+ * offers no way to interrupt a regex mid-match, so `regex.test(line)` runs to
+ * completion however long it takes. A single catastrophically-backtracking
+ * match against one very long line therefore still overruns the bound, and
+ * this comment is the honest statement of that -- the bound stops the search
+ * from continuing, it does not stop a match in progress. What it does buy is
+ * that the pathological case is one line's worth of overrun instead of
+ * unbounded: without it, the same pattern kept matching against every line of
+ * every file for as long as the process lived.
+ *
+ * Exported so a test can hand it a small budget directly.
+ */
+export function grepFallback(
   pattern: string,
   searchPaths: string[],
   globFilter: string | undefined,
@@ -189,7 +275,11 @@ function grepFallback(
   outputMode: string,
   contextLines: number | undefined,
   headLimit: number | undefined,
+  budgetMs: number = grepBudgetMs(),
 ) {
+  const deadline = Date.now() + budgetMs;
+  const expired = () => Date.now() >= deadline;
+
   let regex: RegExp;
   try {
     regex = new RegExp(pattern);
@@ -197,12 +287,23 @@ function grepFallback(
     return errorResult(`invalid regex: ${pattern}`);
   }
 
-  const files = searchPaths.flatMap((p) => walkFiles(p, globFilter, typeFilter));
+  // The walk is inside the budget too: enumerating a very large tree is its
+  // own way to not come back, and a file list that is itself a floor must not
+  // be reported as "N of M".
+  const files = searchPaths.flatMap((p) => walkFiles(p, globFilter, typeFilter, deadline));
+  const walkTruncated = expired();
+
   const results: string[] = [];
   let resultCount = 0;
+  let filesSearched = 0;
+  let stopped = walkTruncated;
 
   for (const file of files) {
     if (headLimit && resultCount >= headLimit) break;
+    if (expired()) {
+      stopped = true;
+      break;
+    }
 
     let content: string;
     try {
@@ -211,42 +312,80 @@ function grepFallback(
       continue;
     }
 
+    filesSearched++;
     const lines = content.split('\n');
     const matchingLines: number[] = [];
 
     for (let i = 0; i < lines.length; i++) {
+      if (expired()) {
+        stopped = true;
+        break;
+      }
       if (regex.test(lines[i])) {
         matchingLines.push(i);
       }
     }
 
-    if (matchingLines.length === 0) continue;
-
-    switch (outputMode) {
-      case 'files_with_matches':
-        results.push(file);
-        resultCount++;
-        break;
-      case 'count':
-        results.push(`${file}:${matchingLines.length}`);
-        resultCount++;
-        break;
-      case 'content': {
-        const ctx = contextLines ?? 0;
-        const shown = new Set<number>();
-        for (const lineIdx of matchingLines) {
-          for (let j = Math.max(0, lineIdx - ctx); j <= Math.min(lines.length - 1, lineIdx + ctx); j++) {
-            shown.add(j);
+    // Matches found before the deadline are real matches and are reported,
+    // even if this file was only partly searched.
+    if (matchingLines.length > 0) {
+      switch (outputMode) {
+        case 'files_with_matches':
+          results.push(file);
+          resultCount++;
+          break;
+        case 'count':
+          results.push(`${file}:${matchingLines.length}`);
+          resultCount++;
+          break;
+        case 'content': {
+          const ctx = contextLines ?? 0;
+          const shown = new Set<number>();
+          for (const lineIdx of matchingLines) {
+            for (let j = Math.max(0, lineIdx - ctx); j <= Math.min(lines.length - 1, lineIdx + ctx); j++) {
+              shown.add(j);
+            }
           }
+          const sortedLines = [...shown].sort((a, b) => a - b);
+          for (const idx of sortedLines) {
+            results.push(`${file}:${idx + 1}:${lines[idx]}`);
+          }
+          resultCount += matchingLines.length;
+          break;
         }
-        const sortedLines = [...shown].sort((a, b) => a - b);
-        for (const idx of sortedLines) {
-          results.push(`${file}:${idx + 1}:${lines[idx]}`);
-        }
-        resultCount += matchingLines.length;
-        break;
       }
     }
+
+    if (stopped) break;
+  }
+
+  if (stopped) {
+    // A search that stopped early and one that finished having found nothing
+    // must not give the same answer. "No matches found." is a claim about
+    // every file in scope; this call cannot make it.
+    const scope = walkTruncated
+      ? `at least ${files.length} files (the file list was itself cut short)`
+      : `${files.length} files`;
+
+    if (filesSearched === 0) {
+      return errorResult(
+        `grep stopped after ${budgetMs}ms without finishing a single file, so nothing can `
+          + `be reported about ${scope}. Narrow the search with path, glob or type, or `
+          + `simplify the pattern.`
+      );
+    }
+
+    const note =
+      `[fsmcp: search stopped after ${budgetMs}ms, having searched ${filesSearched} of `
+      + `${scope}. These results are a floor, not a complete answer: a file that was not `
+      + `searched may still match.]`;
+
+    if (results.length === 0) {
+      return textResult(
+        `No matches in the ${filesSearched} file(s) searched before the search stopped.\n${note}`
+      );
+    }
+    return textResult(`${results.join('\n')}\n\n${note}`);
   }
 
   if (results.length === 0) {
@@ -260,6 +399,7 @@ function walkFiles(
   dir: string,
   globFilter: string | undefined,
   typeFilter: string | undefined,
+  deadline: number,
 ): string[] {
   const results: string[] = [];
 
@@ -273,6 +413,8 @@ function walkFiles(
   const typeExt = typeFilter ? `.${typeFilter}` : undefined;
 
   function walk(current: string): void {
+    if (Date.now() >= deadline) return;
+
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
@@ -281,6 +423,7 @@ function walkFiles(
     }
 
     for (const entry of entries) {
+      if (Date.now() >= deadline) return;
       const fullPath = path.join(current, entry.name);
 
       // Skip hidden dirs and node_modules

@@ -30,36 +30,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { spawnServer } = require('./helpers');
+const { spawnServer, makeFakeRg, readArgvLog } = require('./helpers');
 const { buildRgArgs } = require('../dist/tools/grep');
-
-/**
- * A stand-in for ripgrep, early on PATH. It answers `--version` (so fsmcp's
- * load-time probe reports ripgrep available and the rg path is the one under
- * test) and otherwise appends its argv, as JSON, to $FAKE_RG_LOG.
- *
- * Written as a node script with an absolute shebang so it does not depend on
- * a shell or on `env` resolution.
- */
-function makeFakeRg(dir) {
-  const bin = path.join(dir, 'bin');
-  fs.mkdirSync(bin, { recursive: true });
-  const log = path.join(dir, 'rg-argv.log');
-  const script = `#!${process.execPath}
-const fs = require('fs');
-const argv = process.argv.slice(2);
-if (argv[0] === '--version') {
-  console.log('ripgrep 99.9.9 (test stand-in)');
-  process.exit(0);
-}
-fs.appendFileSync(process.env.FAKE_RG_LOG, JSON.stringify(argv) + '\\n');
-console.log('fake-rg-ran');
-`;
-  const rg = path.join(bin, 'rg');
-  fs.writeFileSync(rg, script);
-  fs.chmodSync(rg, 0o755);
-  return { bin, log };
-}
 
 function mkFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-inj-'));
@@ -69,15 +41,6 @@ function mkFixture() {
   const { bin, log } = makeFakeRg(root);
   const canary = path.join(root, 'CANARY-INJECTION');
   return { root, allowed, bin, log, canary };
-}
-
-function readArgvLog(log) {
-  if (!fs.existsSync(log)) return [];
-  return fs
-    .readFileSync(log, 'utf-8')
-    .split('\n')
-    .filter((l) => l.trim())
-    .map((l) => JSON.parse(l));
 }
 
 async function grepWithFakeRg(fx, args) {
