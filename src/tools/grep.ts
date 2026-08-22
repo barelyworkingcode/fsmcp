@@ -3,7 +3,7 @@ import * as path from 'path';
 import { execSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, intProp, enumProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
 // Detect ripgrep at load time
 let rgAvailable = false;
@@ -23,7 +23,7 @@ export function registerGrep(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp('Regex pattern to search for'),
-          path: stringProp('File or directory to search in (defaults to allowed directories, or cwd if unrestricted)'),
+          path: stringProp('File or directory to search in (defaults to all allowed directories)'),
           glob: stringProp("Glob to filter files (e.g. '*.ts')"),
           type: stringProp("File type filter (e.g. 'ts', 'js', 'py')"),
           output_mode: enumProp('Output mode', [
@@ -58,7 +58,9 @@ export function registerGrep(registry: ToolRegistry): void {
         searchPaths = ctx.allowedDirs.filter((d) => fs.existsSync(d));
         if (searchPaths.length === 0) return errorResult('none of the allowed directories exist');
       } else {
-        searchPaths = [process.cwd()];
+        // No allowed dirs configured: an absent path must resolve to the
+        // (empty) scope, not to an unrestricted cwd fallback.
+        return errorResult(NO_ALLOWED_DIRS_MESSAGE);
       }
 
       if (rgAvailable) {

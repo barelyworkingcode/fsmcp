@@ -33,7 +33,7 @@ Entry point reads stdin line-by-line, dispatches to `ToolRegistry`, writes JSON 
 - **Tool = module** with `export function register(registry: ToolRegistry)`. Handler signature: `(args, ctx) => MCPCallResult`.
 - **ToolContext** carries `allowedDirs` merged from `_meta` (Relay per-token) and `--allowed-dir` CLI flags.
 - **contextSchema** declared in `initialize` response's `serverInfo`. Relay reads this during discovery and renders the appropriate UI for configuring per-token context (e.g. allowed_dirs). Schema fields have `type`, `description`, and `ui` hint.
-- **security.ts** validates paths via `validatePath()` -- resolves symlinks, checks prefix against allowed dirs. Empty allowed dirs = no restrictions.
+- **security.ts** validates paths via `validatePath()` -- resolves symlinks, checks prefix against allowed dirs. Empty allowed dirs = refuse everything (fail closed, not "no restrictions"); an operator who wants unrestricted access passes `--allowed-dir /` explicitly.
 - **fs_grep** shells out to `rg` if available, falls back to recursive readdir + RegExp.
 - **fs_bash** persists cwd via `___FSMCP_CWD___$(pwd)` marker appended to commands.
 - **fs_edit** uses `split().join()` for literal matching (no regex special char issues).

@@ -3,7 +3,7 @@ import * as path from 'path';
 import { globSync } from 'glob';
 import { ToolRegistry, schema, stringProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
 const MAX_RESULTS = 1000;
 
@@ -16,7 +16,7 @@ export function registerGlob(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp("Glob pattern (e.g. '**/*.ts')"),
-          path: stringProp('Directory to search in (defaults to allowed directories, or cwd if unrestricted)'),
+          path: stringProp('Directory to search in (defaults to all allowed directories)'),
         },
         ['pattern']
       ),
@@ -39,7 +39,9 @@ export function registerGlob(registry: ToolRegistry): void {
         searchDirs = ctx.allowedDirs.filter((d) => fs.existsSync(d));
         if (searchDirs.length === 0) return errorResult('none of the allowed directories exist');
       } else {
-        searchDirs = [process.cwd()];
+        // No allowed dirs configured: an absent path must resolve to the
+        // (empty) scope, not to an unrestricted cwd fallback.
+        return errorResult(NO_ALLOWED_DIRS_MESSAGE);
       }
 
       // Run glob against each directory and collect unique matches
