@@ -44,17 +44,27 @@ export function registerGlob(registry: ToolRegistry): void {
         return errorResult(NO_ALLOWED_DIRS_MESSAGE);
       }
 
-      // Run glob against each directory and collect unique matches
+      // Run glob against each directory and collect unique matches.
+      //
+      // Every hit is re-validated rather than trusted for being a descendant
+      // of a directory that was itself validated: the pattern chooses which
+      // entries are walked, so a symlink inside an allowed directory that
+      // points outside it comes back as an in-scope-looking path. Measured --
+      // with `link -> <outside>` inside the allowed dir, `linkdir/*` returned
+      // `<allowed>/linkdir/secret.txt` and `**/*` listed a symlink-to-file
+      // whose bytes live outside. fs_read of those paths is refused, so this
+      // was disclosure of names rather than contents, but the scope a caller
+      // is shown must be the scope they actually have.
       const seen = new Set<string>();
       const allMatches: string[] = [];
       for (const dir of searchDirs) {
         try {
           const hits = globSync(pattern, { cwd: dir, absolute: true, nodir: true });
           for (const h of hits) {
-            if (!seen.has(h)) {
-              seen.add(h);
-              allMatches.push(h);
-            }
+            if (seen.has(h)) continue;
+            seen.add(h);
+            if (validatePath(h, ctx.allowedDirs)) continue; // resolves outside
+            allMatches.push(h);
           }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);

@@ -130,3 +130,93 @@ test('server with --allowed-dir / (explicit opt-out)', async (t) => {
     assert.match(result.content[0].text, /reachable from anywhere/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Symlink escape, end to end over stdio against a real dist/main.js.
+//
+// The unit cases in security.test.js pin validatePath; these pin the thing a
+// caller actually observes -- that fs_write refuses, and that no file appears
+// outside the allowed directory afterwards. The tool's own success sentence is
+// not the ground truth here, the filesystem is: the original bug reported
+// "Wrote 27 bytes to <allowed>/link/ESCAPED.txt" for a file it had created
+// outside the sandbox.
+//
+// The root is realpath'd because os.tmpdir() is reached through the
+// /var -> /private/var symlink on macOS; without it every path here would be
+// refused for the wrong reason and the tests would pass without testing
+// anything.
+// ---------------------------------------------------------------------------
+
+function mkLinkFixture() {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-esc-')));
+  const allowed = path.join(root, 'allowed');
+  const outside = path.join(root, 'outside');
+  fs.mkdirSync(allowed, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  fs.writeFileSync(path.join(outside, 'existing.txt'), 'pre-existing secret');
+  fs.symlinkSync(outside, path.join(allowed, 'link'));
+  return { root, allowed, outside };
+}
+
+test('a symlink out of an allowed dir is not a way out of it', async (t) => {
+  const { allowed, outside } = mkLinkFixture();
+  const server = spawnServer(['--allowed-dir', allowed]);
+  t.after(() => server.close());
+
+  await t.test('fs_write to a NEW file through the symlink is refused and writes nothing', async () => {
+    const target = path.join(allowed, 'link', 'ESCAPED.txt');
+    const result = await server.callTool('fs_write', { file_path: target, content: 'escaped!' });
+    assert.equal(result.isError, true, 'fs_write must refuse');
+    assert.match(result.content[0].text, /outside allowed directories/i);
+    assert.equal(
+      fs.existsSync(path.join(outside, 'ESCAPED.txt')),
+      false,
+      'nothing may appear outside the allowed directory'
+    );
+    assert.deepEqual(
+      fs.readdirSync(outside).sort(),
+      ['existing.txt'],
+      'the outside directory must be untouched'
+    );
+  });
+
+  await t.test('fs_read of an existing file through the symlink is refused', async () => {
+    const result = await server.callTool('fs_read', {
+      file_path: path.join(allowed, 'link', 'existing.txt'),
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /outside allowed directories/i);
+    assert.doesNotMatch(result.content[0].text, /pre-existing secret/);
+  });
+
+  await t.test('fs_edit through the symlink is refused', async () => {
+    const result = await server.callTool('fs_edit', {
+      file_path: path.join(allowed, 'link', 'existing.txt'),
+      old_string: 'secret',
+      new_string: 'edited',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /outside allowed directories/i);
+    assert.equal(
+      fs.readFileSync(path.join(outside, 'existing.txt'), 'utf-8'),
+      'pre-existing secret',
+      'the file outside must be unmodified'
+    );
+  });
+
+  await t.test('fs_glob does not report paths that resolve outside the allowed dir', async () => {
+    const result = await server.callTool('fs_glob', { pattern: 'link/*' });
+    assert.equal(result.isError, undefined);
+    assert.doesNotMatch(result.content[0].text, /existing\.txt/);
+  });
+
+  // Positive control: the refusals above must not be the server refusing
+  // everything. A legitimate new file inside the allowed dir still writes.
+  await t.test('a legitimate new file inside the allowed dir still writes', async () => {
+    const legit = path.join(allowed, 'nested', 'legit.txt');
+    const result = await server.callTool('fs_write', { file_path: legit, content: 'fine' });
+    assert.equal(result.isError, undefined, result.content[0].text);
+    assert.match(result.content[0].text, /Wrote 4 bytes/);
+    assert.equal(fs.readFileSync(legit, 'utf-8'), 'fine');
+  });
+});
