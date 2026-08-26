@@ -1,3 +1,5 @@
 /fsmcp
 /dist/
 *.test
+__pycache__/
+*.pyc
