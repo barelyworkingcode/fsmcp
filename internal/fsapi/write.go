@@ -92,7 +92,7 @@ func handleWrite(root *Root, rawArgs json.RawMessage) *proto.CallToolResult {
 		return proto.NewErrorResult(proto.ErrInvalidArgument, decodeErr.Error(), normalized)
 	}
 
-	if _, failure := checkPrecondition(root, normalized, kind, hash); failure != nil {
+	if failure := checkPrecondition(root, normalized, kind, hash); failure != nil {
 		return failure
 	}
 

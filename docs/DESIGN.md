@@ -172,6 +172,13 @@ returns `sha256` for regular files, so a caller can obtain a precondition
 **without reading the file** — which is what makes editing a 50 MB file
 possible without transferring it.
 
+fsMCP verifies the precondition the same way: **streamed, not read**, wherever
+the content is not otherwise wanted. `fs_write` replaces the bytes and
+`fs_delete` unlinks them, so neither has any use for what was there — reading a
+file to produce a digest that is compared and discarded costs memory
+proportional to its size for nothing. `fs_replace` is the exception, and holds
+the content because it edits it.
+
 ## Tools
 
 Ten tools. `readOnlyHint: true` on the first five; `--read-only` registers only

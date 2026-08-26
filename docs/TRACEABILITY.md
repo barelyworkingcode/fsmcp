@@ -54,6 +54,7 @@ nothing covers it. Every row below is the state *after* this pass; the
 | C8 | no temp file survives any failure path | `TestAtomicReplaceNoTempFileLeftAfterSuccess`, `TestAtomicReplaceNoTempFileLeftAfterAttrFailure`, `TestAtomicReplaceRefusesUndeletableTarget`, `TestAtomicReplaceWritePartwayFailureLeavesOriginalIntact` | covered | covered |
 | C9 | file-flag target refused, naming chflags | `TestAtomicReplaceDistinguishesAFileFlagFromAnACL`, `TestWriteNamesTheRightRemedyForEachCause` | **missing** — only the ACL cause was planted, so both shared one diagnosis | covered |
 | C10 | file flags not preserved across a replace | `TestAtomicReplaceDoesNotPreserveFileFlags` | **missing** | covered |
+| C11 | precondition streamed, not read | `TestCheckPreconditionDoesNotAllocateTheWholeFile`, `TestCheckPrecondition` | **missing** | covered |
 
 Hard-link-breaks-on-replace ("known and deliberate", not independently
 numbered) is pinned by `TestAtomicReplaceBreaksHardLink`.

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -346,49 +347,98 @@ func TestParsePrecondition(t *testing.T) {
 	}
 }
 
+// Both precondition entry points share one body, so every case is asserted
+// through both: they must agree on every refusal, and differ only in whether
+// the content comes back.
 func TestCheckPrecondition(t *testing.T) {
 	root, _ := newTestRoot(t)
 	fileHash := sha256Hex(t, []byte("hello")) // matches file.txt's fixture content
 
-	t.Run("existing file, matching hash", func(t *testing.T) {
-		data, failure := checkPrecondition(root, "file.txt", preconditionHash, fileHash)
-		if failure != nil {
+	cases := []struct {
+		name      string
+		path      string
+		kind      preconditionKind
+		hash      string
+		wantCode  string // "" means the precondition is satisfied
+		wantBytes string // what readWithPrecondition must return on success
+	}{
+		{"existing file, matching hash", "file.txt", preconditionHash, fileHash, "", "hello"},
+		{"existing file, wrong hash", "file.txt", preconditionHash, strings.Repeat("0", 64), "precondition_failed", ""},
+		{"existing file, null precondition", "file.txt", preconditionCreate, "", "exists", ""},
+		{"missing file, null precondition", "nope.txt", preconditionCreate, "", "", ""},
+		{"missing file, hash precondition", "nope.txt", preconditionHash, fileHash, "not_found", ""},
+		{"directory target", "sub", preconditionHash, fileHash, "not_a_file", ""},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			failure := checkPrecondition(root, c.path, c.kind, c.hash)
+			data, readFailure := readWithPrecondition(root, c.path, c.kind, c.hash)
+
+			if c.wantCode == "" {
+				if failure != nil {
+					t.Errorf("checkPrecondition: unexpected failure: %+v", failure)
+				}
+				if readFailure != nil {
+					t.Errorf("readWithPrecondition: unexpected failure: %+v", readFailure)
+				}
+				if string(data) != c.wantBytes {
+					t.Errorf("readWithPrecondition data = %q, want %q", data, c.wantBytes)
+				}
+				return
+			}
+			assertErrorCode(t, failure, c.wantCode)
+			assertErrorCode(t, readFailure, c.wantCode)
+			if data != nil {
+				t.Errorf("readWithPrecondition returned %q alongside a refusal", data)
+			}
+		})
+	}
+}
+
+// The whole point of the split: verifying if_sha256 for fs_write and fs_delete
+// must not cost memory proportional to the file. Asserted as allocation
+// volume rather than wall time, because the cost being removed is the
+// allocation — a 1.5 GB target measured 1508 MB peak RSS through the reading
+// path and 6 MB through the streaming one.
+func TestCheckPreconditionDoesNotAllocateTheWholeFile(t *testing.T) {
+	const size = 32 << 20 // 32 MiB: large enough that reading it dwarfs the noise
+	root, rootDir := newTestRoot(t)
+	body := bytes.Repeat([]byte("x"), size)
+	if err := os.WriteFile(filepath.Join(rootDir, "big.bin"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256Hex(t, body)
+
+	allocatedBy := func(fn func()) uint64 {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		fn()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	streamed := allocatedBy(func() {
+		if failure := checkPrecondition(root, "big.bin", preconditionHash, hash); failure != nil {
 			t.Fatalf("unexpected failure: %+v", failure)
 		}
-		if string(data) != "hello" {
-			t.Errorf("data = %q, want %q", data, "hello")
-		}
 	})
-
-	t.Run("existing file, wrong hash", func(t *testing.T) {
-		_, failure := checkPrecondition(root, "file.txt", preconditionHash, strings.Repeat("0", 64))
-		assertErrorCode(t, failure, "precondition_failed")
-	})
-
-	t.Run("existing file, null precondition", func(t *testing.T) {
-		_, failure := checkPrecondition(root, "file.txt", preconditionCreate, "")
-		assertErrorCode(t, failure, "exists")
-	})
-
-	t.Run("missing file, null precondition", func(t *testing.T) {
-		data, failure := checkPrecondition(root, "nope.txt", preconditionCreate, "")
-		if failure != nil {
+	read := allocatedBy(func() {
+		if _, failure := readWithPrecondition(root, "big.bin", preconditionHash, hash); failure != nil {
 			t.Fatalf("unexpected failure: %+v", failure)
 		}
-		if data != nil {
-			t.Errorf("data = %v, want nil", data)
-		}
 	})
 
-	t.Run("missing file, hash precondition", func(t *testing.T) {
-		_, failure := checkPrecondition(root, "nope.txt", preconditionHash, fileHash)
-		assertErrorCode(t, failure, "not_found")
-	})
+	t.Logf("checkPrecondition allocated %d KiB; readWithPrecondition allocated %d KiB (file is %d KiB)",
+		streamed>>10, read>>10, size>>10)
 
-	t.Run("directory target", func(t *testing.T) {
-		_, failure := checkPrecondition(root, "sub", preconditionHash, fileHash)
-		assertErrorCode(t, failure, "not_a_file")
-	})
+	if streamed >= size {
+		t.Errorf("checkPrecondition allocated %d bytes for a %d byte file — it is reading the file, not streaming it", streamed, size)
+	}
+	if read < size {
+		t.Errorf("readWithPrecondition allocated %d bytes for a %d byte file — it is expected to hold the content", read, size)
+	}
 }
 
 // TestAtomicReplaceRefusesUndeletableTarget pins the refusal rather than a

@@ -79,6 +79,7 @@ from a self-move.
 | C8 | no temp file survives any failure path | directory listing clean after each |
 | C9 | a target protected by a **file flag** (`uchg`/`uappnd`) | refused, file unchanged, and the refusal names `chflags` — never a deny-delete ACL entry the file does not have |
 | C10 | BSD file flags across a successful replace | **not preserved** — a stated non-guarantee, since `cp -pN`'s `-N` is what stops a copied `uchg` stranding fsMCP's own temp file |
+| C11 | `if_sha256` on a very large file | verified by streaming for `fs_write`/`fs_delete`; memory does not scale with the file |
 
 **Known and deliberate:** a replace breaks a hard link to the target (new
 inode). Assert it rather than fix it — the alternative is in-place truncation,

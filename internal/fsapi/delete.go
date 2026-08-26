@@ -2,8 +2,6 @@ package fsapi
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io/fs"
 
@@ -127,13 +125,15 @@ func verifyDeleteHash(root *Root, p string, fi fs.FileInfo, wantHash string) *pr
 	if !fi.Mode().IsRegular() {
 		return proto.NewErrorResult(proto.ErrNotAFile, "not a regular file", p)
 	}
-	data, err := root.ReadFile(p)
+	// Streamed, not read: the bytes are about to be unlinked, so holding the
+	// whole file to produce a digest that is compared and dropped costs memory
+	// proportional to the file for nothing.
+	sum, err := hashFile(root, p)
 	if err != nil {
 		return Fail(err, p)
 	}
-	sum := sha256.Sum256(data)
-	if hex.EncodeToString(sum[:]) != wantHash {
-		return proto.NewErrorResult(proto.ErrPreconditionFailed, "if_sha256 does not match the file's current contents", p)
+	if sum != wantHash {
+		return preconditionMismatch(p)
 	}
 	return nil
 }

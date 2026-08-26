@@ -101,7 +101,7 @@ func handleReplace(root *Root, rawArgs json.RawMessage) *proto.CallToolResult {
 		return proto.NewErrorResult(proto.ErrInvalidArgument, `"edits" must be a non-empty array`, normalized)
 	}
 
-	current, failure := checkPrecondition(root, normalized, kind, hash)
+	current, failure := readWithPrecondition(root, normalized, kind, hash)
 	if failure != nil {
 		return failure
 	}
