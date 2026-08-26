@@ -22,6 +22,12 @@ export interface MCPContent {
 export interface MCPCallResult {
   content: MCPContent[];
   isError?: boolean;
+  // Optional, and rare: the only current use is `{ scope_violation: true }`
+  // (see scopeViolationResult below) so relay's audit log can tell "the
+  // sandbox refused this" apart from every other kind of tool_error without
+  // parsing the human-readable message text. Nothing else in this codebase
+  // sets it.
+  _meta?: Record<string, unknown>;
 }
 
 export interface ToolContext {
@@ -34,4 +40,25 @@ export function textResult(text: string): MCPCallResult {
 
 export function errorResult(message: string): MCPCallResult {
   return { content: [{ type: 'text', text: message }], isError: true };
+}
+
+/**
+ * A refusal specifically because the requested path -- or the absence of any
+ * configured scope at all -- falls outside allowed_dirs, as distinct from a
+ * refusal for any other reason (invalid regex, file not found, a NUL byte in
+ * a path). Relay's audit reads `_meta.scope_violation` (or the namespaced
+ * `_meta["relay/scope_violation"]`) off a `tool_error` result and records it
+ * as a field on that outcome, not a distinct outcome of its own
+ * (`audit_call.go:261`, `audit_call.go:294-348`) -- so this is the one piece
+ * of vocabulary that lets an operator's audit log tell "the sandbox held"
+ * apart from "the tool broke." It must be set on every "you asked for
+ * something outside your scope" refusal, and set on nothing else: a plain
+ * "file not found" is still just `errorResult`.
+ */
+export function scopeViolationResult(message: string): MCPCallResult {
+  return {
+    content: [{ type: 'text', text: message }],
+    isError: true,
+    _meta: { scope_violation: true },
+  };
 }
