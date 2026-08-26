@@ -134,6 +134,10 @@ during the write is roughly the old file's size plus the new one's, so a
 volume sized with no headroom to spare for its largest file can start
 seeing `ENOSPC` on writes that used to fit.
 
+That temp file is what makes the grant root itself an invalid target for a
+write -- see "The grant root is not a writable target" below.
+
+
 ## Virtual Path Space
 
 A client never sees a host path, in either direction. It addresses files in a
@@ -247,6 +251,55 @@ that surface; see the note in CLAUDE.md. Whether the description relay writes ca
 is a property of the relay in front of it, and is worth checking with
 `relayremote list --schema` on the deployment you actually run (plain
 `list` truncates the description, which is where the note lives).
+
+### The grant root is not a writable target
+
+A path that resolves to an allowed directory *itself* -- rather than to
+something inside it -- is refused by every tool that writes, creates or
+replaces something at it: `fs_write`, `fs_edit`, `fs_mkdir`, and `fs_move`'s
+destination. The refusal is a scope violation, flagged as such in the audit
+log:
+
+```
+fs_write { "file_path": "/d0", "content": "..." }
+-> refusing to write to an allowed_dir root: /d0
+```
+
+The check runs on the *resolved* path, so `/d0`, `/d0/`, `/d0/.`,
+`/d0/notes/..` and an in-scope symlink pointing back at the root are all the
+same case, not four near-misses of a string comparison.
+
+This is not tidiness about a call that could not have worked anyway. The
+containment check passes for a grant root -- a root is inside itself, which
+is the right answer to the question it asks -- and the tools then derive a
+*sibling* of the target, which for a root means the directory **above** the
+sandbox:
+
+- the atomic-write temp file described above is
+  `<dirname of target>/.<basename>.fsmcp-tmp-<random>`;
+- `fs_write` creates the target's parent directories before that;
+- `fs_mkdir` creates every missing ancestor of its argument.
+
+Pointed at the root, all three of those reach outside the grant. Measured on
+the version before this rule existed: a single `fs_write` at the root put
+5,000,000 bytes of caller-chosen content into the grant's parent directory,
+with only the closing rename failing once the bytes were already on disk
+there, and `fs_mkdir` at a not-yet-created root created the parent and
+reported plain success. The temp file was usually unlinked on the way out,
+which is not the same as never having been written: the cleanup does not run
+if the process is killed, the size is the caller's choice, and on a real
+machine the directory in question is something like `~/Documents`.
+
+The deleting half of the same rule is older and still there: `fs_delete`
+refuses to remove an allowed directory root, and so does `fs_move`'s
+`overwrite`. It is worded identically ("refusing to delete an allowed_dir
+root") but is *not* flagged as a scope violation, because removing the root
+would only ever have removed something inside the grant -- that refusal is
+"the sandbox must survive its occupant", not "you addressed something
+outside your scope".
+
+Writing *inside* the root is unaffected, including when the grant's parent
+directory is not writable at all.
 
 ### A symlink out of the sandbox is refused, even one a human placed
 

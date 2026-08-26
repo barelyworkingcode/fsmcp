@@ -3,7 +3,14 @@ import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { canonicalizePath } from '../security';
-import { checkPathV, decodeInboundPath, describeError, refuseAllowedDirRootV, translateResult } from '../vpath';
+import {
+  checkPathV,
+  decodeInboundPath,
+  describeError,
+  refuseAllowedDirRootV,
+  refuseAllowedDirRootWriteV,
+  translateResult,
+} from '../vpath';
 
 export function registerMove(registry: ToolRegistry): void {
   registry.register(
@@ -56,6 +63,24 @@ export function registerMove(registry: ToolRegistry): void {
       const destErr = checkPathV(destination, ctx.allowedDirs, ctx.labels);
       if (destErr) return destErr;
 
+      // Issue #24: a path that resolves to a grant root is not a valid
+      // target for a tool that creates or replaces something at it, and
+      // `destination` is exactly such a target -- fs_move brings the
+      // destination name into being (C4's own framing). `checkPathV` cannot
+      // refuse it, because a root is inside itself, so this is the same
+      // blind spot fs_write had. It is checked here, before the
+      // does-it-exist branching below, rather than only in the
+      // `overwrite: true` branch: without it the answer for a root
+      // destination depended on whether the root happened to exist and on
+      // whether `overwrite` was set -- "destination already exists" for the
+      // ordinary case, a scope refusal for the overwrite case, and, for a
+      // grant root that does not exist yet, an actual rename of a file onto
+      // the sandbox root. One rule, one answer, on the resolved path, so
+      // the alias spellings (`/d0`, `/d0/`, `/d0/.`, `/d0/notes/..`) are
+      // one case rather than four.
+      const destRootErr = refuseAllowedDirRootWriteV(destination, ctx.allowedDirs, 'move onto', ctx.labels);
+      if (destRootErr) return destRootErr;
+
       let sourceStat: fs.Stats;
       try {
         sourceStat = fs.lstatSync(source);
@@ -101,6 +126,16 @@ export function registerMove(registry: ToolRegistry): void {
       // that rmSync with nothing guarding it and erased the sandbox root.
       // Same guard fs_delete uses (security.ts's refuseAllowedDirRoot),
       // applied here because this is the other place that syscall happens.
+      //
+      // Unreachable as of issue #24 -- the destination root is refused
+      // above, before the branch that gets here -- and kept anyway, on
+      // purpose. The two guards answer different questions about the same
+      // path: the one above is "this is not a valid target for a write"
+      // (the write half of the rule, a scope violation), this one is "this
+      // rmSync must not remove a sandbox root" (the delete half, an
+      // ordinary tool error). If the check above is ever narrowed or moved,
+      // the syscall on the next line must still not be reachable with a
+      // root in hand.
       if (destExists) {
         const rootErr = refuseAllowedDirRootV(destination, ctx.allowedDirs, 'overwrite', ctx.labels);
         if (rootErr) return rootErr;

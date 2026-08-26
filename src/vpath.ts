@@ -5,6 +5,7 @@ import {
   checkPath,
   checkPathNoFollowFinal,
   refuseAllowedDirRoot,
+  refuseAllowedDirRootWrite,
 } from './security';
 
 /**
@@ -410,6 +411,26 @@ export function checkPathNoFollowFinalV(
 ): MCPCallResult | null {
   const result = checkPathNoFollowFinal(filePath, allowedDirs);
   return result ? translateResult(result, [filePath], labels) : null;
+}
+
+/**
+ * `security.ts`'s `refuseAllowedDirRootWrite` -- the write-side half of the
+ * allowed_dir-root rule (issue #24) -- wrapped the same way `checkPathV`
+ * wraps `checkPath`: `security.ts` still decides, this only renames the
+ * path in the message it hands back. `targetPath` is the already-decoded
+ * host path, and the refusal embeds it verbatim, so an alias spelling comes
+ * back in the shape the caller sent it (`/d0/notes/..`, not `/d0`) rather
+ * than in a normalised form that would quietly disagree with the argument
+ * the caller is looking at.
+ */
+export function refuseAllowedDirRootWriteV(
+  targetPath: string,
+  allowedDirs: string[],
+  action: string,
+  labels: LabelEntry[]
+): MCPCallResult | null {
+  const result = refuseAllowedDirRootWrite(targetPath, allowedDirs, action);
+  return result ? translateResult(result, [targetPath], labels) : null;
 }
 
 /** `security.ts`'s `refuseAllowedDirRoot`, wrapped the same way `checkPathV` wraps `checkPath`. */

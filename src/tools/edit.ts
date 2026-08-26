@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
+import { checkPathV, decodeInboundPath, refuseAllowedDirRootWriteV, translateResult } from '../vpath';
 import { decodeUtf8Strict, hasLoneSurrogate } from '../encoding';
 import { writeFileAtomic } from '../atomicWrite';
 import { canonicalizePath } from '../security';
@@ -59,6 +59,24 @@ export function registerEdit(registry: ToolRegistry): void {
 
       const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
+
+      // Issue #24, the same rule fs_write applies for the same reason: a
+      // path that resolves to a grant root is not a valid target for a
+      // tool that replaces a file, and `checkPathV` cannot say so because a
+      // root is inside itself. fs_edit reaches the identical
+      // `writeFileAtomic` -- whose temp path is `path.dirname(filePath)`,
+      // i.e. the directory ABOVE the sandbox when the target is the
+      // sandbox -- so the same shape is reachable here as soon as anything
+      // gets past the read below. Today it does not: `fs.readFileSync` of a
+      // directory throws EISDIR and this handler answers "file not found",
+      // so the bytes never reach the write. That is an accident of
+      // ordering, not a guarantee -- it depends on a read failing first,
+      // for an errno nothing here checks -- and "file not found" is also
+      // simply the wrong answer for a path that exists and is a grant root.
+      // Refused explicitly, before the read, so the answer does not depend
+      // on which syscall happens to fail first.
+      const rootErr = refuseAllowedDirRootWriteV(filePath, ctx.allowedDirs, 'edit', ctx.labels);
+      if (rootErr) return rootErr;
 
       // A lone UTF-16 surrogate in new_string cannot be encoded as valid
       // UTF-8 at all (see encoding.ts's hasLoneSurrogate doc) -- refused
