@@ -30,8 +30,30 @@ export interface MCPCallResult {
   _meta?: Record<string, unknown>;
 }
 
+/**
+ * One allowed directory's virtual-space label (issue #7): `label` is what a
+ * client addresses it as (always `/<label>/...`, never a bare `/`, even for
+ * a single root -- see vpath.ts's assignLabels), `hostDir` is the real path
+ * on disk it stands for. Lives here, not in vpath.ts, purely so
+ * ToolContext below can reference it without vpath.ts and types.ts
+ * importing each other.
+ */
+export interface LabelEntry {
+  label: string;
+  hostDir: string;
+}
+
 export interface ToolContext {
   allowedDirs: string[];
+  // The virtual-space labels for this call's effective scope, one per entry
+  // of allowedDirs, in the same order. A tool handler decodes every path
+  // ARGUMENT it receives against this (vpath.ts's decodeInboundPath) before
+  // it ever reaches allowedDirs/security.ts; the registry translates every
+  // path in the RESULT back through it (vpath.ts's translateResultToVirtual)
+  // on the way out. Computed once per call in main.ts, from the same
+  // narrowing that produced allowedDirs -- never a second, independent scope
+  // of its own.
+  labels: LabelEntry[];
 }
 
 export function textResult(text: string): MCPCallResult {

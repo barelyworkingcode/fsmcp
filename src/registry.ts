@@ -1,4 +1,5 @@
 import { MCPTool, MCPCallResult, ToolContext, errorResult } from './types';
+import { translateResultToVirtual } from './vpath';
 
 /**
  * Parse a boolean-shaped argument off the wire strictly: absent becomes
@@ -102,15 +103,32 @@ export class ToolRegistry {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  // Issue #7: every result, whether a handler returned it or this catch
+  // built it, passes through translateResultToVirtual before it reaches the
+  // wire. This is the ONE place that has to be right for every handler's
+  // raw syscall error text to stop leaking a host path -- `err.message` for
+  // an `ENOTEMPTY`/`EACCES`/etc. is written three stack frames inside a
+  // Node fs binding, with the exact host path this process handed the
+  // syscall embedded in it, and nothing upstream of that message ever gets
+  // a chance to build a virtual form instead. Centralizing the translation
+  // here means that is true regardless of which of the ten tools threw, and
+  // regardless of whether a future eleventh tool remembers to translate its
+  // own errors -- it does not have to, because it cannot reach the wire
+  // without going through this method first.
   call(name: string, args: Record<string, unknown>, ctx: ToolContext): MCPCallResult {
     const reg = this.registrations.get(name);
-    if (!reg) return errorResult(`unknown tool: ${name}`);
-    try {
-      return reg.handler(args, ctx);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return errorResult(message);
+    let result: MCPCallResult;
+    if (!reg) {
+      result = errorResult(`unknown tool: ${name}`);
+    } else {
+      try {
+        result = reg.handler(args, ctx);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        result = errorResult(message);
+      }
     }
+    return translateResultToVirtual(result, ctx.labels);
   }
 }
 
