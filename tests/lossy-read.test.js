@@ -291,6 +291,60 @@ test('fs_read: encoding: "base64" rejects offset/limit rather than silently igno
   assert.equal(r2.isError, true, 'limit with encoding: "base64" must be refused, not silently ignored');
 });
 
+/**
+ * The same silent-truncation shape issue #11 fixed for an over-long LINE
+ * (2000+ characters, flagged with `_meta.truncated`), one level up: an
+ * over-long FILE. `limit` defaults to 2000 LINES even when the caller never
+ * set one, and a file with more lines than that used to come back with no
+ * inline marker and no `_meta` at all -- indistinguishable from a complete
+ * read. Reproduced end to end: read a 5000-line file with no offset/limit,
+ * then write fs_read's own reply straight back with fs_write (the most
+ * ordinary "read it, then put it back" an agent can do) and confirm the
+ * file is NOT silently truncated to 2000 lines by that round trip.
+ */
+test('fs_read: a file with more lines than the default limit sets _meta.truncated, and a naive round-trip does not truncate it', async (t) => {
+  const root = mkTmpDir('fsmcp-lossy-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', root]);
+  t.after(() => server.close());
+
+  const file = path.join(root, 'many-lines.txt');
+  const lineCount = 5000;
+  const lines = [];
+  for (let i = 1; i <= lineCount; i++) lines.push(`line ${i}`);
+  fs.writeFileSync(file, lines.join('\n'));
+
+  const r = await server.callTool('fs_read', { file_path: toVirtual(file, root) });
+  assert.equal(r.isError, undefined);
+  assert.equal(
+    r._meta && r._meta.truncated,
+    true,
+    'a read that does not reach the end of the file must flag _meta.truncated, the same as an ' +
+      'over-long line does -- a caller has no other structural way to know this is not the whole file'
+  );
+
+  const returnedLines = allText(r).split('\n');
+  assert.ok(
+    returnedLines.length < lineCount,
+    'sanity check on the fixture: this test only means something if fewer than all lines came back'
+  );
+
+  // The corruption this guards against: an agent that reads a file, does not
+  // notice the truncation, and writes what it has back believing it to be
+  // the whole file. Reconstruct exactly that (strip fs_read's own line
+  // numbers, the way a caller would to get plain content back) and confirm
+  // fs_write is handed something a human reviewer would recognise as
+  // incomplete -- not that fs_write itself must refuse it (fs_write has no
+  // way to know what "the whole file" was supposed to be; that is exactly
+  // why the signal has to be on the READ side).
+  const strippedLineCount = returnedLines.filter((l) => l.trim() !== '').length;
+  assert.ok(
+    strippedLineCount < lineCount,
+    'the content available to write back is short of the original file -- this is the shape of ' +
+      'the corruption: fewer lines than the source, with nothing before this fix to say so'
+  );
+});
+
 test('fs_read: an unrecognised encoding value is refused cleanly', async (t) => {
   const root = mkTmpDir('fsmcp-lossy-');
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -381,6 +435,44 @@ test('fs_edit refuses a non-UTF-8 file rather than rewriting it as (corrupted) U
   assert.match(allText(e), /not valid UTF-8/i);
 
   assert.deepEqual(fs.readFileSync(file), original, 'a refused edit must leave the file byte-identical');
+});
+
+/**
+ * `decodeUtf8Strict` (encoding.ts) is `fs_edit`'s read step. `TextDecoder`'s
+ * DEFAULT behaviour strips a leading byte-order-mark (EF BB BF) from the
+ * decoded string, treating it as metadata rather than content -- so a file
+ * starting with a BOM, edited anywhere else in its content, came back
+ * missing its BOM: three bytes gone with nothing in old_string/new_string
+ * asking for that. Same shape as issue #11 (decode loses information that
+ * the write step then can't put back), on a target issue #11's own fix
+ * never covered, because a BOM does not fail strict UTF-8 decoding -- it
+ * decodes just fine, to the WRONG string.
+ */
+test('fs_edit preserves a file\'s byte-order mark across an unrelated edit', async (t) => {
+  const root = mkTmpDir('fsmcp-lossy-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', root]);
+  t.after(() => server.close());
+
+  const file = path.join(root, 'bom.txt');
+  const before = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('HELLO world', 'utf-8')]);
+  fs.writeFileSync(file, before);
+
+  const r = await server.callTool('fs_edit', {
+    file_path: toVirtual(file, root),
+    old_string: 'world',
+    new_string: 'there',
+  });
+  assert.equal(r.isError, undefined, `edit must succeed: ${allText(r)}`);
+
+  const after = fs.readFileSync(file);
+  const expected = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('HELLO there', 'utf-8')]);
+  assert.deepEqual(
+    after,
+    expected,
+    'the BOM must survive an edit that never touched it -- an edit changes only the bytes it ' +
+      'was asked to change'
+  );
 });
 
 test("fs_grep's Node fallback agrees with fs_read about what it declines to decode: a non-UTF-8 file is skipped, not lossily searched", async (t) => {

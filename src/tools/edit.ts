@@ -3,6 +3,8 @@ import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireString
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 import { decodeUtf8Strict, hasLoneSurrogate } from '../encoding';
+import { writeFileAtomic } from '../atomicWrite';
+import { canonicalizePath } from '../security';
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
@@ -74,8 +76,17 @@ export function registerEdit(registry: ToolRegistry): void {
       }
 
       let raw: Buffer;
+      let existingMode: number;
       try {
         raw = fs.readFileSync(filePath);
+        // Read alongside the content, not after: this file is about to be
+        // rewritten onto a fresh inode (writeFileAtomic below), and that
+        // inode gets the process's default mode unless told otherwise --
+        // silently dropping, say, a script's execute bit on every edit.
+        // Fetched from the same successfully-opened path the content came
+        // from, so there is no separate failure mode to handle here beyond
+        // the one already caught below.
+        existingMode = fs.statSync(filePath).mode;
       } catch {
         return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
       }
@@ -126,7 +137,32 @@ export function registerEdit(registry: ToolRegistry): void {
       }
 
       const newContent = parts.join(newString);
-      fs.writeFileSync(filePath, newContent, 'utf-8');
+      // Resolved through any symlink at `filePath` before the atomic
+      // rename, for the same reason fs_write does this: rename(2) replaces
+      // the DESTINATION'S OWN directory entry rather than following it, so
+      // renaming onto `filePath` unchanged would sever an in-scope symlink
+      // (replacing it with a plain file) and leave its real target holding
+      // stale pre-edit content forever -- confirmed by writing through a
+      // symlink to a real file and finding the real file untouched without
+      // this step. The old fs.writeFileSync(filePath, ...) call being
+      // replaced here DID follow the symlink (like any ordinary open()),
+      // so this resolution is what keeps that behaviour rather than
+      // changing it. canonicalizePath is the same resolution checkPathV
+      // already ran to approve this call, so this can only land on a path
+      // already in scope; `?? filePath` covers canonicalizePath's null
+      // return (a symlink cycle, or an input basicPathError would already
+      // have refused), which checkPathV's own success above has already
+      // ruled out for this exact string.
+      const resolvedPath = canonicalizePath(filePath) ?? filePath;
+      // writeFileAtomic, not a direct fs.writeFileSync(resolvedPath, ...,
+      // 'utf-8'): the direct call truncates the file before writing a byte
+      // of the edited content, so a write that fails partway (ENOSPC, the
+      // process being killed) leaves neither the pre-edit nor the post-edit
+      // content on disk -- measured on a deliberately undersized
+      // filesystem, where it destroyed a 500006-byte file down to 0 bytes
+      // on a single failed fs_edit. See atomicWrite.ts for the full
+      // argument and the repro.
+      writeFileAtomic(resolvedPath, Buffer.from(newContent, 'utf-8'), existingMode);
 
       return translateResult(
         textResult(`Replaced ${count} occurrence(s) in ${filePath}`),

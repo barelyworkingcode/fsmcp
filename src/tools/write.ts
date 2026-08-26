@@ -4,6 +4,8 @@ import { ToolRegistry, schema, stringProp, enumProp, requireStringArg, optionalS
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 import { hasLoneSurrogate, isValidBase64 } from '../encoding';
+import { writeFileAtomic } from '../atomicWrite';
+import { canonicalizePath } from '../security';
 
 // C5 ("max bytes on fs_read and fs_write"), same reasoning as fs_read's
 // MAX_READ_BYTES: an unbounded write is an unbounded synchronous allocation
@@ -116,17 +118,64 @@ export function registerWrite(registry: ToolRegistry): void {
         );
       }
 
-      const dir = path.dirname(filePath);
+      // writeFileAtomic replaces a path by renaming a temp file OVER it, and
+      // rename(2) never follows a symlink at its destination -- it replaces
+      // the directory entry itself. A direct fs.writeFileSync(filePath, ...)
+      // (what this used to call) DOES follow a symlink, the same as any
+      // other open() call, so `filePath` pointing at, say, `real.txt` used
+      // to update real.txt's content and leave the symlink alone. Renaming
+      // onto `filePath` unchanged would instead sever the link -- replacing
+      // it with a plain file holding the new content -- and leave real.txt
+      // holding stale content forever, silently, with fs_write still
+      // reporting success. Confirmed: without this resolution step, writing
+      // through an in-scope symlink to real.txt left real.txt completely
+      // untouched. canonicalizePath is the same resolution checkPathV above
+      // already ran to decide this call is in scope (validatePath's own
+      // rule: "the data really does end up wherever a symlink leads, so
+      // that is what must be in scope"), so this cannot land anywhere new;
+      // it only makes writeFileAtomic's destination match what checkPathV
+      // already approved. `?? filePath`: canonicalizePath returns null only
+      // for input basicPathError would already have refused (NUL byte, over
+      // PATH_MAX) or a symlink cycle -- checkPathV's own success above rules
+      // both out for this exact string, so the fallback is unreachable in
+      // practice, not a silent behaviour change for some other case.
+      const resolvedPath = canonicalizePath(filePath) ?? filePath;
+      const dir = path.dirname(resolvedPath);
       fs.mkdirSync(dir, { recursive: true });
+
+      // Preserve an existing file's permission bits across the replace --
+      // see writeFileAtomic's doc for why this matters (a rewrite through a
+      // temp file + rename lands on a brand-new inode, which otherwise gets
+      // the process's default mode regardless of what was there before).
+      // fs.statSync (unlike lstatSync) already follows a symlink at
+      // `filePath` on its own, so this reads the TARGET's mode, matching
+      // `resolvedPath` above. `undefined` here (file does not exist, or
+      // existsSync raced and lost) means "nothing to preserve," which is
+      // exactly the new-file case fs.writeFileSync's own default already
+      // covered before this change.
+      let existingMode: number | undefined;
+      try {
+        existingMode = fs.statSync(filePath).mode;
+      } catch {
+        // New file.
+      }
+
       // Written from the already-computed `bytes` buffer, not `content` +
       // an encoding name, for both branches: text mode's bytes are already
       // exactly the UTF-8 encoding fs.writeFileSync(..., 'utf-8') would
       // produce, and base64 mode's bytes are the decoded raw bytes, which
-      // fs.writeFileSync must write with NO encoding argument -- passing
-      // 'utf-8' here would re-interpret and re-encode an arbitrary byte
-      // buffer as if it were UTF-8 text, corrupting exactly the bytes this
-      // escape hatch exists to preserve.
-      fs.writeFileSync(filePath, bytes);
+      // must be written with NO text encoding applied -- interpreting them
+      // as UTF-8 text would re-encode an arbitrary byte buffer, corrupting
+      // exactly the bytes this escape hatch exists to preserve.
+      //
+      // writeFileAtomic, not a direct fs.writeFileSync(resolvedPath, bytes):
+      // the direct call truncates the target before writing a single byte,
+      // so a write that fails partway (ENOSPC, the process being killed)
+      // leaves the file neither in its old state nor its new one --
+      // measured on a deliberately undersized filesystem, where it left a
+      // 512000-byte file at 0 bytes. See atomicWrite.ts for the full
+      // argument and the repro.
+      writeFileAtomic(resolvedPath, bytes, existingMode);
 
       return translateResult(textResult(`Wrote ${bytes.length} bytes to ${filePath}`), [filePath], ctx.labels);
     }

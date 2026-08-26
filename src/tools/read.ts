@@ -214,8 +214,35 @@ export function registerRead(registry: ToolRegistry): void {
         })
         .join('\n');
 
-      const result = textResult(formatted);
-      if (truncatedAnyLine) {
+      // The OTHER way this view can be incomplete: DEFAULT_LIMIT (2000
+      // lines) applies even when the caller never asked for a limit at all,
+      // and a file with more lines than that used to come back looking
+      // exactly like a complete read -- no inline marker, no _meta, nothing
+      // -- with lines past it simply absent. That is the same silent-
+      // truncation shape issue #11 fixed for an over-long LINE, just one
+      // level up (over-long FILE instead), and it matters more here because
+      // it needs no unusual input to trigger: reading past line 2000 without
+      // ever setting `limit` reaches it on an entirely ordinary file. An
+      // agent that reads a file this way, assumes it has seen everything (a
+      // reasonable assumption -- nothing said otherwise), and writes the
+      // whole thing back via fs_write silently truncates the file to
+      // whatever it happened to see. Flagged the same way per-line
+      // truncation is, structurally AND inline, rather than inventing a
+      // second signal for what is the same underlying problem: this
+      // response does not contain the whole of what it was asked to
+      // represent.
+      const moreLinesRemain = startIdx + lines.length < allLines.length;
+
+      let resultText = formatted;
+      if (moreLinesRemain) {
+        const shownThrough = startIdx + lines.length;
+        resultText +=
+          `\n[fsmcp: showing lines ${offset}-${shownThrough} of ${allLines.length}; ` +
+          `pass offset: ${shownThrough + 1} to continue reading]`;
+      }
+
+      const result = textResult(resultText);
+      if (truncatedAnyLine || moreLinesRemain) {
         result._meta = { truncated: true };
       }
       return result;

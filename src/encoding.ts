@@ -33,9 +33,27 @@
  * already implements correctly, with real ways to get it subtly wrong (an
  * off-by-one on a continuation byte, an overlong encoding accepted, a
  * surrogate half accepted) that this issue does not need more of.
+ *
+ * `ignoreBOM: true` is also deliberate, and the option name is the opposite
+ * of what it sounds like: `TextDecoder`'s DEFAULT (`ignoreBOM: false`)
+ * treats a leading EF BB BF as a byte-order mark rather than data and
+ * STRIPS it from the decoded string -- `ignoreBOM: true` means "ignore the
+ * BOM's special meaning," i.e. keep it as an ordinary U+FEFF character.
+ * Without this, `fs_edit` (which decodes a file with this function, edits
+ * the string, and writes the WHOLE string back) silently deleted a file's
+ * BOM on every single successful edit, regardless of what old_string/
+ * new_string were -- confirmed: a file starting `EF BB BF 48 45 4C 4C 4F`
+ * ("﻿HELLO") edited to replace an unrelated word elsewhere in the
+ * file came back starting `48 45 4C 4C 4F`, three bytes shorter, with
+ * nothing in either argument asking for that. That is this module's own
+ * "pass-through, not a content judgement" principle (see the file doc
+ * above) failing on its own terms: treating a BOM as metadata to discard
+ * rather than as three ordinary content bytes is exactly the kind of
+ * "decide what the bytes mean" judgement call this file otherwise refuses
+ * to make.
  */
 export function decodeUtf8Strict(buf: Buffer): string {
-  return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buf);
 }
 
 /**

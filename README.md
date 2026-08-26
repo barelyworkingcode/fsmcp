@@ -126,6 +126,14 @@ valid UTF-8 at all, rather than rewriting it as corrupted UTF-8. There is no
 base64 mode for `fs_edit` -- a byte-level splice is not a string
 replacement.
 
+`fs_write` and `fs_edit` replace a file by writing the new content to a
+temp file in the same directory and renaming it into place, so a write that
+fails partway (a full disk, the process being killed) leaves the *original*
+file intact instead of truncated -- the tradeoff is that peak disk usage
+during the write is roughly the old file's size plus the new one's, so a
+volume sized with no headroom to spare for its largest file can start
+seeing `ENOSPC` on writes that used to fit.
+
 ## Virtual Path Space
 
 A client never sees a host path, in either direction. It addresses files in a
