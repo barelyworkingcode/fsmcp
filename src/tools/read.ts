@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, intProp } from '../registry';
+import { ToolRegistry, schema, stringProp, intProp, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { checkPath } from '../security';
 
 const IMAGE_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico',
@@ -10,12 +10,25 @@ const IMAGE_EXTENSIONS = new Set([
 const MAX_LINE_LENGTH = 2000;
 const DEFAULT_LIMIT = 2000;
 
+// C5 ("max bytes on fs_read and fs_write") named this explicitly and it was
+// simply never implemented: every read below loaded the *entire* file into
+// memory with fs.readFileSync before offset/limit ever got a chance to trim
+// it down to a handful of lines. fsmcp is one synchronous process serving
+// every caller; a file this large already sitting inside an allowed_dir (put
+// there by the same agent this tool serves, or by anything else with write
+// access to that directory) turns an ordinary `fs_read` into a
+// multi-hundred-megabyte synchronous allocation that blocks -- and can
+// exhaust memory in -- the one process every other caller is also waiting
+// on. Checked against `stat.size` (already available before any read is
+// attempted) rather than after reading, so the refusal costs nothing.
+const MAX_READ_BYTES = 10 * 1024 * 1024;
+
 export function registerRead(registry: ToolRegistry): void {
   registry.register(
     {
       name: 'fs_read',
       description:
-        'Read file contents with line numbers (cat -n format). Supports offset and limit for partial reads. Lines longer than 2000 characters are truncated.',
+        'Read file contents with line numbers (cat -n format). Supports offset and limit for partial reads. Lines longer than 2000 characters are truncated. Refuses files over 10MB -- use fs_grep to search a larger one instead.',
       inputSchema: schema(
         {
           file_path: stringProp('Absolute path to the file'),
@@ -29,12 +42,12 @@ export function registerRead(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext): ReturnType<typeof textResult> => {
-      const filePath = args.file_path as string;
+      const filePathArg = requireStringArg(args, 'file_path');
+      if (typeof filePathArg !== 'string') return filePathArg;
+      const filePath = filePathArg;
 
-      const pathErr = validatePath(filePath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
-
-      if (!path.isAbsolute(filePath)) return errorResult('file_path must be absolute');
+      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      if (pathErr) return pathErr;
 
       let stat: fs.Stats;
       try {
@@ -44,6 +57,14 @@ export function registerRead(registry: ToolRegistry): void {
       }
 
       if (stat.isDirectory()) return errorResult('path is a directory, not a file');
+
+      if (stat.size > MAX_READ_BYTES) {
+        return errorResult(
+          `${filePath} is ${stat.size} bytes, over fs_read's ${MAX_READ_BYTES}-byte limit; ` +
+            `narrow with offset/limit is not possible because the whole file must be loaded ` +
+            `to find line boundaries -- use fs_grep to search it instead`
+        );
+      }
 
       // Image files: return base64
       const ext = path.extname(filePath).toLowerCase();

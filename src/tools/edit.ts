@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
-import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { checkPath } from '../security';
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
@@ -25,15 +24,32 @@ export function registerEdit(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
-      const filePath = args.file_path as string;
-      const oldString = args.old_string as string;
-      const newString = args.new_string as string;
-      const replaceAll = (args.replace_all as boolean) ?? false;
+      const filePathArg = requireStringArg(args, 'file_path');
+      if (typeof filePathArg !== 'string') return filePathArg;
+      const filePath = filePathArg;
 
-      if (!path.isAbsolute(filePath)) return errorResult('file_path must be absolute');
+      const oldStringArg = requireStringArg(args, 'old_string');
+      if (typeof oldStringArg !== 'string') return oldStringArg;
+      const oldString = oldStringArg;
 
-      const pathErr = validatePath(filePath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
+      // Checked explicitly rather than left to `parts.join(newString)`:
+      // `Array.prototype.join` stringifies a `null` new_string to the
+      // literal text "null" and writes it into the file with no error at
+      // all (unlike `undefined`, which join treats as "use the default
+      // separator" -- the two are not equivalent here even though `as
+      // string` cannot tell them apart). A wrong-typed old_string throws
+      // instead (content.split has no such special case), which is also
+      // wrong, just louder -- this check catches both the same way.
+      const newStringArg = requireStringArg(args, 'new_string');
+      if (typeof newStringArg !== 'string') return newStringArg;
+      const newString = newStringArg;
+
+      const replaceAllArg = parseBoolArg(args.replace_all, 'replace_all', false);
+      if (typeof replaceAllArg !== 'boolean') return replaceAllArg;
+      const replaceAll = replaceAllArg;
+
+      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      if (pathErr) return pathErr;
 
       let content: string;
       try {

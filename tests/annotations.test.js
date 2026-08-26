@@ -15,10 +15,18 @@
  *     fs_write, fs_edit -- was silently treated as reaching the network.
  *
  *   - relay's access-mode check reads an absent `readOnlyHint` as
- *     "mutating". fs_write, fs_edit and fs_bash mutate, so that default
- *     happened to be correct for them by accident, but fs_read, fs_glob and
- *     fs_grep already carried an explicit `readOnlyHint: true` -- the
- *     absence problem was openWorldHint's alone before this change.
+ *     "mutating". fs_write and fs_edit mutate, so that default happened to
+ *     be correct for them by accident, but fs_read, fs_glob and fs_grep
+ *     already carried an explicit `readOnlyHint: true` -- the absence
+ *     problem was openWorldHint's alone before this change.
+ *
+ * fs_bash (readOnlyHint: false, openWorldHint: true -- an arbitrary shell
+ * reaches anywhere by construction) has since been removed outright rather
+ * than fixed: allowed_dirs was never a boundary for it, so every containment
+ * guarantee the rest of this server makes was void while it was registered
+ * (issue #5). fs_list, fs_find, fs_mkdir, fs_move and fs_delete were added in
+ * its place, each confined to allowed_dirs the same as every other tool
+ * here.
  *
  * An omitted annotation is not "no opinion" to the caller consuming it; it
  * is a permission decision made by whichever field was forgotten. This test
@@ -43,21 +51,25 @@ const { spawnServer } = require('./helpers');
 // The single source of truth for this task: every tool fsmcp is expected to
 // publish, and the two hints it must carry.
 //
-//   fs_read, fs_glob, fs_grep   -- read the local filesystem only.
-//   fs_write, fs_edit           -- mutate the local filesystem only.
-//   fs_bash                     -- runs an arbitrary shell command, which can
-//                                  curl/ssh/nc/etc, so it reaches outside the
-//                                  machine by construction (a property of
-//                                  what the call CAN do, not of what one
-//                                  invocation happened to run), and it is not
-//                                  read-only whatever the command is.
+//   fs_read, fs_glob, fs_grep,
+//   fs_list, fs_find            -- read the local filesystem only.
+//   fs_write, fs_edit,
+//   fs_mkdir, fs_move, fs_delete -- mutate the local filesystem only.
+//
+// Nothing in this table is openWorldHint: true any more -- that was fs_bash
+// alone (an arbitrary shell reaches anywhere by construction), and it is
+// gone (issue #5, Part 1) rather than fixed.
 const EXPECTED = {
   fs_read: { readOnlyHint: true, openWorldHint: false },
   fs_glob: { readOnlyHint: true, openWorldHint: false },
   fs_grep: { readOnlyHint: true, openWorldHint: false },
+  fs_list: { readOnlyHint: true, openWorldHint: false },
+  fs_find: { readOnlyHint: true, openWorldHint: false },
   fs_write: { readOnlyHint: false, openWorldHint: false },
   fs_edit: { readOnlyHint: false, openWorldHint: false },
-  fs_bash: { readOnlyHint: false, openWorldHint: true },
+  fs_mkdir: { readOnlyHint: false, openWorldHint: false },
+  fs_move: { readOnlyHint: false, openWorldHint: false },
+  fs_delete: { readOnlyHint: false, openWorldHint: false },
 };
 
 async function fetchTools() {

@@ -62,11 +62,6 @@ test('server with no CLI --allowed-dir', async (t) => {
     assert.equal(fs.existsSync(target), false, 'nothing should have been written');
   });
 
-  await t.test('fs_bash is refused with no scope (cwd cannot be validated)', async () => {
-    const result = await server.callTool('fs_bash', { command: 'echo hi' });
-    assert.equal(result.isError, true);
-  });
-
   await t.test('fs_glob with no path and no scope refuses rather than falling back to cwd', async () => {
     const result = await server.callTool('fs_glob', { pattern: '**/*' });
     assert.equal(result.isError, true);

@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { MCPCallResult, errorResult, scopeViolationResult } from './types';
 
 /**
  * Message returned whenever a path-governed operation has no allowed
@@ -17,6 +18,39 @@ export const NO_ALLOWED_DIRS_MESSAGE =
  * ELOOP at the syscall anyway.
  */
 const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * Upper bound on the length of a path string this server will even look at,
+ * matching Linux's PATH_MAX. Nothing here traverses a path that long without
+ * this check -- the difference is *how* it fails. Left unchecked, a path
+ * this long either throws deep inside `fs.lstatSync` (an exception the
+ * per-component loop below would swallow as "does not exist yet", changing
+ * the answer, not just the failure mode) or degrades into a very slow
+ * component-by-component walk. Checked up front, it is a clean refusal (C6):
+ * an error result, not a surprise thrown from three stack frames away.
+ */
+const MAX_PATH_LENGTH = 4096;
+
+/**
+ * The checks every path-governed operation needs regardless of which flavour
+ * of containment check runs afterwards (canonicalize-everything for
+ * validatePath, canonicalize-the-parent-only for validatePathNoFollowFinal).
+ * Factored out so both stay in exact agreement on what counts as a
+ * malformed path (C6), rather than each re-deriving it.
+ *
+ * A NUL byte is refused here rather than left to Node: `fs.lstatSync` throws
+ * synchronously for one (`ERR_INVALID_ARG_VALUE`), which is exactly the kind
+ * of exception-across-the-tool-boundary C6 exists to rule out, and it is a
+ * clearer refusal than whatever message that exception happens to carry.
+ */
+function basicPathError(filePath: string): string | null {
+  if (!path.isAbsolute(filePath)) return 'path must be absolute';
+  if (filePath.includes('\0')) return 'path must not contain a NUL byte';
+  if (filePath.length > MAX_PATH_LENGTH) {
+    return `path exceeds the maximum length of ${MAX_PATH_LENGTH} characters`;
+  }
+  return null;
+}
 
 /** Split a path fragment into its non-empty components. */
 function splitComponents(fragment: string): string[] {
@@ -139,11 +173,20 @@ export function canonicalizePath(inputPath: string): string | null {
  * with `O_NOFOLLOW | O_DIRECTORY`, i.e. openat-per-component from a pinned
  * root fd), so the kernel refuses the traversal instead of this function
  * predicting it.
+ *
+ * C7 restates this for fs_mkdir, fs_move and fs_delete, since it would be
+ * easy to read "mutating tools" as a reason this reasoning needs
+ * revisiting: it does not. Every one of them still checks a path and then
+ * acts on it in a later syscall, and the race described above still grants
+ * its winner nothing beyond what they could already do by writing into the
+ * allowed directory directly -- there is no privilege boundary here for a
+ * race to cross. This is a documented non-goal, not an oversight, and it
+ * stays one for exactly as long as fsmcp runs as the same user as everyone
+ * who can write into an allowed_dir.
  */
 export function validatePath(filePath: string, allowedDirs: string[]): string | null {
-  if (!path.isAbsolute(filePath)) {
-    return 'path must be absolute';
-  }
+  const basicErr = basicPathError(filePath);
+  if (basicErr) return basicErr;
 
   if (allowedDirs.length === 0) {
     return NO_ALLOWED_DIRS_MESSAGE;
@@ -154,6 +197,18 @@ export function validatePath(filePath: string, allowedDirs: string[]): string | 
     return `path ${filePath} could not be resolved (too many levels of symbolic links)`;
   }
 
+  if (isWithinAnyDir(resolved, allowedDirs)) return null;
+  return `path ${filePath} is outside allowed directories`;
+}
+
+/**
+ * True if `resolved` -- already canonicalized -- sits inside (or is exactly)
+ * one of `allowedDirs`. Shared between validatePath (which canonicalizes the
+ * whole path) and validatePathNoFollowFinal (which canonicalizes only the
+ * dirname), so the two agree on what "inside" means and differ only in what
+ * they canonicalize before asking.
+ */
+function isWithinAnyDir(resolved: string, allowedDirs: string[]): boolean {
   for (const dir of allowedDirs) {
     const resolvedDir = canonicalizePath(dir);
     // A directory that will not resolve cannot contain anything; skip it
@@ -164,11 +219,267 @@ export function validatePath(filePath: string, allowedDirs: string[]): string | 
     // /foobar.
     const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
     if (resolved === resolvedDir || resolved.startsWith(prefix)) {
-      return null; // within this allowed dir
+      return true; // within this allowed dir
     }
   }
+  return false;
+}
 
+/**
+ * C2: validate a path the way `fs_delete` needs -- everything up to the
+ * final component canonicalized and checked as usual, but the final
+ * component itself taken literally, un-followed.
+ *
+ * `validatePath` canonicalizes the whole path, which is the right answer for
+ * every other tool: reading or writing "through" a symlink means the data
+ * really does end up at the link's target, so that target is what must be in
+ * scope. Delete is the one operation where that is the wrong question.
+ * Deleting `<root>/link-out` (a symlink living inside the sandbox, pointing
+ * at `/etc`) must remove the link -- an in-scope directory entry -- and must
+ * never touch `/etc`. Canonicalizing first resolves the path onto `/etc` and
+ * (correctly) refuses it, but that also makes an in-scope symlink
+ * impossible to ever clean up: the sandbox can accrete escape hatches that
+ * `fs_delete` can never reach, because every attempt to name one resolves
+ * onto its target instead of the link.
+ *
+ * So: canonicalize `dirname(filePath)` (symlinks in a path *up to* the entry
+ * being deleted are still real traversal and must still be resolved and
+ * checked -- this is not a blanket "don't follow anything" mode), re-join
+ * `basename(filePath)` without resolving it, and check containment on that.
+ * The caller then uses `lstat`/`unlink` on the exact path handed back --
+ * never `stat`, or the same follow happens one line later.
+ */
+export function validatePathNoFollowFinal(filePath: string, allowedDirs: string[]): string | null {
+  const basicErr = basicPathError(filePath);
+  if (basicErr) return basicErr;
+
+  if (allowedDirs.length === 0) {
+    return NO_ALLOWED_DIRS_MESSAGE;
+  }
+
+  const base = path.basename(filePath);
+  if (base === '' || base === '.' || base === '..') {
+    return `path ${filePath} does not name a removable entry`;
+  }
+
+  const resolvedDir = canonicalizePath(path.dirname(filePath));
+  if (resolvedDir === null) {
+    return `path ${filePath} could not be resolved (too many levels of symbolic links)`;
+  }
+
+  const resolved = path.join(resolvedDir, base);
+  if (isWithinAnyDir(resolved, allowedDirs)) return null;
   return `path ${filePath} is outside allowed directories`;
+}
+
+/**
+ * A refusal message qualifies as a *scope* violation -- as opposed to a
+ * refusal for some other reason (bad regex, file not found, malformed path)
+ * -- exactly when it is one of the two sentences above: "no allowed
+ * directories are configured" (an empty scope refuses everything) or "is
+ * outside allowed directories" (a real scope, but this path is not in it).
+ * String comparison rather than a shared error-code enum is deliberate: it
+ * keeps validatePath's return type exactly `string | null`, which
+ * security.test.js already asserts against directly, and it means a new
+ * failure mode added to validatePath in future is *not* a scope violation by
+ * default -- it has to spell out one of these two sentences to become one.
+ */
+function isScopeViolationMessage(message: string): boolean {
+  return message === NO_ALLOWED_DIRS_MESSAGE || message.endsWith('is outside allowed directories');
+}
+
+/**
+ * Convenience for tool handlers: run a path check and, on failure, hand back
+ * the exact MCPCallResult the tool should return -- with
+ * `_meta.scope_violation` set when (and only when) the refusal is "this is
+ * outside what you're allowed to touch," never for a malformed-input
+ * refusal (not absolute, NUL byte, unresolvable symlink chain) or any other
+ * kind of tool error. Relay's audit reads `_meta.scope_violation` off a
+ * `tool_error` result and records it as a field on that outcome rather than
+ * a distinct outcome of its own, so getting this classification right is
+ * what lets an operator tell "the sandbox held" apart from "the tool broke"
+ * in the log -- see the acceptance table in issue #5, row 18.
+ */
+export function checkPath(filePath: string, allowedDirs: string[]): MCPCallResult | null {
+  const message = validatePath(filePath, allowedDirs);
+  if (message === null) return null;
+  return isScopeViolationMessage(message) ? scopeViolationResult(message) : errorResult(message);
+}
+
+/** Same as checkPath, but built on validatePathNoFollowFinal (C2) for fs_delete. */
+export function checkPathNoFollowFinal(filePath: string, allowedDirs: string[]): MCPCallResult | null {
+  const message = validatePathNoFollowFinal(filePath, allowedDirs);
+  if (message === null) return null;
+  return isScopeViolationMessage(message) ? scopeViolationResult(message) : errorResult(message);
+}
+
+/**
+ * Refuse an operation that is about to remove an allowed_dir root outright.
+ *
+ * Originally this check lived only inside fs_delete: "the sandbox root must
+ * survive its occupant." It was not actually a delete-shaped rule, though --
+ * it is a rule about the syscall `fs.rmSync(recursive: true)`, and fs_delete
+ * is not the only tool that makes that call. fs_move's `overwrite: true`
+ * branch runs exactly the same `fs.rmSync(destination, { recursive: true,
+ * force: true })` to clear the destination before renaming onto it, with no
+ * guard of its own -- a recursive delete wearing fs_move's name rather than
+ * fs_delete's. `checkPath(<allowed_dir root>)` passes, because a root is
+ * inside itself, so
+ *
+ *     fs_move { source: "<root>/a.txt", destination: "<root>", overwrite: true }
+ *
+ * reached that rmSync with nothing standing between the caller and the
+ * sandbox root, and erased it. Hoisting the guard here means every tool
+ * whose syscall removes a path checks the same thing the same way, instead
+ * of each mutating tool having to remember, on its own, that this is a rule
+ * it also needs.
+ *
+ * An unresolvable `targetPath` (e.g. a symlink cycle) is not guarded here --
+ * `canonicalizePath` returning null means the path-governed check upstream
+ * (checkPath / checkPathNoFollowFinal) already refused the call before this
+ * function would ever run, so there is no path left for this to protect.
+ */
+export function refuseAllowedDirRoot(
+  targetPath: string,
+  allowedDirs: string[],
+  action: string
+): MCPCallResult | null {
+  const resolved = canonicalizePath(targetPath);
+  if (resolved === null) return null;
+  for (const dir of allowedDirs) {
+    if (canonicalizePath(dir) === resolved) {
+      return errorResult(`refusing to ${action} an allowed_dir root: ${targetPath}`);
+    }
+  }
+  return null;
+}
+
+/** The result of combining CLI and _meta allowed dirs: see narrowAllowedDirs. */
+export interface NarrowedDirs {
+  allowedDirs: string[];
+  /** _meta dirs that were supplied but rejected for not narrowing the CLI grant. */
+  droppedMetaDirs: string[];
+}
+
+/**
+ * C1 (highest severity): combine `--allowed-dir` CLI flags with relay's
+ * per-call `_meta.allowed_dirs` under the rule that `_meta` may only ever
+ * *narrow* what the operator already granted, never widen it.
+ *
+ * main.ts used to compute `[...cliAllowedDirs, ...metaDirs]` -- a union. Under
+ * relay, `_meta` is a field relay populates from context an operator
+ * configured elsewhere in the chain, so it looks like a trusted input. But
+ * fsmcp cannot verify that anything upstream of `_meta` enforced anything:
+ * it must treat `_meta` as caller-supplied, the same as any other argument on
+ * the wire. A union lets a caller who can put *any* value into `_meta` widen
+ * its own sandbox -- `_meta.allowed_dirs: ["/"]` against a server launched
+ * with `--allowed-dir <root>` was a one-line, unauthenticated escape from
+ * `<root>` to the whole filesystem.
+ *
+ * The table this implements (all four rows, in one place, so no call site
+ * has to re-derive it and no call site can get away with only handling the
+ * cases it happened to think of):
+ *
+ *   CLI set   | _meta set   | effective scope
+ *   ----------|-------------|----------------------------------------------
+ *   yes       | yes         | intersection: each _meta dir kept only if it
+ *             |             | canonicalizes inside some CLI dir; the rest
+ *             |             | are dropped (and reported -- see below)
+ *   yes       | no          | CLI dirs, unchanged
+ *   no        | yes         | _meta dirs (relay-mediated mode: the operator's
+ *             |             | grant lives entirely in relay's context, and
+ *             |             | there is no CLI grant for it to be checked
+ *             |             | against)
+ *   no        | no          | empty, i.e. deny all (fefb031, unchanged)
+ *
+ * "`_meta` set" means the caller supplied an `allowed_dirs` array at all --
+ * including an empty one, which is a caller *asserting* a scope of nothing,
+ * not the absence of an opinion. The caller in main.ts is responsible for
+ * telling "absent" (`undefined`) apart from "present but empty" (`[]`)
+ * before this function ever sees `metaDirs`; conflating them (as the old
+ * `?? []` did) is exactly what made "no _meta key" and "no _meta.allowed_dirs
+ * key" and "_meta.allowed_dirs: []" indistinguishable, which happened not to
+ * matter for a union but would silently break the "no" row above for an
+ * intersection.
+ *
+ * A dropped `_meta` dir is returned, not swallowed: the caller (main.ts)
+ * reports it on the result rather than narrowing the scope in a way nothing
+ * ever tells the operator about.
+ */
+/**
+ * The result of sanitizeMetaAllowedDirs: see below for what each field means
+ * and why this exists as a separate step before narrowAllowedDirs at all.
+ */
+export interface SanitizedMetaDirs {
+  metaDirs: string[] | undefined;
+  /** True when the raw value was present but not an array of strings. */
+  malformed: boolean;
+}
+
+/**
+ * Validate that a raw `_meta.allowed_dirs` value off the wire is actually
+ * the `string[] | undefined` narrowAllowedDirs assumes it is, before it ever
+ * reaches that function -- narrowAllowedDirs's own type signature used to be
+ * the only thing asserting this, and a type assertion at the wire boundary
+ * (`meta?.allowed_dirs as string[] | undefined` in main.ts) checks nothing:
+ * it changes what TypeScript believes the value is, not what it is.
+ *
+ * A caller (or a misbehaving relay) sending `_meta.allowed_dirs` as `null`,
+ * a bare object, a number, a boolean, or an array containing a non-string
+ * element used to reach `for (const metaDir of metaDirs)` in
+ * narrowAllowedDirs's "CLI set" branches with something JavaScript cannot
+ * iterate, or reach `canonicalizePath(metaDir)` with something
+ * `path.isAbsolute` cannot accept -- both throw synchronously, and that
+ * throw happens in main.ts's request handler, OUTSIDE registry.call's
+ * try/catch (which wraps only the tool handler, reached later). fsmcp is
+ * one synchronous stdio loop serving every caller; an uncaught exception
+ * there crashes the whole process, taking down every OTHER in-flight or
+ * future call along with the one that sent the bad value. That is a worse
+ * outcome than any answer this one call could give, including a wrong one.
+ *
+ * The fix is not "reject the call with a clean error" alone -- fsmcp does
+ * that too, via `malformed`, so an operator can see what happened -- it is
+ * that a malformed value is treated exactly like a `_meta.allowed_dirs: []`
+ * a caller sent on purpose: an explicit assertion of an empty scope.
+ * narrowAllowedDirs already has a rule for "present but empty" (it is not
+ * the same as absent, and it does not fall back to the CLI grant -- see its
+ * own doc comment), so routing a malformed value through that existing rule
+ * means the fail-closed behaviour is proven once, by the tests that already
+ * cover the empty-array row, rather than needing a second, parallel
+ * fail-closed path that could drift from the first.
+ */
+export function sanitizeMetaAllowedDirs(raw: unknown): SanitizedMetaDirs {
+  if (raw === undefined) return { metaDirs: undefined, malformed: false };
+  if (Array.isArray(raw) && raw.every((entry) => typeof entry === 'string')) {
+    return { metaDirs: raw as string[], malformed: false };
+  }
+  return { metaDirs: [], malformed: true };
+}
+
+export function narrowAllowedDirs(cliDirs: string[], metaDirs: string[] | undefined): NarrowedDirs {
+  if (cliDirs.length === 0) {
+    // No CLI grant to intersect against: _meta is the whole scope when
+    // present, and an absent _meta leaves the (correct, fail-closed) empty
+    // default alone.
+    return { allowedDirs: metaDirs ?? [], droppedMetaDirs: [] };
+  }
+
+  if (metaDirs === undefined) {
+    return { allowedDirs: cliDirs, droppedMetaDirs: [] };
+  }
+
+  const allowedDirs: string[] = [];
+  const droppedMetaDirs: string[] = [];
+  for (const metaDir of metaDirs) {
+    const resolvedMeta = canonicalizePath(metaDir);
+    const contained = resolvedMeta !== null && isWithinAnyDir(resolvedMeta, cliDirs);
+    if (contained) {
+      allowedDirs.push(metaDir);
+    } else {
+      droppedMetaDirs.push(metaDir);
+    }
+  }
+  return { allowedDirs, droppedMetaDirs };
 }
 
 /** Parse --allowed-dir flags from process.argv */
