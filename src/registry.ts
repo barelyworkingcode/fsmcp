@@ -1,5 +1,6 @@
 import { MCPTool, MCPCallResult, ToolContext, errorResult } from './types';
 import { describeError, redactLeakedHostPaths } from './vpath';
+import { boundResultBytes } from './limits';
 
 /**
  * Parse a boolean-shaped argument off the wire strictly: absent becomes
@@ -134,7 +135,20 @@ export class ToolRegistry {
         result = errorResult(describeError(err, ctx.labels));
       }
     }
-    return redactLeakedHostPaths(result, ctx.labels);
+    // Issue #19: the size bound is a property of EVERY result, not a check
+    // inside whichever tool was found to break first. fs_read was the first
+    // (a 4/3-inflated base64 payload for a file its own limit had passed);
+    // fs_grep content mode was the second, and it bounded nothing at all. The
+    // two produce the same permanent outage -- an over-long line makes
+    // relay's stdout scanner return bufio.ErrTooLong, readLoop exits, and
+    // every enrolment served by this MCP is dead until an operator restarts
+    // the tray app. Putting the backstop here, alongside redactLeakedHostPaths
+    // and for the same reason, is what stops the NEXT unbounded tool from
+    // reopening it. Tools still bound their own results, and should: only the
+    // tool knows how to give a useful bounded answer (a page with a
+    // continuation offset, "showing X of Y matches"). This is the alarm for
+    // when one does not.
+    return boundResultBytes(redactLeakedHostPaths(result, ctx.labels), name);
   }
 }
 

@@ -4,6 +4,7 @@ import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, 
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
+import { capLines, MAX_RESPONSE_BYTES } from '../limits';
 
 const MAX_RESULTS = 1000;
 
@@ -99,18 +100,31 @@ export function registerGlob(registry: ToolRegistry): void {
       });
       withMtime.sort((a, b) => b.mtime - a.mtime);
 
-      const capped = withMtime.slice(0, MAX_RESULTS);
       // Issue #7, outbound: every hit already passed validatePath above (the
       // real, unmodified security check); hostToVirtualOrRedact only
       // decides how to SHOW a path that check already accepted, and redacts
       // rather than emits one it somehow can't map -- see vpath.ts.
-      const result = capped.map((f) => hostToVirtualOrRedact(f.path, ctx.labels)).join('\n');
+      // Rendered before the cap is applied, not after, so the byte budget
+      // measures the strings that will actually be sent rather than the host
+      // paths they were built from.
+      const rendered = withMtime
+        .slice(0, MAX_RESULTS)
+        .map((f) => hostToVirtualOrRedact(f.path, ctx.labels));
 
-      const suffix = allMatches.length > MAX_RESULTS
-        ? `\n\n(showing ${MAX_RESULTS} of ${allMatches.length} matches)`
-        : '';
+      // Issue #19: 1000 matches was a cap on the COUNT only, and a match is a
+      // whole path -- at PATH_MAX that is a megabyte of result from a bound
+      // that looks small. capLines adds the shared byte budget; the
+      // "(showing X of Y matches)" wording is unchanged.
+      const capped = capLines(rendered, MAX_RESULTS, allMatches.length);
+      if (!capped.capped) return textResult(capped.text);
 
-      return textResult(result + suffix);
+      const why =
+        capped.reason === 'bytes' ? `, cut at fs_glob's ${MAX_RESPONSE_BYTES}-byte response limit` : '';
+      const result = textResult(
+        `${capped.text}\n\n(showing ${capped.shown} of ${capped.total} matches${why})`
+      );
+      result._meta = { truncated: true };
+      return result;
     }
   );
 }

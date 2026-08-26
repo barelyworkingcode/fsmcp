@@ -109,9 +109,37 @@ test('the mutating syscall surface is exactly the five calls we have argued abou
   // a test about churn rather than about capability.
   const MUTATORS = /fs\.(writeFileSync|mkdirSync|unlinkSync|renameSync|rmSync|appendFileSync|truncateSync|chmodSync|chownSync|utimesSync|createWriteStream|openSync)/g;
 
+  // `fs.openSync` is on that list because its FLAG decides whether it
+  // mutates: `openSync(p, 'w')` truncates the file to zero length before
+  // anything is written to it, which is precisely the non-atomic destruction
+  // atomicWrite.ts exists to avoid, and `'a'`/`'w+'`/`'a+'` all create.
+  // `openSync(p, 'r')` cannot create, truncate, extend or alter anything --
+  // it is the read half of `pread`, and fs_read's base64 byte windowing
+  // (issue #19) needs it to read a bounded window out of a large file
+  // without allocating the whole file the way readFileSync would. So the
+  // rule is on the flag, not on the name: a read-only open is exempt, every
+  // other open is a sixth mutating primitive and has to argue for itself
+  // here. `filePath` at fs_read's call site has already been through
+  // decodeInboundPath + checkPathV, the same containment every other tool
+  // applies, and opening it read-only adds no reach beyond the readFileSync
+  // that was there before.
+  const READ_ONLY_OPEN = /fs\.openSync\([^;]*?,\s*'r'\s*\)/g;
+
   for (const file of sourceFiles(src)) {
     const code = stripComments(fs.readFileSync(file, 'utf-8'));
-    for (const m of code.matchAll(MUTATORS)) found.add(m[1]);
+    const totalOpens = (code.match(/fs\.openSync\(/g) || []).length;
+    const readOnlyOpens = (code.match(READ_ONLY_OPEN) || []).length;
+    assert.equal(
+      readOnlyOpens,
+      totalOpens,
+      `${path.relative(src, file)} calls fs.openSync with a flag other than 'r'. Any other flag ` +
+        `creates or truncates, which is a mutating primitive and needs its own containment ` +
+        `argument -- do not relax this by widening the pattern.`
+    );
+    // Read-only opens are removed before the mutator scan so the assertion
+    // below stays a statement about capability rather than about spelling.
+    const mutatingOnly = code.replace(READ_ONLY_OPEN, 'fs.__readOnlyOpen()');
+    for (const m of mutatingOnly.matchAll(MUTATORS)) found.add(m[1]);
   }
 
   assert.deepStrictEqual(

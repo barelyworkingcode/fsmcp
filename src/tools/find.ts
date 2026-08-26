@@ -5,6 +5,7 @@ import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, 
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
+import { capLines, MAX_RESPONSE_BYTES } from '../limits';
 import { grepBudgetMs } from './grep';
 
 const MAX_RESULTS = 200;
@@ -232,10 +233,23 @@ export function registerFind(registry: ToolRegistry): void {
       // through validatePath (the real, unmodified security check);
       // hostToVirtualOrRedact only decides how to show a path that check
       // already accepted, and redacts rather than emits one it can't map.
-      const lines = capped.map((r) => hostToVirtualOrRedact(r.file, ctx.labels)).join('\n');
+      const rendered = capped.map((r) => hostToVirtualOrRedact(r.file, ctx.labels));
+
+      // Issue #19: 200 results is the tightest of this codebase's four
+      // existing caps and the least likely of them to reach a megabyte, but
+      // it is still a count and a result is still a whole path, so it goes
+      // through the same shared byte budget as fs_grep/fs_glob/fs_list rather
+      // than being the one tool left arguing that its own cap is small
+      // enough. That argument is exactly what fs_grep's content mode was
+      // relying on.
+      const bounded = capLines(rendered, MAX_RESULTS, scored.length);
       const notes: string[] = [];
-      if (scored.length > MAX_RESULTS) {
-        notes.push(`(showing ${MAX_RESULTS} of ${scored.length} matches)`);
+      if (bounded.capped) {
+        const why =
+          bounded.reason === 'bytes'
+            ? `, cut at fs_find's ${MAX_RESPONSE_BYTES}-byte response limit`
+            : '';
+        notes.push(`(showing ${bounded.shown} of ${bounded.total} matches${why})`);
       }
       if (truncated) {
         notes.push(
@@ -244,7 +258,11 @@ export function registerFind(registry: ToolRegistry): void {
         );
       }
 
-      return textResult(notes.length > 0 ? `${lines}\n\n${notes.join('\n')}` : lines);
+      const result = textResult(
+        notes.length > 0 ? `${bounded.text}\n\n${notes.join('\n')}` : bounded.text
+      );
+      if (bounded.capped || truncated) result._meta = { truncated: true };
+      return result;
     }
   );
 }
