@@ -2,6 +2,7 @@ import * as path from 'path';
 import { MCPCallResult, MCPContent, LabelEntry, errorResult, scopeViolationResult } from './types';
 import {
   NO_ALLOWED_DIRS_MESSAGE,
+  canonicalizePath,
   checkPath,
   checkPathNoFollowFinal,
   refuseAllowedDirRoot,
@@ -24,9 +25,19 @@ import {
  * undo `canonicalizePath`'s kernel-style walk before it ever runs). Every
  * symlink, `..`, dangling-link and canonicalisation argument in security.ts
  * still runs, unmodified, on that host path, and still decides. Nothing in
- * this file resolves a symlink, canonicalizes a path, or makes a
- * scope decision on its own merits -- it only renames strings that
- * `security.ts` has already judged, or is about to.
+ * this file implements its own resolution rule or makes a scope decision on
+ * its own merits -- it only renames strings that `security.ts` has already
+ * judged, or is about to.
+ *
+ * There is exactly one place this file needs to know what a path resolves
+ * to (`assignLabels`, recording each granted directory's canonical spelling
+ * for outbound translation -- issue #21), and it gets that answer by
+ * calling `security.ts`'s own `canonicalizePath`, the same function
+ * `isWithinAnyDir` uses to decide containment. That is deliberate and it is
+ * the opposite of a second path checker: the failure this fixes was the
+ * outbound map disagreeing with `security.ts` about which strings name the
+ * same directory, and the fix is to ask `security.ts` rather than to grow a
+ * resolution rule of this file's own.
  */
 
 // LabelEntry (one allowed directory's label and the host path it stands for)
@@ -192,7 +203,19 @@ export function assignLabels(
       );
     }
     hostDirByLabel.set(label, bare);
-    entries.push({ label, hostDir: bare });
+    // `realHostDir` is `bare` as security.ts's own resolver sees it (issue
+    // #21). Computed once per call here rather than per emitted path,
+    // because it is a property of the GRANT, not of any one hit, and
+    // because `hostToVirtual` runs once per result line (up to 1000 for
+    // fs_glob) where a syscall each would be paid for nothing.
+    //
+    // `?? bare` for the unresolvable case (a symlink cycle in the grant
+    // itself): `canonicalizePath` returning null already means
+    // `isWithinAnyDir` skips that directory entirely, so nothing can ever
+    // be validated into it and nothing can reach outbound translation
+    // wanting it -- falling back to the literal spelling keeps this a total
+    // function without inventing an answer that could ever be consulted.
+    entries.push({ label, hostDir: bare, realHostDir: canonicalizePath(bare) ?? bare });
   }
   return entries;
 }
@@ -295,29 +318,71 @@ export function decodeInboundPath(virtualPath: string, labels: LabelEntry[]): st
 }
 
 /**
- * Outbound, single path: `<hostDir><rest>` -> `/<label><rest>`, sorted
- * longest-`hostDir`-first so a nested allowed dir (e.g. both `/a` and
+ * Outbound, single path: `<grantedDir><rest>` -> `/<label><rest>`, sorted
+ * longest-directory-first so a nested allowed dir (e.g. both `/a` and
  * `/a/b` granted separately, with distinct labels) maps to its most specific
  * label rather than the shorter, less specific one matching first.
  *
- * Returns null when `hostPath` sits under none of `labels`' directories.
- * Every real call site re-validates with `security.ts`'s own `validatePath`
- * before it ever reaches here (this function makes no scope decision of its
- * own), so null should be unreachable in practice; callers still redact
- * rather than emit when it happens, per issue #7's outbound rule -- "if a
- * host path cannot be mapped back, do not emit it" -- treating the
- * unreachable case as the bug it would be rather than assuming it away.
+ * Each label offers TWO spellings of its one directory (issue #21): the
+ * literal `hostDir` the operator wrote, and `realHostDir`, the same
+ * directory as `canonicalizePath` resolves it. They are the same string
+ * unless the grant is reached through a symlink, and when they differ, a
+ * tool that produces a path in resolved form -- `fs_glob`, which now hands
+ * `globSync` a resolved `cwd` because glob will not descend a symlinked one
+ * (issue #21), and anything else that ever resolves before it emits --
+ * matched neither the old single prefix nor any other label, and every one
+ * of its hits came back as `REDACTED_PATH`. That is the failure this
+ * function exists to prevent, arriving as a false alarm instead of as
+ * silence, so it has to be fixed here rather than tolerated.
+ *
+ * **Recognising the second spelling maps no file the first did not already
+ * map.** `canonicalizePath` resolves a path prefix-first, so
+ * `canonicalizePath(hostDir + rest)` and `canonicalizePath(realHostDir +
+ * rest)` are the same path for every `rest`: the two spellings name exactly
+ * the same set of files, and the virtual address this returns round-trips
+ * through `virtualToHost` back onto that same file either way. In
+ * particular, this does NOT widen what can be named out of scope: a `rest`
+ * that escapes the grant through an inner symlink (`realHostDir/link-out/x`)
+ * escapes identically through the unresolved spelling
+ * (`hostDir/link-out/x`), which this function has always matched, and both
+ * are stopped where they have always been stopped -- at the `validatePath`
+ * every call site runs BEFORE it gets here. This function still makes no
+ * scope decision of its own; it decides how to SHOW a path something else
+ * already judged.
+ *
+ * Returns null when `hostPath` sits under none of `labels`' directories in
+ * either spelling. Every real call site re-validates with `security.ts`'s
+ * own `validatePath` before it ever reaches here, so null should be
+ * unreachable in practice; callers still redact rather than emit when it
+ * happens, per issue #7's outbound rule -- "if a host path cannot be mapped
+ * back, do not emit it" -- treating the unreachable case as the bug it
+ * would be rather than assuming it away. Issue #21 is what that redaction
+ * would have looked like in the field if `fs_glob` had been fixed on its
+ * own: a page of placeholders in place of a page of real filenames, which
+ * is a different way of telling a caller nothing, not a fix.
  */
 export function hostToVirtual(hostPath: string, labels: LabelEntry[]): string | null {
-  const sorted = [...labels].sort((a, b) => b.hostDir.length - a.hostDir.length);
-  for (const { label, hostDir } of sorted) {
-    if (hostPath === hostDir) return `/${label}`;
-    const prefix = hostDir.endsWith(path.sep) ? hostDir : hostDir + path.sep;
+  // One candidate per (label, spelling). A label whose two spellings are
+  // identical -- every grant not reached through a symlink, i.e. almost all
+  // of them -- contributes exactly one, so the ordinary case is byte-for-byte
+  // the comparison this function has always done.
+  const candidates: { label: string; dir: string }[] = [];
+  for (const { label, hostDir, realHostDir } of labels) {
+    candidates.push({ label, dir: hostDir });
+    if (realHostDir !== hostDir) candidates.push({ label, dir: realHostDir });
+  }
+  // Stable sort (V8 guarantees it), so two equal-length directories keep
+  // their `labels` order and this stays a pure refinement of the old
+  // longest-first rule rather than a reshuffle of it.
+  candidates.sort((a, b) => b.dir.length - a.dir.length);
+  for (const { label, dir } of candidates) {
+    if (hostPath === dir) return `/${label}`;
+    const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
     if (hostPath.startsWith(prefix)) {
-      // Slicing off `prefix` (not just `hostDir`) consumes the separator
+      // Slicing off `prefix` (not just `dir`) consumes the separator
       // along with the directory, so `rest` never has one of its own --
-      // load-bearing for hostDir === "/" (the `--allowed-dir /` opt-out),
-      // where `hostDir.length` alone would slice off nothing and leave the
+      // load-bearing for a granted "/" (the `--allowed-dir /` opt-out),
+      // where `dir.length` alone would slice off nothing and leave the
       // path's own leading "/" glued directly onto the label with no
       // separator between them at all (`/d0var/x`, not `/d0/var/x`).
       const rest = hostPath.slice(prefix.length);
@@ -505,11 +570,19 @@ export function describeError(err: unknown, labels: LabelEntry[]): string {
  * A path-boundary lookahead (matching `hostToVirtual`/the old whole-result
  * rewrite) avoids flagging an unrelated sibling directory that happens to
  * share a prefix (`/allowed/project` inside `/allowed/project-old`).
+ *
+ * Both spellings of each grant are scanned (issue #21), for the same reason
+ * `hostToVirtual` matches both: `realHostDir` is as much the granted
+ * directory's real path as `hostDir` is, and under a symlinked root it is
+ * the one a resolved-path leak would actually be spelled with. An alarm
+ * that only knows the operator's spelling would have stayed silent on
+ * exactly the deployments this issue is about.
  */
 export function redactLeakedHostPaths(result: MCPCallResult, labels: LabelEntry[]): MCPCallResult {
   if (!result.isError || labels.length === 0) return result;
-  const leaked = labels.some(({ hostDir }) => {
-    const re = new RegExp(`${escapeRegExp(hostDir)}(?=[/\n]|$)`);
+  const spellings = new Set(labels.flatMap(({ hostDir, realHostDir }) => [hostDir, realHostDir]));
+  const leaked = [...spellings].some((dir) => {
+    const re = new RegExp(`${escapeRegExp(dir)}(?=[/\n]|$)`);
     return result.content.some((item) => re.test(item.text));
   });
   if (!leaked) return result;
