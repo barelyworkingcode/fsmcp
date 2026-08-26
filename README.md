@@ -212,15 +212,41 @@ disk is. Relay's audit log also keeps absolute host paths: it is relay's
 ground truth, read by the operator, not the client, and redacting it would
 undermine the very thing an operator uses it to verify.
 
-**The other half of this lives in relay.** Relay currently appends the raw
-`allowed_dirs` value into every governed tool's *description* text at
-`tools/list` time (`router.go:840`), so a client that never sees a host path
-from a fsmcp *result* can still read one out of the tool *description* handed
-to it before it ever calls anything. That is filed as **barelyworkingcode/relay#33**
-(see **[Relay](../relay)**) -- the two halves are independently useful and
-independently shippable (this one still removes every path fsmcp itself
-emits), but the disclosure this issue describes is not fully closed until
-both have landed.
+**The other half of this lives in relay, and fsmcp now asks for it.** Relay
+appends a scope note built from `allowed_dirs` into every governed tool's
+*description* at `tools/list` time, so a client that never sees a host path in
+any fsmcp *result* could still read one out of the tool *description* handed to
+it before it called anything -- a live Hermes run reported `/d0` mapping to the
+sandbox's absolute path, unprompted, having read it there. fsmcp's context
+schema therefore declares `disclose: "count"` (relay#33, fsmcp#15) and a
+relay that understands the keyword renders
+
+```
+Scope: Directories this client may read, search and modify within — confined to 1 value.
+```
+
+"count", not "none": the client is still told that it is confined and to how
+many roots, which is the boundary without the coordinates. An agent that cannot
+see its own limits behaves worse, not better.
+
+**What fsmcp can and cannot promise here.** The note is rendered by relay, not
+by fsmcp, and `disclose` is a request. A relay older than relay#33 ignores the
+keyword entirely and renders the value -- fsmcp cannot detect which relay it is
+speaking to, cannot fail closed on the answer, and does not claim to. The
+guarantee fsmcp keeps is the one it can: **no host path in any tool result,
+error, or search hit fsmcp emits.**
+
+That guarantee has one documented exception, and it predates this change: when
+a call's `_meta.allowed_dirs` contains an entry that is not inside any
+`--allowed-dir` root, fsmcp appends a report naming the dropped entries as raw
+host paths, on a SUCCESS result, outside the virtual path space. It is
+reachable in a relay deployment whose registration carries `--allowed-dir`
+args *and* whose profile grants a directory outside them — the two disagree,
+and the client is told which entry was discarded. `disclose` does not reach
+that surface; see the note in CLAUDE.md. Whether the description relay writes carries one
+is a property of the relay in front of it, and is worth checking with
+`relayremote list --schema` on the deployment you actually run (plain
+`list` truncates the description, which is where the note lives).
 
 ### A symlink out of the sandbox is refused, even one a human placed
 
@@ -270,7 +296,7 @@ every hop of which would have been correctly validated on the way out.
 relay mcp register --name fsMCP --command ~/.local/bin/fsmcp
 ```
 
-fsMCP declares a **v2** relay context schema (`contextSchemaVersion: 2`, `source: "operator"`, `scope: "restrict"`, `applies_to: ["fs_*"]`, `enumerable: false`) so relay can offer `allowed_dirs` as an operator-typed field on both local and **remote** access profiles -- a v1 schema (the old `allowed_dirs` field with no version and a directory-list `ui` hint) only works for a local project, because v1 derives the value from a project path a remote profile does not have. Configure per-token directory access in Relay's Settings > Security > Token Permissions.
+fsMCP declares a **v2** relay context schema (`contextSchemaVersion: 2`, `source: "operator"`, `scope: "restrict"`, `applies_to: ["fs_*"]`, `enumerable: false`, `disclose: "count"`) so relay can offer `allowed_dirs` as an operator-typed field on both local and **remote** access profiles -- a v1 schema (the old `allowed_dirs` field with no version and a directory-list `ui` hint) only works for a local project, because v1 derives the value from a project path a remote profile does not have. Configure per-token directory access in Relay's Settings > Security > Token Permissions.
 
 ### Standalone
 
