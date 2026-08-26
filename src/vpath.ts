@@ -215,7 +215,23 @@ export function assignLabels(
     // be validated into it and nothing can reach outbound translation
     // wanting it -- falling back to the literal spelling keeps this a total
     // function without inventing an answer that could ever be consulted.
-    entries.push({ label, hostDir: bare, realHostDir: canonicalizePath(bare) ?? bare });
+    const realHostDir = canonicalizePath(bare) ?? bare;
+    // The LEXICAL form (issue #35): `path.resolve` collapses `..` and `.`
+    // without touching a symlink. It is here because it is what `path.join`
+    // produces, and `path.join` is how `fs_list` builds every entry it
+    // reports and how the grep/find fallbacks build every path they emit --
+    // so for a grant written with a `..` in it, this is the spelling that
+    // actually arrives at outbound translation, and it is neither the
+    // literal string nor the canonical one. Guarded on `isAbsolute` because
+    // `path.resolve` would otherwise resolve a (already-doomed) relative
+    // entry against fsmcp's own CWD, inventing a spelling for a grant that
+    // can never validate anything anyway.
+    const lexical = path.isAbsolute(bare) ? path.resolve(bare) : bare;
+    // Deduped, so the ordinary grant -- all three identical -- contributes
+    // exactly one prefix and the comparison stays byte-for-byte what it has
+    // always been for nearly every deployment.
+    const spellings = [...new Set([bare, lexical, realHostDir])];
+    entries.push({ label, hostDir: bare, realHostDir, spellings });
   }
   return entries;
 }
@@ -318,78 +334,179 @@ export function decodeInboundPath(virtualPath: string, labels: LabelEntry[]): st
 }
 
 /**
- * Outbound, single path: `<grantedDir><rest>` -> `/<label><rest>`, sorted
- * longest-directory-first so a nested allowed dir (e.g. both `/a` and
- * `/a/b` granted separately, with distinct labels) maps to its most specific
- * label rather than the shorter, less specific one matching first.
+ * Outbound, single path: a host path under one of this call's granted
+ * directories -> `/<label>/<rest>`.
  *
- * Each label offers TWO spellings of its one directory (issue #21): the
- * literal `hostDir` the operator wrote, and `realHostDir`, the same
- * directory as `canonicalizePath` resolves it. They are the same string
- * unless the grant is reached through a symlink, and when they differ, a
- * tool that produces a path in resolved form -- `fs_glob`, which now hands
- * `globSync` a resolved `cwd` because glob will not descend a symlinked one
- * (issue #21), and anything else that ever resolves before it emits --
- * matched neither the old single prefix nor any other label, and every one
- * of its hits came back as `REDACTED_PATH`. That is the failure this
- * function exists to prevent, arriving as a false alarm instead of as
- * silence, so it has to be fixed here rather than tolerated.
+ * ## The defect this function had, stated once
  *
- * **Recognising the second spelling maps no file the first did not already
- * map.** `canonicalizePath` resolves a path prefix-first, so
- * `canonicalizePath(hostDir + rest)` and `canonicalizePath(realHostDir +
- * rest)` are the same path for every `rest`: the two spellings name exactly
- * the same set of files, and the virtual address this returns round-trips
- * through `virtualToHost` back onto that same file either way. In
- * particular, this does NOT widen what can be named out of scope: a `rest`
- * that escapes the grant through an inner symlink (`realHostDir/link-out/x`)
- * escapes identically through the unresolved spelling
- * (`hostDir/link-out/x`), which this function has always matched, and both
- * are stopped where they have always been stopped -- at the `validatePath`
- * every call site runs BEFORE it gets here. This function still makes no
- * scope decision of its own; it decides how to SHOW a path something else
- * already judged.
+ * `security.ts` decides containment by CANONICALISING both sides
+ * (`isWithinAnyDir`: `canonicalizePath(path)` against `canonicalizePath(dir)`).
+ * This function used to decide the label by comparing STRINGS against the
+ * directory as the operator wrote it. Those two rules do not agree, and
+ * every way of making them disagree is a live bug that reaches a client on
+ * an `ok` result:
  *
- * Returns null when `hostPath` sits under none of `labels`' directories in
- * either spelling. Every real call site re-validates with `security.ts`'s
- * own `validatePath` before it ever reaches here, so null should be
- * unreachable in practice; callers still redact rather than emit when it
- * happens, per issue #7's outbound rule -- "if a host path cannot be mapped
- * back, do not emit it" -- treating the unreachable case as the bug it
- * would be rather than assuming it away. Issue #21 is what that redaction
- * would have looked like in the field if `fs_glob` had been fixed on its
- * own: a page of placeholders in place of a page of real filenames, which
- * is a different way of telling a caller nothing, not a fix.
+ *  - **a granted root that is itself a symlink (#21)** -- `fs_glob` walks
+ *    from the resolved root and every hit fails the string compare;
+ *  - **an aliased ancestor** (`/Users/runner -> /Users/admin`, found on #21
+ *    on an ordinary macOS host with no unusual configuration) -- a pattern
+ *    that reaches the same files by both names returns each file twice, once
+ *    named and once as the placeholder;
+ *  - **an `allowed_dirs` entry containing `..` (#35)** -- `fs_list` and
+ *    `fs_glob` redact EVERY path while `fs_read`, `fs_grep` and `fs_find`
+ *    work, because the first two build their paths with `path.join`, which
+ *    collapses the `..` lexically, and the others echo back the string they
+ *    were handed;
+ *  - **`/tmp` vs `/private/tmp`**, which is the same defect waiting on any
+ *    macOS host and which nobody had reported yet;
+ *  - **a `..` AND a symlinked ancestor together**, which is why enumerating
+ *    spellings is not sufficient on its own: `path.join` collapses the `..`
+ *    without resolving the link, producing a string that is neither what the
+ *    operator wrote nor what `canonicalizePath` returns.
+ *
+ * They are one sentence -- *one check resolves and the other compares
+ * strings* -- so this is fixed once, here, rather than at each tool that
+ * happens to surface it. **The comment that used to live here, calling the
+ * unmappable case "unreachable in practice", was wrong: it is reachable from
+ * an ordinary call on an ordinary host.**
+ *
+ * ## What it does now
+ *
+ * Two stages, in this order:
+ *
+ *  1. **Prefix match against `spellings`** -- the deduped set of string forms
+ *     of the grant this repository can itself produce (literal, lexical,
+ *     canonical). Sorted longest-first so a nested allowed dir (both `/a` and
+ *     `/a/b` granted with distinct labels) maps to its most specific label.
+ *     No syscalls, and it answers nearly every real path.
+ *  2. **Canonical containment**, when no spelling matched: resolve
+ *     `dirname(hostPath)` with security.ts's own `canonicalizePath` and ask
+ *     whether it is inside some label's `realHostDir` -- the same question,
+ *     against the same canonical form, that `isWithinAnyDir` asks. The answer
+ *     is built from the resolved parent plus the path's OWN `basename`, never
+ *     from canonicalising the whole path: that is `validatePathNoFollowFinal`'s
+ *     rule (security.ts, C2) and it is here for the same reason -- resolving
+ *     the last component would rename an in-scope symlink to whatever it
+ *     points at, so `fs_list` would report a name that is not the name of the
+ *     entry it just listed.
+ *
+ * Stage 1 is kept in front of stage 2 for cost, not for correctness: stage 2
+ * alone would be correct and would pay a `canonicalizePath` per emitted path,
+ * up to 1000 of them for one `fs_glob`.
+ *
+ * ## Why neither stage can map a path that is genuinely out of scope
+ *
+ * Stage 2 is strictly WEAKER than the check every caller already ran, which
+ * is what makes it safe: its test is "the resolved PARENT is inside the
+ * grant" -- exactly `validatePathNoFollowFinal` -- while every call site
+ * re-validates with `validatePath`, which resolves the whole path including
+ * the final component. Anything arriving here has already passed a harder
+ * test than the one this stage applies. A path whose parent resolves outside
+ * every grant still returns null and is still redacted, asserted directly by
+ * `tests/label-mapping.test.js` rather than argued.
+ *
+ * Stage 1 is likewise not a widening. `canonicalizePath` resolves
+ * prefix-first, so `canonicalizePath(spelling + rest)` is the same path for
+ * every spelling of one directory: the spellings name exactly the same set
+ * of files, and a `rest` that escapes through an inner symlink escapes
+ * identically through each of them and is stopped identically, at that same
+ * `validatePath`.
+ *
+ * ## Why this matters beyond the wrong string
+ *
+ * The redaction this replaces is fsmcp's ALARM for "a path reached output
+ * from outside the grant". An alarm that fires on correct, contained calls --
+ * which is what every case above did -- trains an operator and an agent to
+ * ignore it, which is the worst thing that can happen to a signal whose whole
+ * value is that it never fires spuriously. Getting it to stop firing on
+ * ordinary use is as much the point of this function as getting the paths
+ * right.
+ *
+ * Returns null when `hostPath` is under none of `labels`' directories by
+ * either stage; callers redact rather than emit, per issue #7's outbound rule
+ * -- "if a host path cannot be mapped back, do not emit it."
  */
 export function hostToVirtual(hostPath: string, labels: LabelEntry[]): string | null {
-  // One candidate per (label, spelling). A label whose two spellings are
-  // identical -- every grant not reached through a symlink, i.e. almost all
-  // of them -- contributes exactly one, so the ordinary case is byte-for-byte
-  // the comparison this function has always done.
+  // Stage 1: string prefixes. A label whose spellings are all identical --
+  // every grant not reached through a symlink and not written with a `..`,
+  // i.e. almost all of them -- contributes exactly one candidate, so the
+  // ordinary case is byte-for-byte the comparison this has always done.
   const candidates: { label: string; dir: string }[] = [];
-  for (const { label, hostDir, realHostDir } of labels) {
-    candidates.push({ label, dir: hostDir });
-    if (realHostDir !== hostDir) candidates.push({ label, dir: realHostDir });
+  for (const entry of labels) {
+    for (const dir of spellingsOf(entry)) candidates.push({ label: entry.label, dir });
   }
   // Stable sort (V8 guarantees it), so two equal-length directories keep
-  // their `labels` order and this stays a pure refinement of the old
-  // longest-first rule rather than a reshuffle of it.
+  // their `labels` order and this stays a refinement of the old longest-first
+  // rule rather than a reshuffle of it.
   candidates.sort((a, b) => b.dir.length - a.dir.length);
   for (const { label, dir } of candidates) {
-    if (hostPath === dir) return `/${label}`;
-    const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
-    if (hostPath.startsWith(prefix)) {
-      // Slicing off `prefix` (not just `dir`) consumes the separator
-      // along with the directory, so `rest` never has one of its own --
-      // load-bearing for a granted "/" (the `--allowed-dir /` opt-out),
-      // where `dir.length` alone would slice off nothing and leave the
-      // path's own leading "/" glued directly onto the label with no
-      // separator between them at all (`/d0var/x`, not `/d0/var/x`).
-      const rest = hostPath.slice(prefix.length);
-      return `/${label}/${rest}`;
-    }
+    const virtual = underDir(hostPath, dir, label);
+    if (virtual !== null) return virtual;
+  }
+
+  // Stage 2: canonical containment. Only reached when no spelling matched,
+  // which after stage 1 means either a path form nothing in this repository
+  // produces, or a path that really is outside every grant.
+  if (!path.isAbsolute(hostPath)) return null;
+  const base = path.basename(hostPath);
+  if (base === '' || base === '.' || base === '..') return null;
+  const resolvedParent = canonicalizePath(path.dirname(hostPath));
+  if (resolvedParent === null) return null; // a symlink cycle resolves nowhere
+  // Entries with no `realHostDir` are skipped rather than guessed at: this
+  // stage's whole claim is that it compares against the same canonical form
+  // `isWithinAnyDir` does, and an entry that does not carry one has nothing
+  // to make that claim with.
+  const byRealDir = labels
+    .flatMap((l) =>
+      typeof l.realHostDir === 'string' && l.realHostDir.length > 0
+        ? [{ label: l.label, realHostDir: l.realHostDir }]
+        : []
+    )
+    .sort((a, b) => b.realHostDir.length - a.realHostDir.length);
+  for (const { label, realHostDir } of byRealDir) {
+    const parentVirtual = underDir(resolvedParent, realHostDir, label);
+    if (parentVirtual === null) continue;
+    // `parentVirtual` is "/<label>" for the grant root itself and
+    // "/<label>/x" below it; either way the entry's own name is appended
+    // verbatim, never resolved.
+    return `${parentVirtual}/${base}`;
   }
   return null;
+}
+
+/**
+ * Every string form of one grant, for a `LabelEntry` that may have been
+ * built by hand.
+ *
+ * `assignLabels` always populates `spellings`, but a `LabelEntry` written out
+ * literally -- a unit test, or any caller predating the field -- may carry
+ * only `hostDir`. Commit f6baa96 fixed exactly this shape crashing
+ * `redactLeakedHostPaths` (`escapeRegExp(undefined)` threw from inside the
+ * one function whose job is to fail safe), and the lesson generalises: a
+ * missing spelling must cost this layer nothing beyond the spelling itself.
+ * Derive and filter rather than assume.
+ */
+export function spellingsOf(entry: LabelEntry): string[] {
+  const forms = entry.spellings ?? [entry.hostDir, entry.realHostDir];
+  return [...new Set(forms.filter((f): f is string => typeof f === 'string' && f.length > 0))];
+}
+
+/**
+ * `hostPath` under `dir` -> its virtual form, or null.
+ *
+ * Slicing off `prefix` (not just `dir`) consumes the separator along with the
+ * directory, so `rest` never has one of its own -- load-bearing for a granted
+ * `/` (the `--allowed-dir /` opt-out), where `dir.length` alone would slice
+ * off nothing and leave the path's own leading `/` glued directly onto the
+ * label with no separator between them at all (`/d0var/x`, not `/d0/var/x`).
+ * The trailing separator is also what keeps `/allowed/project` from matching
+ * inside `/allowed/project-old`.
+ */
+function underDir(hostPath: string, dir: string, label: string): string | null {
+  if (hostPath === dir) return `/${label}`;
+  const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+  if (!hostPath.startsWith(prefix)) return null;
+  return `/${label}/${hostPath.slice(prefix.length)}`;
 }
 
 /** What issue #7 calls "emit a redaction": a placeholder that names the shape of the bug without naming the path. */
@@ -636,13 +753,19 @@ const PATH_BOUNDARY = "(?=[/\\s:,;'\"`)\\]}>|]|$)";
  */
 export function redactLeakedHostPaths(result: MCPCallResult, labels: LabelEntry[]): MCPCallResult {
   if (!result.isError || labels.length === 0) return result;
-  // `realHostDir` is absent on a LabelEntry built by hand (a unit test, or
-  // any caller predating issue #21). Filter rather than assume: a missing
-  // spelling must cost this alarm nothing, and `escapeRegExp(undefined)`
-  // would throw from inside the one function whose job is to fail safe.
-  const spellings = new Set(
-    labels.flatMap(({ hostDir, realHostDir }) => [hostDir, realHostDir]).filter(Boolean)
-  );
+  // EVERY spelling of each grant is scanned (issues #21/#35), for the same
+  // reason `hostToVirtual` matches them all: the lexical and canonical forms
+  // are as much the granted directory's real path as the operator's literal
+  // string is, and under a symlinked root or a `..`-bearing entry they are
+  // the ones a leak would actually be spelled with. An alarm that knew only
+  // the operator's spelling would have stayed silent on exactly the
+  // deployments those issues are about.
+  //
+  // `spellingsOf` also carries f6baa96's fix rather than repeating it: a
+  // LabelEntry built by hand has no `realHostDir`/`spellings` at all, and
+  // `escapeRegExp(undefined)` would throw from inside the one function whose
+  // job is to fail safe. It filters rather than assumes.
+  const spellings = new Set(labels.flatMap((entry) => spellingsOf(entry)));
   const leaked = [...spellings].some((dir) => {
     const re = new RegExp(`${escapeRegExp(dir)}${PATH_BOUNDARY}`);
     return result.content.some((item) => re.test(item.text));
