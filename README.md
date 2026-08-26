@@ -396,14 +396,17 @@ its virtual form; a host path that cannot be mapped back to any granted
 label is **redacted, not emitted** -- that case means something reached the
 client from outside the grant, which would be a bug, and a redacted string
 is the right output for a bug of that shape, not the raw path. One granted
-directory can be spelled two ways -- the path the operator wrote, and the
-path it resolves to when the grant is reached through a symlink -- and the
-outbound map recognises both, because a tool that resolves a path before it
-emits it produces the second one. Recognising it makes nothing new
-reachable: the two spellings resolve to the same files by construction, and
-either way the hit has already been through the same containment check
-before anything decides how to display it. See *A granted root that is
-itself a symlink*, below. Refusing an
+directory can be written more than one way -- the path the operator typed,
+the same path with a `..` collapsed out of it, and the path it resolves to
+when the grant is reached through a symlink -- and the outbound map treats
+all of them as what they are: one directory. It matches the known spellings
+first and, if none of them fit, resolves the path's parent directory and
+asks the same containment question the security check asks. Neither step
+makes anything new reachable: the spellings resolve to the same files by
+construction, the resolving step is a *weaker* test than the one every hit
+has already passed, and either way the hit went through the full containment
+check before anything decided how to display it. See *A granted directory
+has more than one name*, below. Refusing an
 argument that is not a valid `/<label>/…` address never echoes the argument
 back, either: an earlier version of this did, and because that echo was
 translated the same way everything else was, a *correct* host-path guess
@@ -823,6 +826,44 @@ at 18 seconds for one call, with an unrelated client's trivial read blocked
 for 16 of them. A walk that runs out of budget returns what it found and
 **says that it was cut short**; it never returns a short answer that reads
 like a complete one.
+
+### A granted directory has more than one name
+
+An `allowed_dirs` entry is a string, and the same directory can be named by
+more than one string: `/tmp/work` and `/private/tmp/work` on macOS,
+`/Users/runner/app` and `/Users/admin/app` when a home directory was
+migrated or a CI image left an alias behind, `/srv/projects/../projects/app`
+and `/srv/projects/app` when someone pasted a path with a `..` still in it.
+All of these are the same folder. fsMCP treats them that way, in both
+directions, and reports the same files for each.
+
+That is worth writing down because it was not always true, and because of
+how it failed. Containment was never affected -- the security check has
+always resolved a path before deciding, so all of these grants confined
+correctly. What broke was the *naming* of results afterwards, which compared
+strings. The failures were quiet and they were odd-looking:
+
+- a grant reached through a symlink returned an empty list from `fs_glob`,
+  on a success;
+- a grant reached through an aliased ancestor returned each file twice, one
+  copy named and one copy replaced by a placeholder;
+- a grant written with a `..` in it returned that placeholder for **every**
+  path from `fs_list` and `fs_glob`, while `fs_read`, `fs_grep` and
+  `fs_find` worked normally on the same grant.
+
+The placeholder in question -- `[fsmcp: path outside the granted directories
+-- redacted]` -- is fsMCP's alarm for "a path reached the client from outside
+the grant", which should be impossible and would be a bug in fsMCP if it
+happened. Firing it on ordinary, correct calls is worse than the wrong
+output it replaces: an alarm that goes off during normal use teaches
+everyone who sees it, human and agent alike, to stop reading it. Getting it
+to stop firing spuriously was as much the point of this fix as getting the
+names right, and it still fires -- immediately -- for a path that really is
+outside the grant.
+
+If you are configuring fsMCP: any of these spellings works, and the plainest
+one is still the best thing to type, because it is what appears in the audit
+log and in the messages an operator reads.
 
 ### A granted root that is itself a symlink
 
