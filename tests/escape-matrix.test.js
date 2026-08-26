@@ -841,3 +841,45 @@ test('fs_edit refuses new_string: null instead of writing the word "null" into t
   assert.match(allText(r), /new_string must be a string/i);
   assert.equal(fs.readFileSync(file, 'utf-8'), before, 'the file must be untouched by the refused edit');
 });
+
+// ---------------------------------------------------------------------------
+// C5 ("max bytes on fs_read and fs_write") named this requirement
+// explicitly and it was never implemented: fs_read loaded a file's entire
+// contents into memory with fs.readFileSync before offset/limit ever
+// trimmed it down, and fs_write had no size check on `content` at all.
+// fsmcp is one synchronous process serving every caller, so an unbounded
+// read or write is an unbounded synchronous allocation blocking every
+// other in-flight call. Fixed with a 10MB cap on each, checked before any
+// read/write syscall runs.
+// ---------------------------------------------------------------------------
+test('fs_read refuses a file over its byte cap instead of loading it whole', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const big = path.join(fx.root, 'big.txt');
+  // One byte over a 10MB cap -- written directly with the real fs module
+  // (not through fs_write, which has its own cap) so this test exercises
+  // fs_read's limit specifically.
+  fs.writeFileSync(big, Buffer.alloc(10 * 1024 * 1024 + 1, 'x'));
+
+  const r = await server.callTool('fs_read', { file_path: big });
+  assert.equal(r.isError, true, 'a file over the byte cap must be refused, not read in full');
+  assert.match(allText(r), /byte limit/i);
+});
+
+test('fs_write refuses content over its byte cap instead of writing it', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const target = path.join(fx.root, 'toobig.txt');
+  const hugeContent = 'x'.repeat(10 * 1024 * 1024 + 1);
+
+  const r = await server.callTool('fs_write', { file_path: target, content: hugeContent });
+  assert.equal(r.isError, true, 'content over the byte cap must be refused');
+  assert.match(allText(r), /byte limit/i);
+  assert.equal(fs.existsSync(target), false, 'nothing should have been written, not even a partial file');
+});
