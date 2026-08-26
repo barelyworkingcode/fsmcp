@@ -33,14 +33,32 @@ export interface MCPCallResult {
 /**
  * One allowed directory's virtual-space label (issue #7): `label` is what a
  * client addresses it as (always `/<label>/...`, never a bare `/`, even for
- * a single root -- see vpath.ts's assignLabels), `hostDir` is the real path
- * on disk it stands for. Lives here, not in vpath.ts, purely so
- * ToolContext below can reference it without vpath.ts and types.ts
- * importing each other.
+ * a single root -- see vpath.ts's assignLabels). Lives here, not in
+ * vpath.ts, purely so ToolContext below can reference it without vpath.ts
+ * and types.ts importing each other.
+ *
+ * TWO host paths, because one granted directory can have two spellings and
+ * both of them show up in real output (issue #21):
+ *
+ *  - `hostDir` is the string the operator (or relay) actually wrote, kept
+ *    byte-exact and never resolved. It is what INBOUND translation
+ *    concatenates onto, so `virtualToHost` still hands `security.ts` the
+ *    same unresolved string every tool validated before issue #7 existed --
+ *    resolving it here would pre-empt `canonicalizePath`'s kernel-style
+ *    walk, which is the one thing vpath.ts must never do.
+ *  - `realHostDir` is that same directory as `canonicalizePath` (security.ts,
+ *    the only resolver in this codebase) resolves it, and it differs only
+ *    when the grant is reached through a symlink -- `/tmp` on macOS, a
+ *    relocated home, an external volume behind a link. It exists so OUTBOUND
+ *    translation recognises a path a tool produced in resolved form, which
+ *    is otherwise unmappable and comes back redacted. See `hostToVirtual`
+ *    for why recognising the second spelling maps no file the first did not
+ *    already map.
  */
 export interface LabelEntry {
   label: string;
   hostDir: string;
+  realHostDir: string;
 }
 
 export interface ToolContext {

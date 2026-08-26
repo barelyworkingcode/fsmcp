@@ -185,7 +185,15 @@ Outbound, every path in every result and every error is translated back to
 its virtual form; a host path that cannot be mapped back to any granted
 label is **redacted, not emitted** -- that case means something reached the
 client from outside the grant, which would be a bug, and a redacted string
-is the right output for a bug of that shape, not the raw path. Refusing an
+is the right output for a bug of that shape, not the raw path. One granted
+directory can be spelled two ways -- the path the operator wrote, and the
+path it resolves to when the grant is reached through a symlink -- and the
+outbound map recognises both, because a tool that resolves a path before it
+emits it produces the second one. Recognising it makes nothing new
+reachable: the two spellings resolve to the same files by construction, and
+either way the hit has already been through the same containment check
+before anything decides how to display it. See *A granted root that is
+itself a symlink*, below. Refusing an
 argument that is not a valid `/<label>/…` address never echoes the argument
 back, either: an earlier version of this did, and because that echo was
 translated the same way everything else was, a *correct* host-path guess
@@ -285,6 +293,40 @@ fsMCP also cannot *create* a symlink: its entire mutating syscall surface is
 `tests/no-link-primitive.test.js` asserts against the source tree. A client
 therefore cannot plant its own escape hatch and then walk through it --
 every hop of which would have been correctly validated on the way out.
+
+### A granted root that is itself a symlink
+
+An allowed directory reached *through* a symlink -- `/tmp` on macOS, a
+relocated home directory, a folder on an external volume behind a link, a
+cloud-storage alias -- works, and every tool reports the same files it would
+report for the directory's real path. This is worth stating because it was
+not always true, and because of the way it failed.
+
+`fs_glob` is backed by the `glob` package, which by default will not walk
+*through* a `cwd` that is a symlink. Given a granted root that was one, a
+recursive pattern (`**/*.txt`) matched nothing and fsMCP returned **an empty
+result on a success**: the client was told its folder was empty, and the
+audit log recorded a normal call. A pattern whose first component is a
+literal (`sub/*.txt`) does not go through that walk and worked, so the
+failure looked intermittent rather than total, and `fs_find`, `fs_grep` and
+`fs_list` were correct on the same grant the whole time -- which made the
+grant itself look fine.
+
+An empty answer where a real one exists is the worst shape a filesystem tool
+can return. It is indistinguishable from the truth, so nothing downstream
+can catch it: an agent reads "no such files" and acts on it, and neither the
+client nor the operator gets any signal at all. fsMCP now hands the glob walk
+the directory's resolved path, so the walk starts somewhere real.
+
+**Enabling glob's "follow symlinks" option would not have fixed this, and
+would have cost containment.** It does not resolve a symlinked starting
+directory (measured), and it would additionally make the walk follow every
+link *inside* the tree, including ones pointing out of the grant -- the exact
+traversal the section above refuses. Resolving the root changes where the
+walk begins and nothing about what it will walk through: links under the root
+are still not followed, and every hit is still checked against the grant
+before the client sees it. A symlink inside a symlinked root, pointing out of
+it, is refused exactly as it is anywhere else.
 
 ## Configuration
 

@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import { globSync } from 'glob';
 import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
-import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { canonicalizePath, validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
 
 const MAX_RESULTS = 1000;
@@ -58,6 +58,46 @@ export function registerGlob(registry: ToolRegistry): void {
         return scopeViolationResult(NO_ALLOWED_DIRS_MESSAGE);
       }
 
+      // Issue #21: glob walks from `cwd`, and it will not walk THROUGH a
+      // `cwd` that is itself a symlink. `globSync`'s default `follow: false`
+      // means `**` stops dead at the granted root when the operator granted
+      // a path that goes through a link (`/tmp` on macOS, a relocated home,
+      // an external volume, a cloud-storage alias -- none of which an
+      // operator has to have thought about), and the caller is told, on a
+      // SUCCESS result, that the directory is empty. A pattern whose first
+      // component is a literal (`sub/*.txt`) sidesteps the `**` walk and
+      // works, which is what made this look intermittent rather than total.
+      //
+      // The fix is to give glob the directory as `canonicalizePath`
+      // (security.ts -- the only resolver in this codebase, and the one
+      // `isWithinAnyDir` already uses to decide what "inside this grant"
+      // means) resolves it, so the walk starts on a real directory.
+      //
+      // `follow: true` is NOT the fix and was tried: it does not resolve a
+      // symlinked `cwd` (verified), and it would make glob follow every
+      // symlink INSIDE the tree as well -- precisely the traversal the
+      // re-validation below exists to catch. Resolving the root changes
+      // where the walk starts and nothing about what it is willing to walk
+      // through: every symlink under the root is still un-followed, and
+      // every hit still goes through the real `validatePath`.
+      //
+      // A directory that will not resolve at all (a symlink cycle) is
+      // skipped, which is what `isWithinAnyDir` does with the same case and
+      // for the same reason: it cannot contain anything, so there is nothing
+      // to search. Unreachable from either branch above (the `path`-argument
+      // branch already refused it via `checkPathV`, the scope branch via
+      // `existsSync`), and handled rather than assumed away.
+      const searchRoots: string[] = [];
+      for (const dir of searchDirs) {
+        const real = canonicalizePath(dir);
+        if (real !== null) searchRoots.push(real);
+      }
+      if (searchRoots.length === 0) {
+        // Never an empty success: a directory that cannot be resolved is an
+        // error about the directory, not an answer about its contents.
+        return errorResult('search directory could not be resolved (too many levels of symbolic links)');
+      }
+
       // Run glob against each directory and collect unique matches.
       //
       // Every hit is re-validated rather than trusted for being a descendant
@@ -68,10 +108,12 @@ export function registerGlob(registry: ToolRegistry): void {
       // `<allowed>/linkdir/secret.txt` and `**/*` listed a symlink-to-file
       // whose bytes live outside. fs_read of those paths is refused, so this
       // was disclosure of names rather than contents, but the scope a caller
-      // is shown must be the scope they actually have.
+      // is shown must be the scope they actually have. Resolving the root
+      // above does not weaken this by an inch -- it is still every hit,
+      // through the real, unmodified `validatePath`.
       const seen = new Set<string>();
       const allMatches: string[] = [];
-      for (const dir of searchDirs) {
+      for (const dir of searchRoots) {
         try {
           const hits = globSync(pattern, { cwd: dir, absolute: true, nodir: true });
           for (const h of hits) {
@@ -103,7 +145,12 @@ export function registerGlob(registry: ToolRegistry): void {
       // Issue #7, outbound: every hit already passed validatePath above (the
       // real, unmodified security check); hostToVirtualOrRedact only
       // decides how to SHOW a path that check already accepted, and redacts
-      // rather than emits one it somehow can't map -- see vpath.ts.
+      // rather than emits one it somehow can't map -- see vpath.ts. Issue
+      // #21's second half lives on the other side of this call: these hits
+      // are now spelled with the RESOLVED root, and `hostToVirtual` had only
+      // the operator's unresolved spelling to match against, so resolving
+      // the walk without teaching the map both spellings would have turned
+      // an empty answer into a page of redaction placeholders.
       const result = capped.map((f) => hostToVirtualOrRedact(f.path, ctx.labels)).join('\n');
 
       const suffix = allMatches.length > MAX_RESULTS
