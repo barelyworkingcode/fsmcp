@@ -473,6 +473,20 @@ export function registerRead(registry: ToolRegistry): void {
       // there is no shorter page to return (a page of zero lines carries no
       // content and no usable continuation offset), so there is nothing to
       // be honest about except that this line does not fit.
+      // ...but ONLY when there was a line to format and it did not fit.
+      // `lines` is empty for two entirely ordinary requests -- an `offset`
+      // past the end of the file, which is exactly what paging to the end
+      // looks like, and `limit: 0` -- and issue #19's first version answered
+      // both with the refusal below, telling a caller that line 5 of a
+      // three-line file was too large to return. That is a regression this
+      // branch caused, not a condition it exists for: nothing was too big,
+      // there was simply nothing there. An empty page is the honest answer,
+      // and it carries the same continuation contract every other page does.
+      if (lines.length === 0) {
+        const empty = textResult('');
+        empty._meta = { truncated: false, lines: allLines.length };
+        return empty;
+      }
       if (formatted.length === 0) {
         return translateResult(
           errorResult(
