@@ -953,3 +953,125 @@ test('fs_write refuses content over its byte cap instead of writing it', async (
   assert.match(allText(r), /byte limit/i);
   assert.equal(fs.existsSync(target), false, 'nothing should have been written, not even a partial file');
 });
+
+// ===========================================================================
+// PR #10 review findings: the whole-result outbound rewrite that used to sit
+// in ToolRegistry.call (translateResultToVirtual) was too broad. Three
+// distinct problems, each with the exact repro that found it, all fixed by
+// replacing that mechanism with translation at each path's own construction
+// site (vpath.ts's translatePathIn/translateResult/checkPathV/describeError)
+// plus a narrow, isError-only backstop (redactLeakedHostPaths). These pin
+// all three so the whole-result rewrite cannot quietly come back.
+// ===========================================================================
+
+// P1: the old rewrite scanned EVERY result's text for the granted host
+// directory and replaced it -- including fs_read's own file content. A file
+// whose bytes happen to contain the sandbox's real path (a config, a log, a
+// script naming its own location) came back corrupted, not just translated.
+// The fix must be structural, not "translate less" -- fs_read's content
+// must never be a candidate for replacement at all, which this proves with
+// a real write-then-read round trip using the sandbox's own root as the
+// planted content.
+test("P1: file content containing the sandbox's own host path survives fs_write/fs_read byte-identical", async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  // The planted content IS the real host root, verbatim, with nothing
+  // after it -- exactly the shape that found this in review (`content:
+  // "<ROOT>"`). This matters: the old whole-result rewrite only replaced a
+  // host directory when it was immediately followed by "/", a newline, or
+  // the end of the string (a path-boundary guard against matching a
+  // sibling directory's longer name); content with the root followed by,
+  // say, a space would not have tripped it, so this has to reproduce the
+  // exact boundary shape, not just "content that mentions the root",
+  // or it would not actually have caught the bug it is named for.
+  const planted = fx.root;
+  const target = path.join(fx.root, 'mentions-root.txt');
+
+  const w = await server.callTool('fs_write', { file_path: v(target, fx), content: planted });
+  assert.equal(w.isError, undefined, allText(w));
+
+  // Ground truth: the real file, read directly, off the disk.
+  assert.equal(fs.readFileSync(target, 'utf-8'), planted, 'sanity: fs_write must have written the real bytes');
+
+  const r = await server.callTool('fs_read', { file_path: v(target, fx) });
+  assert.equal(r.isError, undefined, allText(r));
+  // fs_read's cat-n format prefixes a line number and a tab; strip it
+  // rather than assert on the raw content array, so this pins the CONTENT
+  // byte-for-byte without also re-pinning the formatting fs_read already
+  // has other tests for.
+  const [, readBack] = /^\s*1\t(.*)$/.exec(allText(r)) || [];
+  assert.equal(readBack, planted, "fs_read must return the file's content byte-identical, not translated");
+});
+
+// P2: the old rewrite made the "not a valid address" refusal an oracle. It
+// echoed the caller's own (rejected) argument back in the message, and that
+// echo passed through the same whole-result rewrite everything else did --
+// so a CORRECT host-path guess came back rewritten to its label ("path /d0/
+// a.txt is not a valid address"), while a wrong guess came back verbatim.
+// Comparing the two replies told a caller whether it had just guessed the
+// real sandbox root. The fix is to stop echoing the argument at all, so a
+// right guess and a wrong guess are indistinguishable.
+test('P2: the invalid-address refusal does not confirm a correct host-path guess', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const correctGuess = path.join(fx.root, 'a.txt'); // the real root, right the first time
+  const wrongGuess = '/Users/admin/projects/myapp/a.txt'; // an unrelated absolute path
+
+  const right = await server.callTool('fs_read', { file_path: correctGuess });
+  const wrong = await server.callTool('fs_read', { file_path: wrongGuess });
+
+  assert.equal(right.isError, true, 'a raw host path must still be refused, correct guess or not');
+  assert.equal(wrong.isError, true);
+
+  // The property under test: nothing distinguishes a correct guess from an
+  // incorrect one. Equal isError, equal _meta, and -- the specific thing
+  // that leaked before -- byte-identical reply text.
+  assert.deepEqual(right._meta, wrong._meta);
+  assert.equal(
+    allText(right),
+    allText(wrong),
+    'a correct host-path guess produced a different reply than an incorrect one -- that difference is an oracle'
+  );
+
+  // And neither reply names fx.root at all, confirmed independently of the
+  // equality check above (which would also pass if both leaked it equally).
+  assert.doesNotMatch(allText(right), new RegExp(fx.root.replace(/[/\\]/g, '.')));
+});
+
+// P3: the old rewrite's application was incidental (it fires only when a
+// result happens to contain a granted host directory as a substring), not a
+// deliberate decision at each call site -- which is a reason not to rely on
+// it, demonstrated here two ways: fs_grep's own diagnostic text (the
+// caller's regex, echoed back by ripgrep on a parse error) must survive
+// untouched the same way fs_read's file content must in P1, and a real
+// syscall error (unlike P1/P2, on the ERROR path) must still be translated
+// via the deliberate describeError/err.path route, not incidentally.
+test('P3: caller-echoed text is never touched, but a real syscall error path still is, deliberately', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  await t.test("fs_grep's regex-parse-error echoes the caller's pattern byte-for-byte", async () => {
+    const badPattern = '(unclosed group';
+    const r = await server.callTool('fs_grep', { pattern: badPattern });
+    assert.equal(r.isError, true);
+    assert.match(allText(r), new RegExp(badPattern.replace(/[().]/g, '\\$&')), "the caller's own pattern must survive untouched");
+  });
+
+  await t.test('a real fs_mkdir syscall error (EEXIST-shaped) still translates its host path', async () => {
+    const collision = path.join(fx.root, 'already-here');
+    fs.writeFileSync(collision, 'x'); // a plain file where fs_mkdir will try to create a directory
+
+    const r = await server.callTool('fs_mkdir', { path: v(collision, fx) });
+    assert.equal(r.isError, true);
+    assert.doesNotMatch(allText(r), new RegExp(fx.root.replace(/[/\\]/g, '.')), 'the raw host root must not appear in a real syscall error');
+    assert.match(allText(r), /\/d0\/already-here/, "the syscall error's own path must still be translated to its virtual form");
+  });
+});

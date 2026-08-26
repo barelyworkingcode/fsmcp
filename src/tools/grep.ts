@@ -3,8 +3,8 @@ import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext, LabelEntry } from '../types';
-import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
-import { decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { checkPathV, decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
 
 // Detect ripgrep at load time.
 //
@@ -109,7 +109,7 @@ export function registerGrep(registry: ToolRegistry): void {
         const decoded = decodeInboundPath(pathArg, ctx.labels);
         if (typeof decoded !== 'string') return decoded;
         const p = decoded;
-        const pathErr = checkPath(p, ctx.allowedDirs);
+        const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
         searchPaths = [p];
       } else if (ctx.allowedDirs.length > 0) {

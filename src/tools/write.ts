@@ -2,8 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
-import { decodeInboundPath } from '../vpath';
+import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
 // C5 ("max bytes on fs_read and fs_write"), same reasoning as fs_read's
 // MAX_READ_BYTES: an unbounded write is an unbounded synchronous allocation
@@ -37,9 +36,10 @@ export function registerWrite(registry: ToolRegistry): void {
       if (typeof filePathArg !== 'string') return filePathArg;
 
       // Issue #7: decode the client's virtual-space address into the host
-      // path checkPath (and everything after it) already expects -- see
-      // read.ts for the full reasoning. checkPath's own containment check
-      // is unmodified and still the thing that decides.
+      // path checkPathV (and everything after it) already expects -- see
+      // read.ts for the full reasoning. security.ts's own checkPath is
+      // unmodified and still the thing that decides; checkPathV only
+      // translates the message it returns.
       const decoded = decodeInboundPath(filePathArg, ctx.labels);
       if (typeof decoded !== 'string') return decoded;
       const filePath = decoded;
@@ -48,7 +48,7 @@ export function registerWrite(registry: ToolRegistry): void {
       if (typeof contentArg !== 'string') return contentArg;
       const content = contentArg;
 
-      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       const bytes = Buffer.byteLength(content, 'utf-8');
@@ -63,7 +63,7 @@ export function registerWrite(registry: ToolRegistry): void {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(filePath, content, 'utf-8');
 
-      return textResult(`Wrote ${bytes} bytes to ${filePath}`);
+      return translateResult(textResult(`Wrote ${bytes} bytes to ${filePath}`), [filePath], ctx.labels);
     }
   );
 }

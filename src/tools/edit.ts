@@ -1,8 +1,7 @@
 import * as fs from 'fs';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
-import { decodeInboundPath } from '../vpath';
+import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
@@ -55,14 +54,14 @@ export function registerEdit(registry: ToolRegistry): void {
       if (typeof replaceAllArg !== 'boolean') return replaceAllArg;
       const replaceAll = replaceAllArg;
 
-      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       let content: string;
       try {
         content = fs.readFileSync(filePath, 'utf-8');
       } catch {
-        return errorResult(`file not found: ${filePath}`);
+        return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
       }
 
       // Count occurrences
@@ -82,7 +81,11 @@ export function registerEdit(registry: ToolRegistry): void {
       const newContent = parts.join(newString);
       fs.writeFileSync(filePath, newContent, 'utf-8');
 
-      return textResult(`Replaced ${count} occurrence(s) in ${filePath}`);
+      return translateResult(
+        textResult(`Replaced ${count} occurrence(s) in ${filePath}`),
+        [filePath],
+        ctx.labels
+      );
     }
   );
 }

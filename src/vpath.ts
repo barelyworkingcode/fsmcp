@@ -1,6 +1,11 @@
 import * as path from 'path';
-import { MCPCallResult, MCPContent, LabelEntry, scopeViolationResult } from './types';
-import { NO_ALLOWED_DIRS_MESSAGE } from './security';
+import { MCPCallResult, MCPContent, LabelEntry, errorResult, scopeViolationResult } from './types';
+import {
+  NO_ALLOWED_DIRS_MESSAGE,
+  checkPath,
+  checkPathNoFollowFinal,
+  refuseAllowedDirRoot,
+} from './security';
 
 /**
  * Issue #7: the client never sees a host path, in either direction. It
@@ -191,11 +196,26 @@ export function decodeInboundPath(virtualPath: string, labels: LabelEntry[]): st
   }
   const host = virtualToHost(virtualPath, labels);
   if (host !== null) return host;
+  // The refusal does NOT echo `virtualPath` back, even though the caller
+  // already knows what it sent. Found in review (PR #10): the earlier
+  // version of this message included it, and that argument used to pass
+  // through the outbound translation pass too -- so a CORRECT host-path
+  // guess came back rewritten to its label ("path /d0/a.txt is not a valid
+  // address"), while a wrong guess came back byte-for-byte unchanged. That
+  // difference is a working oracle: try a candidate host path, read the
+  // reply, learn whether it matched a granted directory -- exactly the
+  // capability issue #7 exists to remove, just moved from "did fs_read
+  // succeed" to "was this refusal's echo rewritten". The fix is not to stop
+  // rewriting the echo (still a working, just noisier, oracle: rewritten
+  // vs. not is itself the signal) -- it is to stop echoing the caller's
+  // input at all. Naming the granted labels is not a comparable leak: they
+  // are already handed to the client on every successful call and in every
+  // other refusal.
   const known = labels.map((l) => `/${l.label}`).join(', ');
   return scopeViolationResult(
-    `path ${virtualPath} is not a valid address: every path must begin with one of this call's ` +
-      `granted labels (${known}), not an absolute host path -- see tools/list or a prior result ` +
-      `for the labels currently in scope`
+    `path is not a valid address: every path must begin with one of this call's granted labels ` +
+      `(${known}), not an absolute host path -- see tools/list or a prior result for the labels ` +
+      `currently in scope`
   );
 }
 
@@ -245,61 +265,162 @@ function escapeRegExp(s: string): string {
 }
 
 /**
- * The outbound backstop for every tool result: replace every occurrence of a
- * known host directory with its label, wherever it appears in the text --
- * this is what closes "the part that will actually be missed" (issue #7):
- * raw syscall error text. `fs.rmSync`/`fs.renameSync`/etc. embed the exact
- * host path fsmcp itself passed to the syscall in their own `err.message`
- * (`ENOTEMPTY: directory not empty, rmdir '/Users/.../root/notes'`), and
- * nothing upstream of that message ever gets a chance to build a virtual
- * form instead -- Node writes it three stack frames inside a C++ binding.
- * Post-processing every result's text against the known host directories is
- * the only place that catches it, and it is applied here, once, in
- * `ToolRegistry.call` (registry.ts), rather than trusted to each handler
- * that happens to build an error string.
+ * Replace every occurrence of ONE specific, already-known host path with its
+ * virtual form (or a redaction, if it cannot be mapped -- see
+ * `hostToVirtualOrRedact`), wherever it appears in `text`.
  *
- * A path-boundary lookahead (`/`, newline, or end of string) stops
- * `/allowed/project` from also matching inside an unrelated
- * `/allowed/project-old` -- a bare substring replace would corrupt that
- * sibling's name instead of leaving it alone. Longest-hostDir-first for the
- * same nesting reason `hostToVirtual` sorts: a shorter allowed dir must not
- * consume the prefix of a longer, more specific one that also matches here.
+ * This is deliberately narrow in a way a whole-result rewrite (what this
+ * used to be, before PR #10 review found the problem with it) is not: it
+ * only ever touches a substring the CALLER of this function already knows
+ * is a path, because the caller is the one who decoded it, passed it to a
+ * syscall, or built a message that names it. It never scans arbitrary
+ * output looking for anything that resembles one of fsmcp's directories.
+ * That distinction is why this is safe to use on a message and unsafe to
+ * use on file content: `fs_read`'s own bytes, or `fs_grep` content mode's
+ * matched line text, are never passed to this function as `hostPath`, so
+ * they are never candidates for replacement no matter what they contain --
+ * a file whose content happens to be (or contain) the sandbox's own host
+ * path comes back byte for byte unchanged, which the old whole-result
+ * rewrite did not guarantee (it corrupted exactly that file, confirmed by a
+ * write-then-read round trip in review).
  *
- * Deliberately narrow: this only ever removes strings fsmcp itself
- * configured as allowed directories. It does not attempt to recognise "any
- * absolute-looking path" in free text, because tool output legitimately
- * contains caller-supplied and file-content text that can look like a path
- * without being one of fsmcp's -- `fs_grep`'s own `invalid regex: <pattern>`
- * message echoes the caller's `pattern` verbatim, and a pattern of
- * `/etc/passwd` is not a host-path leak, it is fsmcp quoting the caller back
- * to themselves. A heuristic broad enough to catch an unrelated leak would
- * also redact that quote, trading a real (but here unreachable, see
- * `hostToVirtualOrRedact`) hazard for a routine false positive on ordinary
- * error text.
+ * A path-boundary lookahead is unnecessary here (unlike the old
+ * whole-result version): `hostPath` is an exact, complete path string, not
+ * a directory prefix that could also match a longer sibling's name, so a
+ * plain substring split/join cannot mis-fire the way scanning for a
+ * directory prefix across free text could.
  */
-export function rewriteHostPaths(text: string, labels: LabelEntry[]): string {
-  if (labels.length === 0) return text;
-  const sorted = [...labels].sort((a, b) => b.hostDir.length - a.hostDir.length);
-  let out = text;
-  for (const { label, hostDir } of sorted) {
-    const re = new RegExp(`${escapeRegExp(hostDir)}(?=[/\\n]|$)`, 'g');
-    out = out.replace(re, `/${label}`);
-  }
-  return out;
+export function translatePathIn(text: string, hostPath: string, labels: LabelEntry[]): string {
+  if (labels.length === 0 || !text.includes(hostPath)) return text;
+  return text.split(hostPath).join(hostToVirtualOrRedact(hostPath, labels));
 }
 
 /**
- * Applied to every tool result, success or error, in `ToolRegistry.call` --
- * the one place every handler's output (and registry.call's own
- * catch-and-`errorResult` backstop for a thrown exception) passes through
- * before it reaches the wire. See `rewriteHostPaths` for what this does and
- * does not catch.
+ * `translatePathIn`, applied across every content item of a result, for
+ * every host path the caller already knows is embedded in it. The ordinary
+ * shape for a tool handler's own success/error message: it already has the
+ * decoded host path (or two, for `fs_move`) in scope, and passes it here
+ * once, right before returning, rather than threading a second "virtual
+ * form of this same variable" through every template string.
  */
-export function translateResultToVirtual(result: MCPCallResult, labels: LabelEntry[]): MCPCallResult {
-  if (labels.length === 0) return result;
-  const content: MCPContent[] = result.content.map((item) => ({
-    ...item,
-    text: rewriteHostPaths(item.text, labels),
-  }));
+export function translateResult(result: MCPCallResult, hostPaths: string[], labels: LabelEntry[]): MCPCallResult {
+  if (labels.length === 0 || hostPaths.length === 0) return result;
+  const content: MCPContent[] = result.content.map((item) => {
+    let text = item.text;
+    for (const hostPath of hostPaths) text = translatePathIn(text, hostPath, labels);
+    return { ...item, text };
+  });
   return { ...result, content };
+}
+
+/**
+ * `security.ts`'s `checkPath`, wrapped so the refusal it returns (which
+ * embeds `filePath` verbatim -- "path <filePath> is outside allowed
+ * directories") comes back with that path already in its virtual form.
+ * `filePath` here is always the ALREADY-DECODED host path a tool handler is
+ * about to check, so this is exactly the same "one known substring" shape
+ * `translatePathIn` is built for -- not a second, independent check:
+ * `checkPath` (security.ts, untouched) still makes every decision, this
+ * only renames the path in the message it hands back.
+ */
+export function checkPathV(filePath: string, allowedDirs: string[], labels: LabelEntry[]): MCPCallResult | null {
+  const result = checkPath(filePath, allowedDirs);
+  return result ? translateResult(result, [filePath], labels) : null;
+}
+
+/** `checkPathV`, built on `checkPathNoFollowFinal` (C2) for fs_delete -- see checkPathV's doc. */
+export function checkPathNoFollowFinalV(
+  filePath: string,
+  allowedDirs: string[],
+  labels: LabelEntry[]
+): MCPCallResult | null {
+  const result = checkPathNoFollowFinal(filePath, allowedDirs);
+  return result ? translateResult(result, [filePath], labels) : null;
+}
+
+/** `security.ts`'s `refuseAllowedDirRoot`, wrapped the same way `checkPathV` wraps `checkPath`. */
+export function refuseAllowedDirRootV(
+  targetPath: string,
+  allowedDirs: string[],
+  action: string,
+  labels: LabelEntry[]
+): MCPCallResult | null {
+  const result = refuseAllowedDirRoot(targetPath, allowedDirs, action);
+  return result ? translateResult(result, [targetPath], labels) : null;
+}
+
+/**
+ * Build the text for a caught exception, translating the offending path(s)
+ * if Node's own error object names them structurally.
+ *
+ * Every `fs.*Sync` error is a `NodeJS.ErrnoException` carrying the syscall's
+ * own path as a real property (`.path`, and `.dest` too for a rename) --
+ * not just baked into `.message` as unstructured text. That property is the
+ * "hook" this issue needed and the old whole-result rewrite made
+ * unnecessary-looking: reading it lets the exact offending path be
+ * translated and the message rebuilt around it, instead of scanning the
+ * finished message for a directory prefix that happens to match. `err.path`
+ * is also correct for an error that names a path DEEPER than the one the
+ * caller passed in (a recursive delete failing three directories down):
+ * `translatePathIn`'s substring match still finds it because a real
+ * descendant path is always lexically prefixed by its ancestor, but reading
+ * `.path` off the exception is the precise version of that, not a
+ * coincidence this happens to rely on.
+ *
+ * Falls back to the plain message, untranslated, when neither property is
+ * present -- a small residual surface (a non-fs exception, or a future
+ * Node error shape without them) that `redactLeakedHostPaths` exists to
+ * catch as a backstop, not to translate.
+ */
+export function describeError(err: unknown, labels: LabelEntry[]): string {
+  if (err && typeof err === 'object') {
+    const e = err as NodeJS.ErrnoException & { dest?: string };
+    if (typeof e.path === 'string' || typeof e.dest === 'string') {
+      let message = typeof e.message === 'string' ? e.message : String(err);
+      if (typeof e.path === 'string') message = translatePathIn(message, e.path, labels);
+      if (typeof e.dest === 'string') message = translatePathIn(message, e.dest, labels);
+      return message;
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Final backstop, not a translation mechanism: if an ERROR result somehow
+ * still contains a literal granted host directory after every deliberate
+ * translation site above, that is a bug -- something reached the client
+ * from outside the grant, or a new call site was added without threading
+ * `translatePathIn`/`describeError` through it -- and the right response to
+ * a bug of that shape is to refuse to hand back the byte that proves it,
+ * not to patch the message in place.
+ *
+ * Scoped to `isError` results ONLY. This is what keeps it from becoming the
+ * whole-result rewrite this replaces: `fs_read`'s file content and
+ * `fs_grep`'s content-mode matched lines are real file bytes that can
+ * legitimately contain something that reads like the sandbox's own host
+ * path (a config file, a log, a script mentioning its own location), and
+ * every such case in this codebase is a SUCCESS result. Scanning success
+ * results here would mean "the file you asked to read happens to mention
+ * its own directory" and "fsmcp leaked a path from outside your grant"
+ * both trip the same alarm -- which is exactly the failure PR #10 review
+ * found (a legitimate read silently corrupted because its content matched
+ * a host directory). Restricting the scan to `isError` avoids it entirely:
+ * nothing in this codebase returns raw file content on an error path.
+ *
+ * A path-boundary lookahead (matching `hostToVirtual`/the old whole-result
+ * rewrite) avoids flagging an unrelated sibling directory that happens to
+ * share a prefix (`/allowed/project` inside `/allowed/project-old`).
+ */
+export function redactLeakedHostPaths(result: MCPCallResult, labels: LabelEntry[]): MCPCallResult {
+  if (!result.isError || labels.length === 0) return result;
+  const leaked = labels.some(({ hostDir }) => {
+    const re = new RegExp(`${escapeRegExp(hostDir)}(?=[/\n]|$)`);
+    return result.content.some((item) => re.test(item.text));
+  });
+  if (!leaked) return result;
+  return errorResult(
+    'fsmcp: internal error -- a result could not be produced without exposing a granted ' +
+      'directory\'s real path. Refusing to return it. This is a bug in fsmcp, not a property of ' +
+      'the request; please report it.'
+  );
 }

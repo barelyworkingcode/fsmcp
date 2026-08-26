@@ -2,8 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, intProp, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
-import { decodeInboundPath } from '../vpath';
+import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
 const IMAGE_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico',
@@ -49,32 +48,45 @@ export function registerRead(registry: ToolRegistry): void {
       // Issue #7: the client addresses files in the virtual space this call
       // was granted (/<label>/...), never a host path -- decodeInboundPath
       // is the only thing standing between the caller's argument and every
-      // check below, and it does not replace any of them: checkPath still
-      // runs, unmodified, on the host path it hands back.
+      // check below, and it does not replace any of them: checkPathV runs
+      // security.ts's own checkPath, unmodified, on the host path it hands
+      // back, and only translates the message THAT returns.
       const decoded = decodeInboundPath(filePathArg, ctx.labels);
       if (typeof decoded !== 'string') return decoded;
       const filePath = decoded;
 
-      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       let stat: fs.Stats;
       try {
         stat = fs.statSync(filePath);
       } catch {
-        return errorResult(`file not found: ${filePath}`);
+        return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
       }
 
       if (stat.isDirectory()) return errorResult('path is a directory, not a file');
 
       if (stat.size > MAX_READ_BYTES) {
-        return errorResult(
-          `${filePath} is ${stat.size} bytes, over fs_read's ${MAX_READ_BYTES}-byte limit; ` +
-            `narrow with offset/limit is not possible because the whole file must be loaded ` +
-            `to find line boundaries -- use fs_grep to search it instead`
+        return translateResult(
+          errorResult(
+            `${filePath} is ${stat.size} bytes, over fs_read's ${MAX_READ_BYTES}-byte limit; ` +
+              `narrow with offset/limit is not possible because the whole file must be loaded ` +
+              `to find line boundaries -- use fs_grep to search it instead`
+          ),
+          [filePath],
+          ctx.labels
         );
       }
 
+      // From here down: real file bytes. Neither this nor the formatted
+      // text below is EVER passed through translateResult/hostToVirtual --
+      // this is a file's own content, which can legitimately contain
+      // something that reads like the sandbox's own host path (a config, a
+      // log, a script mentioning its own location), and must reach the
+      // caller byte for byte regardless (PR #10 review: a whole-result
+      // rewrite used to run here too, and a write-then-read round trip
+      // showed it silently corrupting exactly this case).
       // Image files: return base64
       const ext = path.extname(filePath).toLowerCase();
       if (IMAGE_EXTENSIONS.has(ext)) {

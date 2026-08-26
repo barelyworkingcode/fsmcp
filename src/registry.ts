@@ -1,5 +1,5 @@
 import { MCPTool, MCPCallResult, ToolContext, errorResult } from './types';
-import { translateResultToVirtual } from './vpath';
+import { describeError, redactLeakedHostPaths } from './vpath';
 
 /**
  * Parse a boolean-shaped argument off the wire strictly: absent becomes
@@ -103,18 +103,20 @@ export class ToolRegistry {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  // Issue #7: every result, whether a handler returned it or this catch
-  // built it, passes through translateResultToVirtual before it reaches the
-  // wire. This is the ONE place that has to be right for every handler's
-  // raw syscall error text to stop leaking a host path -- `err.message` for
-  // an `ENOTEMPTY`/`EACCES`/etc. is written three stack frames inside a
-  // Node fs binding, with the exact host path this process handed the
-  // syscall embedded in it, and nothing upstream of that message ever gets
-  // a chance to build a virtual form instead. Centralizing the translation
-  // here means that is true regardless of which of the ten tools threw, and
-  // regardless of whether a future eleventh tool remembers to translate its
-  // own errors -- it does not have to, because it cannot reach the wire
-  // without going through this method first.
+  // Issue #7 / PR #10 review: every ERROR result, whether a handler
+  // returned it or this catch built it, passes through
+  // redactLeakedHostPaths before it reaches the wire -- an alarm, not a
+  // translation mechanism. Deliberate translation happens at each path's
+  // own construction site now (decodeInboundPath, checkPathV/
+  // checkPathNoFollowFinalV/refuseAllowedDirRootV, describeError,
+  // hostToVirtualOrRedact in the search tools), specifically so a SUCCESS
+  // result's file content (fs_read's bytes, fs_grep content mode's matched
+  // lines) is never scanned or rewritten -- a whole-result rewrite here
+  // used to do exactly that, and a write-then-read round trip in review
+  // showed it silently corrupting any file whose content happened to
+  // contain the sandbox's own host path. Restricting this backstop to
+  // `isError` results is what keeps that from recurring: nothing in this
+  // codebase returns raw file content on an error path.
   call(name: string, args: Record<string, unknown>, ctx: ToolContext): MCPCallResult {
     const reg = this.registrations.get(name);
     let result: MCPCallResult;
@@ -124,11 +126,15 @@ export class ToolRegistry {
       try {
         result = reg.handler(args, ctx);
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        result = errorResult(message);
+        // describeError (vpath.ts): a tool handler that let an fs exception
+        // escape uncaught is exactly the shape describeError exists for --
+        // Node's ErrnoException carries the offending path as `.path`
+        // (`.dest` too for a rename), which this translates before it ever
+        // reaches the wire.
+        result = errorResult(describeError(err, ctx.labels));
       }
     }
-    return translateResultToVirtual(result, ctx.labels);
+    return redactLeakedHostPaths(result, ctx.labels);
   }
 }
 

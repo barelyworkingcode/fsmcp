@@ -2,8 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath, canonicalizePath, refuseAllowedDirRoot } from '../security';
-import { decodeInboundPath } from '../vpath';
+import { canonicalizePath } from '../security';
+import { checkPathV, decodeInboundPath, describeError, refuseAllowedDirRootV, translateResult } from '../vpath';
 
 export function registerMove(registry: ToolRegistry): void {
   registry.register(
@@ -51,16 +51,16 @@ export function registerMove(registry: ToolRegistry): void {
       // source name goes away, the destination name comes into being -- and
       // checking only one would leave the other free to land outside the
       // sandbox.
-      const sourceErr = checkPath(source, ctx.allowedDirs);
+      const sourceErr = checkPathV(source, ctx.allowedDirs, ctx.labels);
       if (sourceErr) return sourceErr;
-      const destErr = checkPath(destination, ctx.allowedDirs);
+      const destErr = checkPathV(destination, ctx.allowedDirs, ctx.labels);
       if (destErr) return destErr;
 
       let sourceStat: fs.Stats;
       try {
         sourceStat = fs.lstatSync(source);
       } catch {
-        return errorResult(`source not found: ${source}`);
+        return translateResult(errorResult(`source not found: ${source}`), [source], ctx.labels);
       }
 
       // A directory moved into (or onto) its own descendant is refused by
@@ -77,13 +77,19 @@ export function registerMove(registry: ToolRegistry): void {
         (resolvedDestParent === resolvedSource ||
           resolvedDestParent.startsWith(resolvedSource + path.sep))
       ) {
-        return errorResult(`cannot move a directory into itself: ${source} -> ${destination}`);
+        return translateResult(
+          errorResult(`cannot move a directory into itself: ${source} -> ${destination}`),
+          [source, destination],
+          ctx.labels
+        );
       }
 
       const destExists = fs.existsSync(destination);
       if (destExists && !overwrite) {
-        return errorResult(
-          `destination already exists: ${destination} (pass overwrite: true to replace it)`
+        return translateResult(
+          errorResult(`destination already exists: ${destination} (pass overwrite: true to replace it)`),
+          [destination],
+          ctx.labels
         );
       }
 
@@ -96,7 +102,7 @@ export function registerMove(registry: ToolRegistry): void {
       // Same guard fs_delete uses (security.ts's refuseAllowedDirRoot),
       // applied here because this is the other place that syscall happens.
       if (destExists) {
-        const rootErr = refuseAllowedDirRoot(destination, ctx.allowedDirs, 'overwrite');
+        const rootErr = refuseAllowedDirRootV(destination, ctx.allowedDirs, 'overwrite', ctx.labels);
         if (rootErr) return rootErr;
       }
 
@@ -113,11 +119,10 @@ export function registerMove(registry: ToolRegistry): void {
         }
         fs.renameSync(source, destination);
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        return errorResult(`move failed: ${message}`);
+        return errorResult(`move failed: ${describeError(err, ctx.labels)}`);
       }
 
-      return textResult(`Moved ${source} to ${destination}`);
+      return translateResult(textResult(`Moved ${source} to ${destination}`), [source, destination], ctx.labels);
     }
   );
 }

@@ -2,8 +2,8 @@ import * as fs from 'fs';
 import { globSync } from 'glob';
 import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
-import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
-import { decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
 
 const MAX_RESULTS = 1000;
 
@@ -41,9 +41,11 @@ export function registerGlob(registry: ToolRegistry): void {
         const decoded = decodeInboundPath(pathArg, ctx.labels);
         if (typeof decoded !== 'string') return decoded;
         const p = decoded;
-        const pathErr = checkPath(p, ctx.allowedDirs);
+        const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
-        if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
+        if (!fs.existsSync(p)) {
+          return translateResult(errorResult(`directory not found: ${p}`), [p], ctx.labels);
+        }
         searchDirs = [p];
       } else if (ctx.allowedDirs.length > 0) {
         searchDirs = ctx.allowedDirs.filter((d) => fs.existsSync(d));
@@ -79,8 +81,11 @@ export function registerGlob(registry: ToolRegistry): void {
             allMatches.push(h);
           }
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return errorResult(`glob error: ${msg}`);
+          return translateResult(
+            errorResult(`glob error: ${describeError(err, ctx.labels)}`),
+            [dir],
+            ctx.labels
+          );
         }
       }
 

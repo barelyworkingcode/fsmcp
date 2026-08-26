@@ -119,7 +119,25 @@ Outbound, every path in every result and every error is translated back to
 its virtual form; a host path that cannot be mapped back to any granted
 label is **redacted, not emitted** -- that case means something reached the
 client from outside the grant, which would be a bug, and a redacted string
-is the right output for a bug of that shape, not the raw path.
+is the right output for a bug of that shape, not the raw path. Refusing an
+argument that is not a valid `/<label>/…` address never echoes the argument
+back, either: an earlier version of this did, and because that echo was
+translated the same way everything else was, a *correct* host-path guess
+came back rewritten to its label while a *wrong* one came back verbatim --
+telling a client, one refusal at a time, whether it had just guessed the
+real sandbox root. The fix is that the refusal names the granted labels and
+nothing else.
+
+Outbound translation happens where a path is produced, never as a scan over
+a finished result. **A file's own content -- what `fs_read` returns, or a
+matched line in `fs_grep`'s content mode -- is never a candidate for
+translation, under any circumstance,** even if it happens to contain text
+that reads like the sandbox's own path (a config file, a log, a script
+naming its own location): that content must reach the client byte for byte,
+and a whole-result scan cannot tell "this is a path" from "this is a file's
+bytes that happen to look like one" -- confirmed in review by a write-then-
+read round trip that came back silently altered under an earlier version of
+this feature that scanned everything.
 
 **Deliberately unchanged.** `--allowed-dir` and `_meta.allowed_dirs`
 themselves keep taking absolute **host** paths -- those are operator/relay
