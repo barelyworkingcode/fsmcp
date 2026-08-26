@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext, LabelEntry } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
@@ -69,7 +69,7 @@ export function registerGrep(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp('Regex pattern to search for'),
-          path: stringProp('File or directory to search in (defaults to all allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
           glob: stringProp("Glob to filter files (e.g. '*.ts')"),
           type: stringProp("File type filter (e.g. 'ts', 'js', 'py')"),
           output_mode: enumProp('Output mode', [

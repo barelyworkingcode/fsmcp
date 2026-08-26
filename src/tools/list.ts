@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { LabelEntry } from '../types';
@@ -72,7 +72,7 @@ export function registerList(registry: ToolRegistry): void {
         `Capped at ${MAX_ENTRIES} entries.`,
       inputSchema: schema(
         {
-          path: stringProp('Directory to list (defaults to the allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
         },
         []
       ),

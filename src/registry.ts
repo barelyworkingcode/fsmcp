@@ -162,3 +162,40 @@ export function boolProp(description: string): Record<string, unknown> {
 export function enumProp(description: string, values: string[]): Record<string, unknown> {
   return { type: 'string', description, enum: values };
 }
+
+/**
+ * Description text for every path ARGUMENT on every tool (`file_path`,
+ * `path`, `source`, `destination`) -- issue #7's virtual path space.
+ *
+ * A tool's `inputSchema` is built once, at module load (`registerFoo`
+ * runs when `main.ts` imports it, long before any `tools/call` exists), but
+ * the label(s) a given call is actually granted are assigned per call
+ * (`vpath.ts`'s `assignLabels`, from that call's `_meta`/CLI-narrowed
+ * scope) -- so there is no real label available here to put in an example.
+ * Before this, every one of these said "Absolute path to the file" (or
+ * "directory", "destination"), which stopped being true the moment
+ * `decodeInboundPath` started refusing a host path as an address: a client
+ * that only reads the schema, not a live result, would follow this text
+ * straight into a refusal whose whole point is to no longer echo what it
+ * sent (PR #10) -- correct behaviour that leaves that client nothing to
+ * learn from. Naming a concrete label instead (e.g. "/d0/notes/a.txt")
+ * would be a different way to mislead the same client: `d0` is only this
+ * server's most common case, not a guarantee, and a caller whose only
+ * label is an operator-chosen `label=` (or whose position isn't 0) would be
+ * told to type an address that is not theirs. "<label>" is written here as
+ * a literal placeholder for exactly that reason -- the real value(s) come
+ * from this server's own results (a directory listing, a search hit, the
+ * "not a valid address" refusal's own text), never from this schema.
+ *
+ * `detail`, when given, is appended for the handful of arguments that need
+ * something more (an optional path's default-to-scope behaviour).
+ */
+export function virtualPathDescription(detail?: string): string {
+  const base =
+    'Path in this call\'s granted virtual address space, shaped "/<label>/..." ' +
+    '(e.g. "/<label>/notes/a.txt") -- never a host filesystem path. "<label>" above is a ' +
+    'placeholder: the actual label(s) granted to this call are shown in this server\'s own ' +
+    'results (a listing, a search hit, or a refusal), not fixed ahead of time, so do not assume ' +
+    '"d0" or any other specific label without seeing it in a result first.';
+  return detail ? `${base} ${detail}` : base;
+}

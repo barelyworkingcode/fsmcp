@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, intProp, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, intProp, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
@@ -31,7 +31,7 @@ export function registerRead(registry: ToolRegistry): void {
         'Read file contents with line numbers (cat -n format). Supports offset and limit for partial reads. Lines longer than 2000 characters are truncated. Refuses files over 10MB -- use fs_grep to search a larger one instead.',
       inputSchema: schema(
         {
-          file_path: stringProp('Absolute path to the file'),
+          file_path: stringProp(virtualPathDescription()),
           offset: intProp('Line number to start reading from (1-based)'),
           limit: intProp('Maximum number of lines to read (default: 2000)'),
         },

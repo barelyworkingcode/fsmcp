@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import { globSync } from 'glob';
-import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
@@ -12,11 +12,11 @@ export function registerGlob(registry: ToolRegistry): void {
     {
       name: 'fs_glob',
       description:
-        'Find files matching a glob pattern. Returns absolute paths sorted by modification time (newest first). Capped at 1000 results.',
+        'Find files matching a glob pattern. Returns virtual paths ("/<label>/...", never a host filesystem path) sorted by modification time (newest first). Capped at 1000 results.',
       inputSchema: schema(
         {
           pattern: stringProp("Glob pattern (e.g. '**/*.ts')"),
-          path: stringProp('Directory to search in (defaults to all allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
         },
         ['pattern']
       ),

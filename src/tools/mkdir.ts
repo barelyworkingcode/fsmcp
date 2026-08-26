@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, describeError, translateResult } from '../vpath';
 
@@ -11,7 +11,7 @@ export function registerMkdir(registry: ToolRegistry): void {
         'Create a directory. Creates missing parent directories too unless recursive is set to false.',
       inputSchema: schema(
         {
-          path: stringProp('Absolute path of the directory to create'),
+          path: stringProp(virtualPathDescription()),
           recursive: boolProp('Create missing parent directories (default: true)'),
         },
         ['path']

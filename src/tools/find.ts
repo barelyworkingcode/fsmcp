@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
@@ -161,7 +161,7 @@ export function registerFind(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp('Fuzzy filename pattern (subsequence match, e.g. "fmain" matches "fs/main.ts")'),
-          path: stringProp('Directory to search in (defaults to all allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
         },
         ['pattern']
       ),

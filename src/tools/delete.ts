@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathNoFollowFinalV, decodeInboundPath, describeError, refuseAllowedDirRootV, translateResult } from '../vpath';
 
@@ -55,7 +55,7 @@ export function registerDelete(registry: ToolRegistry): void {
         `${MAX_DELETE_ENTRIES} entries per recursive delete.`,
       inputSchema: schema(
         {
-          path: stringProp('Absolute path to delete'),
+          path: stringProp(virtualPathDescription()),
           recursive: boolProp('Delete a non-empty directory and its contents (default: false)'),
         },
         ['path']

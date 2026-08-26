@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
@@ -11,7 +11,7 @@ export function registerEdit(registry: ToolRegistry): void {
         'Perform exact string replacement in a file. By default, old_string must appear exactly once (fails if 0 or >1 matches). Use replace_all to replace every occurrence.',
       inputSchema: schema(
         {
-          file_path: stringProp('Absolute path to the file'),
+          file_path: stringProp(virtualPathDescription()),
           old_string: stringProp('Exact string to find'),
           new_string: stringProp('Replacement string'),
           replace_all: boolProp('Replace all occurrences (default: false)'),

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { canonicalizePath } from '../security';
 import { checkPathV, decodeInboundPath, describeError, refuseAllowedDirRootV, translateResult } from '../vpath';
@@ -14,8 +14,8 @@ export function registerMove(registry: ToolRegistry): void {
         'overwrite is set to true.',
       inputSchema: schema(
         {
-          source: stringProp('Absolute path of the file or directory to move'),
-          destination: stringProp('Absolute destination path'),
+          source: stringProp(virtualPathDescription()),
+          destination: stringProp(virtualPathDescription()),
           overwrite: boolProp('Replace an existing destination (default: false)'),
         },
         ['source', 'destination']

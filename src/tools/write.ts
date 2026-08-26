@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
@@ -21,7 +21,7 @@ export function registerWrite(registry: ToolRegistry): void {
         'Write content to a file. Creates the file and parent directories if they do not exist. Overwrites existing files. Refuses content over 10MB.',
       inputSchema: schema(
         {
-          file_path: stringProp('Absolute path to the file'),
+          file_path: stringProp(virtualPathDescription()),
           content: stringProp('Content to write'),
         },
         ['file_path', 'content']
