@@ -161,6 +161,27 @@ export function registerMove(registry: ToolRegistry): void {
       const destRootErr = refuseAllowedDirRootWriteV(destination, ctx.allowedDirs, 'move onto', ctx.labels);
       if (destRootErr) return destRootErr;
 
+      // Issue #34: the same rule for the OTHER endpoint, and it is the delete
+      // half rather than the write half. `fs_delete` refuses to remove an
+      // allowed_dir root because the sandbox must survive its occupant -- an
+      // agent may do as it likes inside the granted folder, but the folder
+      // itself is the operator's boundary object, not the agent's to remove.
+      // `rename(2)` reaches that same outcome by a different syscall:
+      // measured, `fs_move { source: "/d0", destination: "/d1/moved-root" }`
+      // on a two-root grant left `/d0` gone and its whole tree relocated,
+      // audit `ok`. Nothing left the grant, so this is not a containment
+      // escape -- which is exactly why neither checkPathV nor issue #24's
+      // destination guard sees it.
+      //
+      // Classified like fs_delete's, NOT like #24's: a plain errorResult, no
+      // `_meta.scope_violation`. The client addressed something inside its own
+      // scope; `scope_violation` has to keep meaning "the client addressed
+      // something outside it" or the one signal an operator alerts on stops
+      // meaning anything. Same shared resolvesToAllowedDirRoot, so every alias
+      // spelling is one case.
+      const sourceRootErr = refuseAllowedDirRootV(source, ctx.allowedDirs, 'move', ctx.labels);
+      if (sourceRootErr) return sourceRootErr;
+
       let sourceStat: fs.Stats;
       try {
         sourceStat = fs.lstatSync(source);

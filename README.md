@@ -858,6 +858,26 @@ are still not followed, and every hit is still checked against the grant
 before the client sees it. A symlink inside a symlinked root, pointing out of
 it, is refused exactly as it is anywhere else.
 
+
+### Neither end of a move may be a granted root
+
+`fs_move` refuses a `source` or a `destination` that resolves to one of the
+granted directories itself, in any spelling (`/d0`, `/d0/`, `/d0/.`,
+`/d0/notes/..`, or a symlink inside the grant that points at the grant).
+
+The two ends are refused for different reasons. A **destination** that is a root
+would have `fs_move` create a name at the sandbox root -- the same rule
+`fs_write` and `fs_mkdir` follow, and a scope violation. A **source** that is a
+root would move the granted folder out of existence, which is the rule
+`fs_delete` already enforces: the sandbox must survive its occupant. An agent
+may do as it likes inside the granted folder; the folder itself is the
+operator's boundary object, not the agent's to remove.
+
+Only the destination case is flagged `scope_violation` in the audit. Moving the
+root away never reaches outside the grant, so calling it a scope violation would
+put a boundary-object mistake in the same column an operator uses to spot a real
+containment event.
+
 ## Configuration
 
 ### With Relay (recommended)
