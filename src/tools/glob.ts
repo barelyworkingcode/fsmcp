@@ -1,8 +1,9 @@
 import * as fs from 'fs';
 import { globSync } from 'glob';
-import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
-import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
 
 const MAX_RESULTS = 1000;
 
@@ -11,11 +12,11 @@ export function registerGlob(registry: ToolRegistry): void {
     {
       name: 'fs_glob',
       description:
-        'Find files matching a glob pattern. Returns absolute paths sorted by modification time (newest first). Capped at 1000 results.',
+        'Find files matching a glob pattern. Returns virtual paths ("/<label>/...", never a host filesystem path) sorted by modification time (newest first). Capped at 1000 results.',
       inputSchema: schema(
         {
           pattern: stringProp("Glob pattern (e.g. '**/*.ts')"),
-          path: stringProp('Directory to search in (defaults to all allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
         },
         ['pattern']
       ),
@@ -34,10 +35,17 @@ export function registerGlob(registry: ToolRegistry): void {
       // Determine search directories ("." is treated as omitted)
       let searchDirs: string[];
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
-        const pathErr = checkPath(p, ctx.allowedDirs);
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and the glob walk below) already expect -- see
+        // read.ts for the full reasoning.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
+        const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
-        if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
+        if (!fs.existsSync(p)) {
+          return translateResult(errorResult(`directory not found: ${p}`), [p], ctx.labels);
+        }
         searchDirs = [p];
       } else if (ctx.allowedDirs.length > 0) {
         searchDirs = ctx.allowedDirs.filter((d) => fs.existsSync(d));
@@ -73,8 +81,11 @@ export function registerGlob(registry: ToolRegistry): void {
             allMatches.push(h);
           }
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return errorResult(`glob error: ${msg}`);
+          return translateResult(
+            errorResult(`glob error: ${describeError(err, ctx.labels)}`),
+            [dir],
+            ctx.labels
+          );
         }
       }
 
@@ -89,7 +100,11 @@ export function registerGlob(registry: ToolRegistry): void {
       withMtime.sort((a, b) => b.mtime - a.mtime);
 
       const capped = withMtime.slice(0, MAX_RESULTS);
-      const result = capped.map((f) => f.path).join('\n');
+      // Issue #7, outbound: every hit already passed validatePath above (the
+      // real, unmodified security check); hostToVirtualOrRedact only
+      // decides how to SHOW a path that check already accepted, and redacts
+      // rather than emits one it somehow can't map -- see vpath.ts.
+      const result = capped.map((f) => hostToVirtualOrRedact(f.path, ctx.labels)).join('\n');
 
       const suffix = allMatches.length > MAX_RESULTS
         ? `\n\n(showing ${MAX_RESULTS} of ${allMatches.length} matches)`

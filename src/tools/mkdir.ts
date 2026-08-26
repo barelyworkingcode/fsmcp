@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
+import { checkPathV, decodeInboundPath, describeError, translateResult } from '../vpath';
 
 export function registerMkdir(registry: ToolRegistry): void {
   registry.register(
@@ -11,7 +11,7 @@ export function registerMkdir(registry: ToolRegistry): void {
         'Create a directory. Creates missing parent directories too unless recursive is set to false.',
       inputSchema: schema(
         {
-          path: stringProp('Absolute path of the directory to create'),
+          path: stringProp(virtualPathDescription()),
           recursive: boolProp('Create missing parent directories (default: true)'),
         },
         ['path']
@@ -24,12 +24,19 @@ export function registerMkdir(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const dirPathArg = requireStringArg(args, 'path');
       if (typeof dirPathArg !== 'string') return dirPathArg;
-      const dirPath = dirPathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPath (and everything after it) already expects -- see
+      // read.ts for the full reasoning.
+      const decoded = decodeInboundPath(dirPathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const dirPath = decoded;
+
       const recursiveArg = parseBoolArg(args.recursive, 'recursive', true);
       if (typeof recursiveArg !== 'boolean') return recursiveArg;
       const recursive = recursiveArg;
 
-      const pathErr = checkPath(dirPath, ctx.allowedDirs);
+      const pathErr = checkPathV(dirPath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       let existed = false;
@@ -38,16 +45,17 @@ export function registerMkdir(registry: ToolRegistry): void {
       } catch {
         // does not exist yet -- the ordinary case
       }
-      if (existed) return textResult(`directory already exists: ${dirPath}`);
+      if (existed) {
+        return translateResult(textResult(`directory already exists: ${dirPath}`), [dirPath], ctx.labels);
+      }
 
       try {
         fs.mkdirSync(dirPath, { recursive });
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        return errorResult(`mkdir failed: ${message}`);
+        return errorResult(`mkdir failed: ${describeError(err, ctx.labels)}`);
       }
 
-      return textResult(`Created directory: ${dirPath}`);
+      return translateResult(textResult(`Created directory: ${dirPath}`), [dirPath], ctx.labels);
     }
   );
 }

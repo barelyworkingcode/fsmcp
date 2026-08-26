@@ -48,7 +48,27 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { spawnServer, buildScopeFixture, removeFixture, OUTSIDE_CANARY } = require('./helpers');
+const {
+  spawnServer,
+  buildScopeFixture,
+  removeFixture,
+  OUTSIDE_CANARY,
+  toVirtual,
+  toVirtualVia,
+  NOT_A_VIRTUAL_PATH,
+} = require('./helpers');
+
+// Issue #7: every fixture in this file passes a single, unlabelled
+// --allowed-dir (fx.root) as this call's only root, either via the CLI flag
+// or as the sole entry of _meta.allowed_dirs -- src/vpath.ts's assignLabels
+// always names the first (and here, only) entry of the effective scope
+// "d0". `v(hostPath)` is shorthand for the common case of addressing
+// something under fx.root; rows that narrow the scope to a DIFFERENT root
+// (the C1 narrowing table) build their own address against that root
+// instead of this one.
+function v(hostPath, fx) {
+  return toVirtual(hostPath, fx.root);
+}
 
 function mkTmpDir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -70,21 +90,21 @@ test('row 1: read/write/edit/mkdir/move/delete all succeed inside root', async (
   t.after(() => server.close());
 
   await t.test('fs_read', async () => {
-    const r = await server.callTool('fs_read', { file_path: path.join(fx.root, 'a.txt') });
+    const r = await server.callTool('fs_read', { file_path: v(path.join(fx.root, 'a.txt'), fx) });
     assert.equal(r.isError, undefined, allText(r));
     assert.match(allText(r), /inside a\.txt/);
   });
 
   const created = path.join(fx.root, 'lifecycle.txt');
   await t.test('fs_write', async () => {
-    const r = await server.callTool('fs_write', { file_path: created, content: 'hello' });
+    const r = await server.callTool('fs_write', { file_path: v(created, fx), content: 'hello' });
     assert.equal(r.isError, undefined, allText(r));
     assert.equal(fs.readFileSync(created, 'utf-8'), 'hello');
   });
 
   await t.test('fs_edit', async () => {
     const r = await server.callTool('fs_edit', {
-      file_path: created,
+      file_path: v(created, fx),
       old_string: 'hello',
       new_string: 'world',
     });
@@ -94,21 +114,21 @@ test('row 1: read/write/edit/mkdir/move/delete all succeed inside root', async (
 
   const newDir = path.join(fx.root, 'lifecycle-dir');
   await t.test('fs_mkdir', async () => {
-    const r = await server.callTool('fs_mkdir', { path: newDir });
+    const r = await server.callTool('fs_mkdir', { path: v(newDir, fx) });
     assert.equal(r.isError, undefined, allText(r));
     assert.ok(fs.statSync(newDir).isDirectory());
   });
 
   const moved = path.join(newDir, 'lifecycle.txt');
   await t.test('fs_move', async () => {
-    const r = await server.callTool('fs_move', { source: created, destination: moved });
+    const r = await server.callTool('fs_move', { source: v(created, fx), destination: v(moved, fx) });
     assert.equal(r.isError, undefined, allText(r));
     assert.equal(fs.existsSync(created), false);
     assert.equal(fs.readFileSync(moved, 'utf-8'), 'world');
   });
 
   await t.test('fs_delete', async () => {
-    const r = await server.callTool('fs_delete', { path: moved });
+    const r = await server.callTool('fs_delete', { path: v(moved, fx) });
     assert.equal(r.isError, undefined, allText(r));
     assert.equal(fs.existsSync(moved), false);
   });
@@ -137,14 +157,14 @@ test('rows 2, 3, 6: read refusals; rows 7, 8, 9: search tools never surface an o
     // process before the server ever saw it, which would test path.join,
     // not fsmcp's own containment check.
     const target = `${fx.root}/../outside/secret.txt`;
-    const r = await server.callTool('fs_read', { file_path: target }, meta);
+    const r = await server.callTool('fs_read', { file_path: v(target, fx) }, meta);
     assert.equal(r.isError, true);
     assert.match(allText(r), /outside allowed directories/i);
   });
 
   await t.test('row 3: reading through a directory symlink out of scope is refused', async () => {
     const target = path.join(fx.root, 'link-out', 'passwd');
-    const r = await server.callTool('fs_read', { file_path: target }, meta);
+    const r = await server.callTool('fs_read', { file_path: v(target, fx) }, meta);
     assert.equal(r.isError, true);
     assert.match(allText(r), /outside allowed directories/i);
     assert.doesNotMatch(allText(r), /fake-etc-standin/);
@@ -160,7 +180,7 @@ test('rows 2, 3, 6: read refusals; rows 7, 8, 9: search tools never surface an o
     // the one row where a regression would look identical to a passing
     // test unless the resolution order is actually kernel-correct.
     const target = `${fx.root}/sub/link-up/../../outside/secret.txt`;
-    const r = await server.callTool('fs_read', { file_path: target }, meta);
+    const r = await server.callTool('fs_read', { file_path: v(target, fx) }, meta);
     assert.equal(r.isError, true);
     assert.match(allText(r), /outside allowed directories/i);
   });
@@ -179,8 +199,13 @@ test('rows 2, 3, 6: read refusals; rows 7, 8, 9: search tools never surface an o
     assert.doesNotMatch(text, /fake-etc/);
     for (const line of text.split('\n')) {
       if (!line.trim() || line.startsWith('(showing')) continue;
+      // Issue #7: fs_glob's own output is virtual now (translated by
+      // hostToVirtualOrRedact in glob.ts), so "reported a path outside
+      // root" is checked against the /d0/... form, not fx.root itself --
+      // fx.root never appears in a result at all any more, which is the
+      // property row 1 of issue #7's acceptance table exists to prove.
       assert.ok(
-        line.startsWith(fx.root + path.sep) || line === fx.root,
+        line.startsWith('/d0/') || line === '/d0',
         `fs_glob reported a path outside root: ${line}`
       );
     }
@@ -218,7 +243,7 @@ test('row 4: writing through a symlink to an outside file is refused, and the fi
   const before = fs.readFileSync(secretPath); // Buffer, for a real byte compare
 
   const r = await server.callTool('fs_write', {
-    file_path: path.join(fx.root, 'link-out-file'),
+    file_path: v(path.join(fx.root, 'link-out-file'), fx),
     content: 'OVERWRITTEN-THROUGH-THE-LINK',
   });
   assert.equal(r.isError, true, allText(r));
@@ -245,7 +270,7 @@ test('row 5: writing through a dangling symlink creates nothing at the target', 
   assert.equal(fs.existsSync(target), false, 'sanity: the dangling target must not pre-exist');
 
   const r = await server.callTool('fs_write', {
-    file_path: path.join(fx.root, 'dangling'),
+    file_path: v(path.join(fx.root, 'dangling'), fx),
     content: 'should never land anywhere',
   });
   assert.equal(r.isError, true, allText(r));
@@ -266,7 +291,7 @@ test('rows 10, 11, 12: fs_delete containment', async (t) => {
   t.after(() => server.close());
 
   await t.test('row 10: deleting the allowed_dir root itself is refused', async () => {
-    const r = await server.callTool('fs_delete', { path: fx.root, recursive: true });
+    const r = await server.callTool('fs_delete', { path: v(fx.root, fx), recursive: true });
     assert.equal(r.isError, true);
     assert.match(allText(r), /allowed_dir root/i);
     assert.ok(fs.statSync(fx.root).isDirectory(), 'the sandbox root must survive its occupant');
@@ -274,7 +299,7 @@ test('rows 10, 11, 12: fs_delete containment', async (t) => {
 
   await t.test('row 11: deleting a non-empty directory without recursive is refused', async () => {
     const notes = path.join(fx.root, 'notes');
-    const r = await server.callTool('fs_delete', { path: notes });
+    const r = await server.callTool('fs_delete', { path: v(notes, fx) });
     assert.equal(r.isError, true);
     assert.match(allText(r), /not empty/i);
     assert.equal(fs.existsSync(path.join(notes, 'note1.txt')), true, 'nothing should have been removed');
@@ -284,7 +309,7 @@ test('rows 10, 11, 12: fs_delete containment', async (t) => {
     const link = path.join(fx.root, 'link-out');
     const passwdBefore = fs.readFileSync(path.join(fx.fakeEtc, 'passwd'));
 
-    const r = await server.callTool('fs_delete', { path: link });
+    const r = await server.callTool('fs_delete', { path: v(link, fx) });
     assert.equal(r.isError, undefined, allText(r));
 
     // The link itself is gone -- lstat (not existsSync, which follows
@@ -318,7 +343,10 @@ test('row 13: fs_move refuses both in->out and out->in', async (t) => {
     const before = fs.readFileSync(source);
     const dest = path.join(fx.outside, 'moved-a.txt');
 
-    const r = await server.callTool('fs_move', { source, destination: dest });
+    const r = await server.callTool('fs_move', {
+      source: v(source, fx),
+      destination: toVirtualVia(dest, fx.root),
+    });
     assert.equal(r.isError, true);
     assert.match(allText(r), /outside allowed directories/i);
     assert.equal(fs.existsSync(dest), false);
@@ -330,7 +358,10 @@ test('row 13: fs_move refuses both in->out and out->in', async (t) => {
     const before = fs.readFileSync(source);
     const dest = path.join(fx.root, 'moved-in.txt');
 
-    const r = await server.callTool('fs_move', { source, destination: dest });
+    const r = await server.callTool('fs_move', {
+      source: toVirtualVia(source, fx.root),
+      destination: v(dest, fx),
+    });
     assert.equal(r.isError, true);
     assert.match(allText(r), /outside allowed directories/i);
     assert.equal(fs.existsSync(dest), false);
@@ -378,6 +409,12 @@ test('row 15: --allowed-dir root + _meta.allowed_dirs ["/"] never widens past ro
   const server = spawnServer(['--allowed-dir', fx.root]);
   t.after(() => server.close());
 
+  // file_path stays a host path in both reads below on purpose: "/" is the
+  // only _meta dir and it is dropped (not contained within fx.root), so the
+  // effective scope -- and this call's labels -- are empty either way.
+  // decodeInboundPath refuses on an empty scope before it ever looks at the
+  // argument's shape (src/vpath.ts), so what the argument says is
+  // immaterial to what's under test here: that "/" cannot widen past root.
   const outsideRead = await server.callTool(
     'fs_read',
     { file_path: path.join(fx.outside, 'secret.txt') },
@@ -409,7 +446,7 @@ test('row 15: --allowed-dir root + _meta.allowed_dirs ["/"] never widens past ro
   // Positive control: the same in-scope read succeeds with no _meta at all,
   // proving the refusal above is about the bad _meta value, not about the
   // server or the fixture being broken.
-  const controlRead = await server.callTool('fs_read', { file_path: path.join(fx.root, 'a.txt') });
+  const controlRead = await server.callTool('fs_read', { file_path: v(path.join(fx.root, 'a.txt'), fx) });
   assert.equal(controlRead.isError, undefined, allText(controlRead));
 });
 
@@ -430,11 +467,18 @@ test('a scope refusal carries _meta.scope_violation: true; a plain miss does not
   const server = spawnServer(['--allowed-dir', fx.root]);
   t.after(() => server.close());
 
+  // file_path stays a host path here on purpose: fx.outside has no virtual
+  // form under this call's only label (d0 -> fx.root), so this is refused
+  // at decodeInboundPath as "not a valid address" rather than reaching
+  // validatePath's "outside allowed directories" -- but both refusal
+  // shapes are scope violations (src/vpath.ts's decodeInboundPath doc),
+  // which is exactly the property this assertion is checking.
   const refusal = await server.callTool('fs_read', { file_path: path.join(fx.outside, 'secret.txt') });
   assert.equal(refusal.isError, true);
+  assert.match(allText(refusal), NOT_A_VIRTUAL_PATH, 'expected the decode-stage refusal, not validatePath\'s');
   assert.equal(refusal._meta && refusal._meta.scope_violation, true, 'a scope refusal must set _meta.scope_violation');
 
-  const miss = await server.callTool('fs_read', { file_path: path.join(fx.root, 'does-not-exist.txt') });
+  const miss = await server.callTool('fs_read', { file_path: v(path.join(fx.root, 'does-not-exist.txt'), fx) });
   assert.equal(miss.isError, true);
   assert.match(allText(miss), /file not found/i);
   assert.ok(
@@ -457,14 +501,29 @@ test('C1: all four rows of the CLI/_meta narrowing table', async (t) => {
   await t.test('CLI set, _meta set and contained: effective scope is the intersection (narrower than CLI)', async () => {
     const server = spawnServer(['--allowed-dir', fx.root]);
     try {
-      const meta = { allowed_dirs: [path.join(fx.root, 'notes')] };
-      const outsideNarrowedScope = await server.callTool('fs_read', { file_path: inside }, meta);
+      const notesDir = path.join(fx.root, 'notes');
+      const meta = { allowed_dirs: [notesDir] };
+      // This call's ONLY label (d0) stands for notesDir, not fx.root -- the
+      // effective scope narrowAllowedDirs computed for it, not the CLI
+      // grant. `inside` (fx.root/a.txt) is a sibling of notesDir, not a
+      // descendant, so it is addressed by climbing out with toVirtualVia,
+      // the same shape a caller who knew the two were siblings could type
+      // by hand; `notesFile` genuinely is a descendant of notesDir.
+      const outsideNarrowedScope = await server.callTool(
+        'fs_read',
+        { file_path: toVirtualVia(inside, notesDir) },
+        meta
+      );
       assert.equal(
         outsideNarrowedScope.isError,
         true,
         'a.txt sits inside the CLI grant but outside the _meta-narrowed one, and must refuse'
       );
-      const insideNarrowedScope = await server.callTool('fs_read', { file_path: notesFile }, meta);
+      const insideNarrowedScope = await server.callTool(
+        'fs_read',
+        { file_path: toVirtual(notesFile, notesDir) },
+        meta
+      );
       assert.equal(insideNarrowedScope.isError, undefined, allText(insideNarrowedScope));
     } finally {
       server.close();
@@ -474,7 +533,7 @@ test('C1: all four rows of the CLI/_meta narrowing table', async (t) => {
   await t.test('CLI set, _meta absent: effective scope is the CLI grant, unchanged', async () => {
     const server = spawnServer(['--allowed-dir', fx.root]);
     try {
-      const r = await server.callTool('fs_read', { file_path: inside } /* no _meta arg at all */);
+      const r = await server.callTool('fs_read', { file_path: v(inside, fx) } /* no _meta arg at all */);
       assert.equal(r.isError, undefined, allText(r));
     } finally {
       server.close();
@@ -485,9 +544,13 @@ test('C1: all four rows of the CLI/_meta narrowing table', async (t) => {
     const server = spawnServer([]);
     try {
       const meta = { allowed_dirs: [fx.root] };
-      const insideRead = await server.callTool('fs_read', { file_path: inside }, meta);
+      const insideRead = await server.callTool('fs_read', { file_path: v(inside, fx) }, meta);
       assert.equal(insideRead.isError, undefined, allText(insideRead));
-      const outsideRead = await server.callTool('fs_read', { file_path: path.join(fx.outside, 'secret.txt') }, meta);
+      const outsideRead = await server.callTool(
+        'fs_read',
+        { file_path: toVirtualVia(path.join(fx.outside, 'secret.txt'), fx.root) },
+        meta
+      );
       assert.equal(outsideRead.isError, true);
     } finally {
       server.close();
@@ -510,9 +573,11 @@ test('C1: all four rows of the CLI/_meta narrowing table', async (t) => {
     try {
       // One entry is a genuine narrowing (kept); one is outside the CLI
       // grant entirely (dropped). Proves dropping is per-entry, not
-      // all-or-nothing for the whole _meta.allowed_dirs array.
-      const meta = { allowed_dirs: [path.join(fx.root, 'notes'), fx.outside] };
-      const r = await server.callTool('fs_read', { file_path: notesFile }, meta);
+      // all-or-nothing for the whole _meta.allowed_dirs array. The
+      // surviving entry (notesDir) is this call's only label, d0.
+      const notesDir = path.join(fx.root, 'notes');
+      const meta = { allowed_dirs: [notesDir, fx.outside] };
+      const r = await server.callTool('fs_read', { file_path: toVirtual(notesFile, notesDir) }, meta);
       assert.equal(r.isError, undefined, allText(r));
       assert.match(allText(r), /_meta\.allowed_dirs entries were dropped/i);
       assert.match(allText(r), new RegExp(fx.outside.replace(/[/\\]/g, '.')));
@@ -570,7 +635,7 @@ test('fs_delete recursive unlinks a symlink inside the tree rather than descendi
   const server = spawnServer(['--allowed-dir', fx.root]);
   t.after(() => server.close());
 
-  const r = await server.callTool('fs_delete', { path: path.join(fx.root, 'notes'), recursive: true });
+  const r = await server.callTool('fs_delete', { path: v(path.join(fx.root, 'notes'), fx), recursive: true });
   assert.equal(r.isError, undefined, allText(r));
   assert.equal(fs.existsSync(path.join(fx.root, 'notes')), false, 'notes/ itself should be gone');
 
@@ -591,7 +656,7 @@ test('fs_move refuses to move a directory into itself', async (t) => {
   const source = path.join(fx.root, 'deep');
   const destination = path.join(fx.root, 'deep', 'nested', 'moved-into-self');
 
-  const r = await server.callTool('fs_move', { source, destination });
+  const r = await server.callTool('fs_move', { source: v(source, fx), destination: v(destination, fx) });
   assert.equal(r.isError, true);
   assert.match(allText(r), /cannot move a directory into itself/i);
   assert.ok(fs.statSync(path.join(fx.root, 'deep', 'nested', 'dirs')).isDirectory(), 'the source tree must be untouched');
@@ -620,8 +685,8 @@ test('fs_move with overwrite:true onto the allowed_dir root does not erase the r
   assert.ok(fs.existsSync(source), 'sanity: the file this test moves must exist beforehand');
 
   const r = await server.callTool('fs_move', {
-    source,
-    destination: fx.root,
+    source: v(source, fx),
+    destination: v(fx.root, fx),
     overwrite: true,
   });
 
@@ -652,7 +717,7 @@ test('fs_delete treats recursive:"false" (a truthy string) as a bad argument, no
   t.after(() => server.close());
 
   const notes = path.join(fx.root, 'notes');
-  const r = await server.callTool('fs_delete', { path: notes, recursive: 'false' });
+  const r = await server.callTool('fs_delete', { path: v(notes, fx), recursive: 'false' });
 
   assert.equal(r.isError, true, 'a stringly-typed "false" must not be read as true');
   assert.match(allText(r), /recursive must be true or false/i);
@@ -672,7 +737,7 @@ test('fs_move treats overwrite:"false" (a truthy string) as a bad argument, not 
   const destination = path.join(fx.root, 'notes', 'note1.txt');
   const destBefore = fs.readFileSync(destination, 'utf-8');
 
-  const r = await server.callTool('fs_move', { source, destination, overwrite: 'false' });
+  const r = await server.callTool('fs_move', { source: v(source, fx), destination: v(destination, fx), overwrite: 'false' });
 
   assert.equal(r.isError, true, 'a stringly-typed "false" must not be read as true');
   assert.match(allText(r), /overwrite must be true or false/i);
@@ -700,7 +765,7 @@ test('fs_delete refuses past the entry cap rather than partially deleting', asyn
   const server = spawnServer(['--allowed-dir', tmp]);
   t.after(() => server.close());
 
-  const r = await server.callTool('fs_delete', { path: bigDir, recursive: true });
+  const r = await server.callTool('fs_delete', { path: toVirtual(bigDir, tmp), recursive: true });
   assert.equal(r.isError, true);
   assert.match(allText(r), /more than 10000 entries/i);
   assert.equal(fs.readdirSync(bigDir).length, ENTRY_COUNT, 'not one entry should have been removed');
@@ -721,7 +786,7 @@ test('a symlink to the real /etc is refused on read (the one place the real path
   const server = spawnServer(['--allowed-dir', root]);
   t.after(() => server.close());
 
-  const r = await server.callTool('fs_read', { file_path: path.join(root, 'real-etc', 'passwd') });
+  const r = await server.callTool('fs_read', { file_path: toVirtual(path.join(root, 'real-etc', 'passwd'), root) });
   assert.equal(r.isError, true);
   assert.match(allText(r), /outside allowed directories/i);
 });
@@ -761,6 +826,11 @@ test('a non-array _meta.allowed_dirs fails the one call closed, and does not tak
 
   const malformedValues = [null, {}, 42, 'not-an-array', true, [42], [null]];
 
+  // file_path stays a host path throughout this loop on purpose: a
+  // malformed _meta.allowed_dirs is treated as an empty scope (C1), which
+  // means this call's labels are empty too, and decodeInboundPath refuses
+  // on that alone before ever looking at the argument (src/vpath.ts) --
+  // exactly the fail-closed behaviour under test.
   for (const badValue of malformedValues) {
     const r = await server.callTool(
       'fs_read',
@@ -779,7 +849,7 @@ test('a non-array _meta.allowed_dirs fails the one call closed, and does not tak
   // (including this one, from a well-behaved caller with no _meta at all)
   // hang until the test's own request timeout, rather than fail fast and
   // visibly.
-  const control = await server.callTool('fs_read', { file_path: path.join(fx.root, 'a.txt') });
+  const control = await server.callTool('fs_read', { file_path: v(path.join(fx.root, 'a.txt'), fx) });
   assert.equal(control.isError, undefined, allText(control));
   assert.match(allText(control), /inside a\.txt/);
 });
@@ -832,7 +902,7 @@ test('fs_edit refuses new_string: null instead of writing the word "null" into t
   const before = fs.readFileSync(file, 'utf-8');
 
   const r = await server.callTool('fs_edit', {
-    file_path: file,
+    file_path: v(file, fx),
     old_string: 'inside',
     new_string: null,
   });
@@ -864,7 +934,7 @@ test('fs_read refuses a file over its byte cap instead of loading it whole', asy
   // fs_read's limit specifically.
   fs.writeFileSync(big, Buffer.alloc(10 * 1024 * 1024 + 1, 'x'));
 
-  const r = await server.callTool('fs_read', { file_path: big });
+  const r = await server.callTool('fs_read', { file_path: v(big, fx) });
   assert.equal(r.isError, true, 'a file over the byte cap must be refused, not read in full');
   assert.match(allText(r), /byte limit/i);
 });
@@ -878,8 +948,249 @@ test('fs_write refuses content over its byte cap instead of writing it', async (
   const target = path.join(fx.root, 'toobig.txt');
   const hugeContent = 'x'.repeat(10 * 1024 * 1024 + 1);
 
-  const r = await server.callTool('fs_write', { file_path: target, content: hugeContent });
+  const r = await server.callTool('fs_write', { file_path: v(target, fx), content: hugeContent });
   assert.equal(r.isError, true, 'content over the byte cap must be refused');
   assert.match(allText(r), /byte limit/i);
   assert.equal(fs.existsSync(target), false, 'nothing should have been written, not even a partial file');
+});
+
+// ===========================================================================
+// PR #10 review findings: the whole-result outbound rewrite that used to sit
+// in ToolRegistry.call (translateResultToVirtual) was too broad. Three
+// distinct problems, each with the exact repro that found it, all fixed by
+// replacing that mechanism with translation at each path's own construction
+// site (vpath.ts's translatePathIn/translateResult/checkPathV/describeError)
+// plus a narrow, isError-only backstop (redactLeakedHostPaths). These pin
+// all three so the whole-result rewrite cannot quietly come back.
+// ===========================================================================
+
+// P1: the old rewrite scanned EVERY result's text for the granted host
+// directory and replaced it -- including fs_read's own file content. A file
+// whose bytes happen to contain the sandbox's real path (a config, a log, a
+// script naming its own location) came back corrupted, not just translated.
+// The fix must be structural, not "translate less" -- fs_read's content
+// must never be a candidate for replacement at all, which this proves with
+// a real write-then-read round trip using the sandbox's own root as the
+// planted content.
+test("P1: file content containing the sandbox's own host path survives fs_write/fs_read byte-identical", async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  // The planted content IS the real host root, verbatim, with nothing
+  // after it -- exactly the shape that found this in review (`content:
+  // "<ROOT>"`). This matters: the old whole-result rewrite only replaced a
+  // host directory when it was immediately followed by "/", a newline, or
+  // the end of the string (a path-boundary guard against matching a
+  // sibling directory's longer name); content with the root followed by,
+  // say, a space would not have tripped it, so this has to reproduce the
+  // exact boundary shape, not just "content that mentions the root",
+  // or it would not actually have caught the bug it is named for.
+  const planted = fx.root;
+  const target = path.join(fx.root, 'mentions-root.txt');
+
+  const w = await server.callTool('fs_write', { file_path: v(target, fx), content: planted });
+  assert.equal(w.isError, undefined, allText(w));
+
+  // Ground truth: the real file, read directly, off the disk.
+  assert.equal(fs.readFileSync(target, 'utf-8'), planted, 'sanity: fs_write must have written the real bytes');
+
+  const r = await server.callTool('fs_read', { file_path: v(target, fx) });
+  assert.equal(r.isError, undefined, allText(r));
+  // fs_read's cat-n format prefixes a line number and a tab; strip it
+  // rather than assert on the raw content array, so this pins the CONTENT
+  // byte-for-byte without also re-pinning the formatting fs_read already
+  // has other tests for.
+  const [, readBack] = /^\s*1\t(.*)$/.exec(allText(r)) || [];
+  assert.equal(readBack, planted, "fs_read must return the file's content byte-identical, not translated");
+});
+
+// P2: the old rewrite made the "not a valid address" refusal an oracle. It
+// echoed the caller's own (rejected) argument back in the message, and that
+// echo passed through the same whole-result rewrite everything else did --
+// so a CORRECT host-path guess came back rewritten to its label ("path /d0/
+// a.txt is not a valid address"), while a wrong guess came back verbatim.
+// Comparing the two replies told a caller whether it had just guessed the
+// real sandbox root. The fix is to stop echoing the argument at all, so a
+// right guess and a wrong guess are indistinguishable.
+test('P2: the invalid-address refusal does not confirm a correct host-path guess', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const correctGuess = path.join(fx.root, 'a.txt'); // the real root, right the first time
+  const wrongGuess = '/Users/admin/projects/myapp/a.txt'; // an unrelated absolute path
+
+  const right = await server.callTool('fs_read', { file_path: correctGuess });
+  const wrong = await server.callTool('fs_read', { file_path: wrongGuess });
+
+  assert.equal(right.isError, true, 'a raw host path must still be refused, correct guess or not');
+  assert.equal(wrong.isError, true);
+
+  // The property under test: nothing distinguishes a correct guess from an
+  // incorrect one. Equal isError, equal _meta, and -- the specific thing
+  // that leaked before -- byte-identical reply text.
+  assert.deepEqual(right._meta, wrong._meta);
+  assert.equal(
+    allText(right),
+    allText(wrong),
+    'a correct host-path guess produced a different reply than an incorrect one -- that difference is an oracle'
+  );
+
+  // And neither reply names fx.root at all, confirmed independently of the
+  // equality check above (which would also pass if both leaked it equally).
+  assert.doesNotMatch(allText(right), new RegExp(fx.root.replace(/[/\\]/g, '.')));
+});
+
+// P3: the old rewrite's application was incidental (it fires only when a
+// result happens to contain a granted host directory as a substring), not a
+// deliberate decision at each call site -- which is a reason not to rely on
+// it, demonstrated here two ways: fs_grep's own diagnostic text (the
+// caller's regex, echoed back by ripgrep on a parse error) must survive
+// untouched the same way fs_read's file content must in P1, and a real
+// syscall error (unlike P1/P2, on the ERROR path) must still be translated
+// via the deliberate describeError/err.path route, not incidentally.
+test('P3: caller-echoed text is never touched, but a real syscall error path still is, deliberately', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  await t.test("fs_grep's regex-parse-error echoes the caller's pattern byte-for-byte", async () => {
+    const badPattern = '(unclosed group';
+    const r = await server.callTool('fs_grep', { pattern: badPattern });
+    assert.equal(r.isError, true);
+    assert.match(allText(r), new RegExp(badPattern.replace(/[().]/g, '\\$&')), "the caller's own pattern must survive untouched");
+  });
+
+  await t.test('a real fs_mkdir syscall error (EEXIST-shaped) still translates its host path', async () => {
+    const collision = path.join(fx.root, 'already-here');
+    fs.writeFileSync(collision, 'x'); // a plain file where fs_mkdir will try to create a directory
+
+    const r = await server.callTool('fs_mkdir', { path: v(collision, fx) });
+    assert.equal(r.isError, true);
+    assert.doesNotMatch(allText(r), new RegExp(fx.root.replace(/[/\\]/g, '.')), 'the raw host root must not appear in a real syscall error');
+    assert.match(allText(r), /\/d0\/already-here/, "the syscall error's own path must still be translated to its virtual form");
+  });
+});
+
+// ===========================================================================
+// P4: a duplicate label refuses the whole call, rather than silently
+// resolving the ambiguity to one of the colliding directories.
+// ===========================================================================
+
+// virtualToHost resolves a label with Array.prototype.find, which returns
+// the FIRST match -- so two directories sharing a label do not error on
+// their own, they silently make the second one unaddressable and make
+// fs_glob/fs_find/fs_grep report the identical virtual path for two
+// genuinely different files. This codebase already refuses this SHAPE of
+// ambiguity elsewhere rather than picking a winner (fs_edit on a
+// non-unique old_string, validatePath on an empty scope), so
+// assignLabels (vpath.ts) refuses too: every tool call under a
+// colliding configuration fails closed, naming both directories, instead
+// of half-working.
+test('P4: a duplicate label fails every call closed, not just the ambiguous address', async (t) => {
+  await t.test('two explicit label= entries claiming the same label', async () => {
+    const dirA = mkTmpDir('fsmcp-duplabelA-');
+    const dirB = mkTmpDir('fsmcp-duplabelB-');
+    t.after(() => {
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    });
+    fs.writeFileSync(path.join(dirA, 'notes.txt'), 'FROM-A');
+    fs.writeFileSync(path.join(dirB, 'notes.txt'), 'FROM-B');
+
+    const server = spawnServer(['--allowed-dir', `z=${dirA}`, '--allowed-dir', `z=${dirB}`]);
+    try {
+      // Every tool fails, not just an fs_read of the ambiguous address --
+      // the whole label space for this call is unusable, so nothing ever
+      // reaches a tool handler.
+      const glob = await server.callTool('fs_glob', { pattern: '**/*' });
+      assert.equal(glob.isError, true);
+      assert.match(allText(glob), /the label "z" is claimed by two different allowed directories/);
+
+      const read = await server.callTool('fs_read', { file_path: '/z/notes.txt' });
+      assert.equal(read.isError, true);
+      assert.match(allText(read), /the label "z" is claimed by two different allowed directories/);
+
+      // NEITHER colliding directory is named to the client. This used to
+      // name both, reasoning that allowedDirs only ever holds the
+      // operator's own CLI directories or _meta entries the caller itself
+      // supplied. That is true standalone and false in the deployment this
+      // server exists for: under relay, --allowed-dir is not passed at all
+      // and the whole scope arrives via _meta, which relay populates from
+      // operator context and the client cannot set. So the colliding
+      // directories are the operator's host paths and the reader is exactly
+      // the party issue #7 keeps them from. The operator's copy, with both
+      // paths, goes to stderr.
+      assert.ok(!allText(glob).includes(dirA), 'client message must not name a host directory');
+      assert.ok(!allText(glob).includes(dirB), 'client message must not name a host directory');
+      assert.ok(!allText(read).includes(dirA), 'client message must not name a host directory');
+    } finally {
+      server.close();
+    }
+  });
+
+  await t.test('an explicit label= collides with another entry\'s auto-assigned d<N>', async () => {
+    // --allowed-dir d1=/x --allowed-dir /y --allowed-dir /z: /y sits at
+    // position 1 in the effective scope, so it auto-assigns "d1" -- the
+    // exact label /x explicitly claimed. No operator reading their own
+    // three flags in order would predict this from position alone.
+    const dirX = mkTmpDir('fsmcp-duplabelX-');
+    const dirY = mkTmpDir('fsmcp-duplabelY-');
+    const dirZ = mkTmpDir('fsmcp-duplabelZ-');
+    t.after(() => {
+      fs.rmSync(dirX, { recursive: true, force: true });
+      fs.rmSync(dirY, { recursive: true, force: true });
+      fs.rmSync(dirZ, { recursive: true, force: true });
+    });
+
+    const server = spawnServer(['--allowed-dir', `d1=${dirX}`, '--allowed-dir', dirY, '--allowed-dir', dirZ]);
+    try {
+      const list = await server.callTool('fs_list', {});
+      assert.equal(list.isError, true);
+      assert.match(allText(list), /the label "d1" is claimed by two different allowed directories/);
+      // Same rule as the explicit-collision case above: the label, never the
+      // host directories. This shape is the one a human would never predict
+      // -- an explicit label= that happens to equal the d<N> another entry
+      // would have been auto-assigned -- which makes it the one most likely
+      // to fire against a real operator's configuration rather than a test's.
+      assert.ok(!allText(list).includes(dirX), 'client message must not name a host directory');
+      assert.ok(!allText(list).includes(dirY), 'client message must not name a host directory');
+    } finally {
+      server.close();
+    }
+  });
+
+  await t.test('the same directory under the same label twice is redundant, not ambiguous, and must not refuse', async () => {
+    const dirA = mkTmpDir('fsmcp-duplabelSame-');
+    t.after(() => fs.rmSync(dirA, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dirA, 'ok.txt'), 'fine');
+
+    const server = spawnServer(['--allowed-dir', `q=${dirA}`, '--allowed-dir', `q=${dirA}`]);
+    try {
+      const list = await server.callTool('fs_list', { path: '/q' });
+      assert.equal(list.isError, undefined, allText(list));
+      assert.match(allText(list), /\/q\/ok\.txt/);
+    } finally {
+      server.close();
+    }
+  });
+
+  await t.test('non-colliding labels in the same config are unaffected', async () => {
+    const dirA = mkTmpDir('fsmcp-nodupe-');
+    t.after(() => fs.rmSync(dirA, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dirA, 'ok.txt'), 'fine');
+
+    const server = spawnServer(['--allowed-dir', dirA]);
+    try {
+      const list = await server.callTool('fs_list', {});
+      assert.equal(list.isError, undefined, allText(list));
+      assert.match(allText(list), /\/d0\/ok\.txt/);
+    } finally {
+      server.close();
+    }
+  });
 });

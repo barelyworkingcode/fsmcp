@@ -1,9 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg } from '../registry';
-import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
-import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
+import { textResult, errorResult, scopeViolationResult, ToolContext, LabelEntry } from '../types';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { checkPathV, decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
 
 // Detect ripgrep at load time.
 //
@@ -68,7 +69,7 @@ export function registerGrep(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp('Regex pattern to search for'),
-          path: stringProp('File or directory to search in (defaults to all allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
           glob: stringProp("Glob to filter files (e.g. '*.ts')"),
           type: stringProp("File type filter (e.g. 'ts', 'js', 'py')"),
           output_mode: enumProp('Output mode', [
@@ -102,8 +103,13 @@ export function registerGrep(registry: ToolRegistry): void {
       // Determine search paths ("." is treated as omitted)
       let searchPaths: string[];
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
-        const pathErr = checkPath(p, ctx.allowedDirs);
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and the search below) already expect -- see
+        // read.ts for the full reasoning.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
+        const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
         searchPaths = [p];
       } else if (ctx.allowedDirs.length > 0) {
@@ -119,12 +125,12 @@ export function registerGrep(registry: ToolRegistry): void {
       if (rgAvailable) {
         return grepWithRg(
           pattern, searchPaths, globFilter, typeFilter,
-          outputMode, contextLines, headLimit, ctx.allowedDirs
+          outputMode, contextLines, headLimit, ctx.allowedDirs, ctx.labels
         );
       }
       return grepFallback(
         pattern, searchPaths, globFilter, typeFilter,
-        outputMode, contextLines, headLimit, grepBudgetMs(), ctx.allowedDirs
+        outputMode, contextLines, headLimit, grepBudgetMs(), ctx.allowedDirs, ctx.labels
       );
     }
   );
@@ -166,21 +172,26 @@ export function buildRgArgs(
   contextLines: number | undefined,
   headLimit: number | undefined,
 ): string[] {
-  const rgArgs: string[] = [];
+  // Issue #7: always --json, and never -l/-c/-n. Outbound translation has to
+  // know exactly which substring of a line is the path and which is
+  // caller-visible file content, so a caller's own path is never rewritten
+  // and a file's own content is never mistaken for one; ripgrep's structured
+  // event stream gives that split for free (`data.path.text` versus
+  // `data.lines.text`) where the old plain-text output required RECOVERING
+  // it with a regex. filterPathsInScope's old regex already flagged that
+  // recovery as fragile for a path containing a colon (issue #5); building a
+  // rewrite step on top of that same regex would have made the fragility
+  // load-bearing in a new way -- a wrong split would not just mis-filter a
+  // result, it could rewrite the wrong substring, or fail to rewrite a host
+  // path at all. `-c` is dropped from this list of flags for a second
+  // reason, not just style: ripgrep does not honour `--json` when `-c` is
+  // also given (measured: it silently falls back to `-c`'s own plain-text
+  // output regardless of flag order), so count mode has to be derived from
+  // the json stream's own per-file stats instead (formatRgJson, `matched_lines`).
+  const rgArgs: string[] = ['--json'];
 
-  switch (outputMode) {
-    case 'files_with_matches':
-      rgArgs.push('-l');
-      break;
-    case 'count':
-      rgArgs.push('-c');
-      break;
-    case 'content':
-      rgArgs.push('-n');
-      if (contextLines !== undefined) {
-        rgArgs.push('-C', String(contextLines));
-      }
-      break;
+  if (outputMode === 'content' && contextLines !== undefined) {
+    rgArgs.push('-C', String(contextLines));
   }
 
   if (globFilter) rgArgs.push('--glob', globFilter);
@@ -192,64 +203,133 @@ export function buildRgArgs(
   return rgArgs;
 }
 
+/** One event from ripgrep's `--json` output (ndjson: one object per line). */
+interface RgJsonEvent {
+  type: string;
+  data?: {
+    path?: { text?: string };
+    lines?: { text?: string };
+    line_number?: number;
+    stats?: { matched_lines?: number };
+  };
+}
+
 /**
- * Re-validate every path fs_grep is about to hand back.
- *
- * fs_glob already does this for the same reason: whatever *walks* the
- * filesystem chooses what gets reported, and a symlink inside an allowed
- * directory that points outside it can come back looking like an in-scope
- * path. Nothing here ever passes `--follow` to ripgrep, and ripgrep does not
- * follow symlinks unless told to, so the ordinary run of this tool should
- * never produce an out-of-scope hit in the first place -- but "the flag we
- * didn't pass happens to default the right way" describes ripgrep's current
- * behaviour, not a guarantee this file makes, and the very same reasoning
- * (glob's fix, `0be03fe` era) says the output gets checked regardless of
- * how confident the input side is.
- *
- * This parses the exact three shapes `grepWithRg`/`grepFallback` themselves
- * produce, not ripgrep's own `--json` mode: a bare path
- * (files_with_matches), `path:count` (count), and `path:lineno:content`
- * (content, anchored on the numeric line number rather than colon-counting,
- * because `content` can itself contain colons). `--` group separators that
- * `-C`/`-A`/`-B` insert between non-contiguous matches are passed through
- * unfiltered, since they name no path at all. A line that cannot be parsed
- * into one of these shapes is dropped rather than guessed at: it cannot be
- * proven in scope, so it is treated as if it were not.
+ * Parse ripgrep's `--json` stdout into events, dropping any line that is not
+ * valid JSON rather than guessing at it. In ordinary operation every line is
+ * well-formed -- ripgrep writes one complete JSON object per line and this
+ * function only ever sees output from a process that exited 0 (a killed,
+ * possibly-mid-line process is handled entirely separately, on `e.stdout`,
+ * by the ETIMEDOUT branch below, and its partial bytes never reach this
+ * parser at all).
  */
-export function filterPathsInScope(
+function parseRgJson(output: string): RgJsonEvent[] {
+  const events: RgJsonEvent[] = [];
+  for (const line of output.split('\n')) {
+    if (!line) continue;
+    try {
+      const ev = JSON.parse(line);
+      if (ev && typeof ev.type === 'string') events.push(ev);
+    } catch {
+      continue;
+    }
+  }
+  return events;
+}
+
+/**
+ * Turn ripgrep's `--json` stream into this tool's plain-text contract
+ * (unchanged from before this issue: a bare path per line for
+ * files_with_matches, `path:count`, or `path:line:content` / `path-line-content`
+ * for content mode) -- with every path re-validated and translated to its
+ * virtual form on the way out.
+ *
+ * Re-validation is not defense in depth here, it is the actual containment
+ * step for this tool's output, the same reasoning fs_glob/fs_find already
+ * apply to their own hits: whatever walked the tree chose what got reported,
+ * so a symlink inside an allowed directory that points outside it can come
+ * back looking like an in-scope path. `inScope` caches per path so a file
+ * with many matches pays validatePath once.
+ *
+ * `hostToVirtualOrRedact` runs only on the path field, never on
+ * `lines.text` -- that field is the *file's own content*, which can
+ * legitimately contain arbitrary bytes including something that happens to
+ * look like a host path, and must reach the caller byte for byte, not
+ * silently rewritten because it resembles one of fsmcp's own directories.
+ */
+export function formatRgJson(
   output: string,
   outputMode: string,
   allowedDirs: string[],
+  labels: LabelEntry[],
 ): string {
-  if (!output) return output;
-  const lines = output.split('\n');
-  const kept: string[] = [];
-  for (const line of lines) {
-    if (line === '') {
-      kept.push(line);
-      continue;
+  const events = parseRgJson(output);
+  const scopeCache = new Map<string, boolean>();
+  const inScope = (p: string): boolean => {
+    let cached = scopeCache.get(p);
+    if (cached === undefined) {
+      cached = validatePath(p, allowedDirs) === null;
+      scopeCache.set(p, cached);
     }
-    if (outputMode === 'content' && line === '--') {
-      kept.push(line);
-      continue;
-    }
+    return cached;
+  };
 
-    let candidate: string | null;
-    if (outputMode === 'content') {
-      const m = /^(.+?):(\d+):/.exec(line);
-      candidate = m ? m[1] : null;
-    } else if (outputMode === 'count') {
-      const m = /^(.+):(\d+)$/.exec(line);
-      candidate = m ? m[1] : null;
-    } else {
-      candidate = line;
+  if (outputMode === 'files_with_matches') {
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const ev of events) {
+      if (ev.type !== 'match') continue;
+      const p = ev.data?.path?.text;
+      if (typeof p !== 'string' || seen.has(p) || !inScope(p)) continue;
+      seen.add(p);
+      lines.push(hostToVirtualOrRedact(p, labels));
     }
-
-    if (candidate !== null && path.isAbsolute(candidate) && validatePath(candidate, allowedDirs) === null) {
-      kept.push(line);
-    }
+    return lines.join('\n');
   }
-  return kept.join('\n');
+
+  if (outputMode === 'count') {
+    // `end` fires once per searched file, and only for a file that had at
+    // least one match (confirmed: a zero-match file among several searched
+    // ones emits no begin/end pair at all) -- exactly the set `-c` reports.
+    const lines: string[] = [];
+    for (const ev of events) {
+      if (ev.type !== 'end') continue;
+      const p = ev.data?.path?.text;
+      const count = ev.data?.stats?.matched_lines;
+      if (typeof p !== 'string' || typeof count !== 'number' || !inScope(p)) continue;
+      lines.push(`${hostToVirtualOrRedact(p, labels)}:${count}`);
+    }
+    return lines.join('\n');
+  }
+
+  // content: reconstruct plain rg's own separators -- ":" for a matched
+  // line, "-" for a context line -- and its "--" group break wherever the
+  // next line is not immediately contiguous with the last one emitted
+  // (different file, or a gap `-C` did not bridge). Tracked across the
+  // whole event stream, not per file, because that is what plain rg's own
+  // output does too (verified against a real ripgrep binary): a file
+  // boundary is just a special case of "not contiguous".
+  const lines: string[] = [];
+  let lastPath: string | null = null;
+  let lastLine = -Infinity;
+  for (const ev of events) {
+    if (ev.type !== 'match' && ev.type !== 'context') continue;
+    const p = ev.data?.path?.text;
+    const lineNumber = ev.data?.line_number;
+    const text = ev.data?.lines?.text;
+    if (typeof p !== 'string' || typeof lineNumber !== 'number' || typeof text !== 'string') continue;
+    if (!inScope(p)) continue;
+
+    if (lines.length > 0 && (p !== lastPath || lineNumber !== lastLine + 1)) {
+      lines.push('--');
+    }
+    const sep = ev.type === 'match' ? ':' : '-';
+    const content = text.endsWith('\n') ? text.slice(0, -1) : text;
+    lines.push(`${hostToVirtualOrRedact(p, labels)}${sep}${lineNumber}${sep}${content}`);
+    lastPath = p;
+    lastLine = lineNumber;
+  }
+  return lines.join('\n');
 }
 
 function grepWithRg(
@@ -261,6 +341,7 @@ function grepWithRg(
   contextLines: number | undefined,
   headLimit: number | undefined,
   allowedDirs: string[],
+  labels: LabelEntry[],
 ) {
   const rgArgs = buildRgArgs(
     pattern, searchPaths, globFilter, typeFilter,
@@ -273,10 +354,15 @@ function grepWithRg(
     const output = execFileSync('rg', rgArgs, {
       encoding: 'utf-8',
       timeout: budgetMs,
-      maxBuffer: 10 * 1024 * 1024,
+      // --json is several times larger than the plain-text output it
+      // replaces (every match repeats the path, wraps the line in a JSON
+      // object, and escapes it) for the same underlying result, so the old
+      // 10MB plain-text ceiling would cut off searches this tool answered
+      // in full before issue #7.
+      maxBuffer: 40 * 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const filtered = filterPathsInScope(output.trimEnd(), outputMode, allowedDirs);
+    const filtered = formatRgJson(output, outputMode, allowedDirs, labels);
     return textResult(filtered === '' ? 'No matches found.' : filtered);
   } catch (err: unknown) {
     const e = (err ?? {}) as {
@@ -337,14 +423,35 @@ function grepWithRg(
  *
  * `allowedDirsForRevalidation` re-validates every file the walk turns up
  * before it is ever opened or reported, the same containment fs_glob already
- * applies to its own hits (see `filterPathsInScope` above for why this
- * fallback needs it too, not just the ripgrep path). It is optional, and
+ * applies to its own hits (see `formatRgJson` above for why the ripgrep path
+ * needs the same treatment, not just this one). It is optional, and
  * defaults to skipping that check, purely as a test seam: the ReDoS-budget
  * tests below call this function directly with a bare tmp directory and no
  * concept of allowed_dirs at all, and defaulting to "no allowed dirs" would
  * make them fail closed for a reason that has nothing to do with what they
  * are testing. The real call site in fs_grep's handler always passes
  * `ctx.allowedDirs`.
+ *
+ * `labels` is the same kind of test seam, for the same reason, for issue #7:
+ * this function used to build every one of its own output lines directly
+ * from `file` (a host path), on the documented assumption that
+ * `ToolRegistry.call`'s generic outbound pass would translate it -- but that
+ * pass (`redactLeakedHostPaths`) was scoped to `isError` results only, in
+ * the same PR #10 review that removed the whole-result rewrite, and a
+ * SUCCESS result (an ordinary search that found matches) is exactly the
+ * case that backstop cannot touch. Confirmed: with ripgrep absent from
+ * PATH, `fs_grep` returned the sandbox's real absolute path in every output
+ * mode (`files_with_matches`, `count`, and `content`'s path column) --
+ * precisely the disclosure issue #7 exists to close, surviving intact on
+ * this one backend. `labels` is `undefined` by default so the ReDoS-budget
+ * tests below, which construct a bare tmp directory with no concept of
+ * `allowed_dirs` or labels at all, keep asserting against the exact host
+ * path they created (translating with an empty label set would REDACT it
+ * instead, which is not what those tests are about); the real call site in
+ * fs_grep's handler always passes `ctx.labels`. Only the PATH column is
+ * translated -- `lines[idx]` in content mode is the file's own matched
+ * text, which must reach the caller byte for byte the same way
+ * `formatRgJson`'s `lines.text` does.
  *
  * Exported so a test can hand it a small budget directly.
  */
@@ -358,7 +465,14 @@ export function grepFallback(
   headLimit: number | undefined,
   budgetMs: number = grepBudgetMs(),
   allowedDirsForRevalidation?: string[],
+  labels?: LabelEntry[],
 ) {
+  // See this function's doc: translate only when a real call site supplied
+  // labels at all. `hostToVirtualOrRedact` would otherwise treat "no labels
+  // passed" the same as "labels is genuinely empty" and redact every path,
+  // which is right for a real empty-scope call but wrong for the unit tests
+  // below that never had a concept of labels to begin with.
+  const displayPath = (f: string): string => (labels === undefined ? f : hostToVirtualOrRedact(f, labels));
   const deadline = Date.now() + budgetMs;
   const expired = () => Date.now() >= deadline;
 
@@ -416,11 +530,11 @@ export function grepFallback(
     if (matchingLines.length > 0) {
       switch (outputMode) {
         case 'files_with_matches':
-          results.push(file);
+          results.push(displayPath(file));
           resultCount++;
           break;
         case 'count':
-          results.push(`${file}:${matchingLines.length}`);
+          results.push(`${displayPath(file)}:${matchingLines.length}`);
           resultCount++;
           break;
         case 'content': {
@@ -432,8 +546,13 @@ export function grepFallback(
             }
           }
           const sortedLines = [...shown].sort((a, b) => a - b);
+          // lines[idx] is the file's own matched text -- never translated,
+          // same rule formatRgJson's lines.text and fs_read's own bytes
+          // follow (PR #10: a whole-result rewrite used to corrupt exactly
+          // this kind of content).
+          const shownPath = displayPath(file);
           for (const idx of sortedLines) {
-            results.push(`${file}:${idx + 1}:${lines[idx]}`);
+            results.push(`${shownPath}:${idx + 1}:${lines[idx]}`);
           }
           resultCount += matchingLines.length;
           break;

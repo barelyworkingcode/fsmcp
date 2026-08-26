@@ -1,4 +1,5 @@
 import { MCPTool, MCPCallResult, ToolContext, errorResult } from './types';
+import { describeError, redactLeakedHostPaths } from './vpath';
 
 /**
  * Parse a boolean-shaped argument off the wire strictly: absent becomes
@@ -102,15 +103,38 @@ export class ToolRegistry {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  // Issue #7 / PR #10 review: every ERROR result, whether a handler
+  // returned it or this catch built it, passes through
+  // redactLeakedHostPaths before it reaches the wire -- an alarm, not a
+  // translation mechanism. Deliberate translation happens at each path's
+  // own construction site now (decodeInboundPath, checkPathV/
+  // checkPathNoFollowFinalV/refuseAllowedDirRootV, describeError,
+  // hostToVirtualOrRedact in the search tools), specifically so a SUCCESS
+  // result's file content (fs_read's bytes, fs_grep content mode's matched
+  // lines) is never scanned or rewritten -- a whole-result rewrite here
+  // used to do exactly that, and a write-then-read round trip in review
+  // showed it silently corrupting any file whose content happened to
+  // contain the sandbox's own host path. Restricting this backstop to
+  // `isError` results is what keeps that from recurring: nothing in this
+  // codebase returns raw file content on an error path.
   call(name: string, args: Record<string, unknown>, ctx: ToolContext): MCPCallResult {
     const reg = this.registrations.get(name);
-    if (!reg) return errorResult(`unknown tool: ${name}`);
-    try {
-      return reg.handler(args, ctx);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return errorResult(message);
+    let result: MCPCallResult;
+    if (!reg) {
+      result = errorResult(`unknown tool: ${name}`);
+    } else {
+      try {
+        result = reg.handler(args, ctx);
+      } catch (err: unknown) {
+        // describeError (vpath.ts): a tool handler that let an fs exception
+        // escape uncaught is exactly the shape describeError exists for --
+        // Node's ErrnoException carries the offending path as `.path`
+        // (`.dest` too for a rename), which this translates before it ever
+        // reaches the wire.
+        result = errorResult(describeError(err, ctx.labels));
+      }
     }
+    return redactLeakedHostPaths(result, ctx.labels);
   }
 }
 
@@ -137,4 +161,41 @@ export function boolProp(description: string): Record<string, unknown> {
 
 export function enumProp(description: string, values: string[]): Record<string, unknown> {
   return { type: 'string', description, enum: values };
+}
+
+/**
+ * Description text for every path ARGUMENT on every tool (`file_path`,
+ * `path`, `source`, `destination`) -- issue #7's virtual path space.
+ *
+ * A tool's `inputSchema` is built once, at module load (`registerFoo`
+ * runs when `main.ts` imports it, long before any `tools/call` exists), but
+ * the label(s) a given call is actually granted are assigned per call
+ * (`vpath.ts`'s `assignLabels`, from that call's `_meta`/CLI-narrowed
+ * scope) -- so there is no real label available here to put in an example.
+ * Before this, every one of these said "Absolute path to the file" (or
+ * "directory", "destination"), which stopped being true the moment
+ * `decodeInboundPath` started refusing a host path as an address: a client
+ * that only reads the schema, not a live result, would follow this text
+ * straight into a refusal whose whole point is to no longer echo what it
+ * sent (PR #10) -- correct behaviour that leaves that client nothing to
+ * learn from. Naming a concrete label instead (e.g. "/d0/notes/a.txt")
+ * would be a different way to mislead the same client: `d0` is only this
+ * server's most common case, not a guarantee, and a caller whose only
+ * label is an operator-chosen `label=` (or whose position isn't 0) would be
+ * told to type an address that is not theirs. "<label>" is written here as
+ * a literal placeholder for exactly that reason -- the real value(s) come
+ * from this server's own results (a directory listing, a search hit, the
+ * "not a valid address" refusal's own text), never from this schema.
+ *
+ * `detail`, when given, is appended for the handful of arguments that need
+ * something more (an optional path's default-to-scope behaviour).
+ */
+export function virtualPathDescription(detail?: string): string {
+  const base =
+    'Path in this call\'s granted virtual address space, shaped "/<label>/..." ' +
+    '(e.g. "/<label>/notes/a.txt") -- never a host filesystem path. "<label>" above is a ' +
+    'placeholder: the actual label(s) granted to this call are shown in this server\'s own ' +
+    'results (a listing, a search hit, or a refusal), not fixed ahead of time, so do not assume ' +
+    '"d0" or any other specific label without seeing it in a result first.';
+  return detail ? `${base} ${detail}` : base;
 }

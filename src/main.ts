@@ -1,7 +1,8 @@
 import { createInterface } from 'readline';
 import { ToolRegistry } from './registry';
-import { ToolContext } from './types';
+import { ToolContext, MCPCallResult } from './types';
 import { parseAllowedDirs, narrowAllowedDirs, sanitizeMetaAllowedDirs } from './security';
+import { stripLabels, assignLabels } from './vpath';
 import { registerRead } from './tools/read';
 import { registerWrite } from './tools/write';
 import { registerEdit } from './tools/edit';
@@ -25,7 +26,16 @@ registerMkdir(registry);
 registerMove(registry);
 registerDelete(registry);
 
-const cliAllowedDirs = parseAllowedDirs();
+// stripLabels (vpath.ts, issue #7) pulls an explicit `label=` prefix off a
+// raw --allowed-dir value before anything security-relevant ever sees it:
+// narrowAllowedDirs and validatePath both call path.isAbsolute() on every
+// entry, and "label=/abs/path" is not absolute -- left unstripped it would
+// not just fail to register a label, canonicalizePath would resolve it
+// against fsmcp's own CWD instead of refusing it, silently corrupting the
+// containment check for that entry. cliAllowedDirs (bare host paths) is the
+// exact value this used to be; cliLabels is looked up again, per call,
+// alongside whatever _meta supplies, when assigning this call's labels.
+const { hostPaths: cliAllowedDirs, labelByHostPath: cliLabels } = stripLabels(parseAllowedDirs());
 
 function respond(msg: unknown): void {
   process.stdout.write(JSON.stringify(msg) + '\n');
@@ -147,10 +157,38 @@ rl.on('line', (line: string) => {
       // ever sees it, and treats anything else as the caller asserting an
       // empty scope -- fail closed, not a crash.
       const { metaDirs, malformed: metaDirsMalformed } = sanitizeMetaAllowedDirs(meta?.allowed_dirs);
-      const { allowedDirs, droppedMetaDirs } = narrowAllowedDirs(cliAllowedDirs, metaDirs);
-      const ctx: ToolContext = { allowedDirs };
-
-      const result = registry.call(name, args, ctx);
+      // Same label-stripping as the CLI side, for the same reason: a
+      // caller-or-operator-supplied _meta.allowed_dirs entry may carry its
+      // own "label=" prefix (relay's per-token Settings UI is exactly where
+      // an operator would type one), and narrowAllowedDirs must see only
+      // the bare host path underneath it. `metaDirs` (not yet stripped)
+      // stays `undefined` exactly when the caller sent no _meta.allowed_dirs
+      // at all -- narrowAllowedDirs's "absent vs empty" distinction (C1)
+      // depends on that surviving this step unchanged, so stripLabels only
+      // runs when metaDirs is genuinely present.
+      const strippedMeta = metaDirs === undefined ? undefined : stripLabels(metaDirs);
+      const { allowedDirs, droppedMetaDirs } = narrowAllowedDirs(cliAllowedDirs, strippedMeta?.hostPaths);
+      // This call's virtual-space labels (issue #7): explicit labels from
+      // either source, keyed by the exact bare host-path string they were
+      // written against, then d<N> by position in the EFFECTIVE (already
+      // narrowed) scope -- see vpath.ts's assignLabels for why position is
+      // taken there and not in the operator's original CLI/_meta ordering.
+      const labelsResult = assignLabels(
+        allowedDirs,
+        new Map([...cliLabels, ...(strippedMeta?.labelByHostPath ?? [])])
+      );
+      // A duplicate label (two directories claiming the same `/<label>/...`
+      // address) makes the whole virtual address space for this call
+      // ambiguous, not just one path in it -- vpath.ts's assignLabels
+      // refuses outright rather than resolving it to whichever directory
+      // happens to be enumerated first, the same "refuse the ambiguity"
+      // stance fs_edit already takes for a non-unique old_string. That
+      // refusal stands in for the tool's own result: nothing here can be
+      // decoded against a label space that does not have a single meaning,
+      // so no tool handler ever runs for this call.
+      const result: MCPCallResult = Array.isArray(labelsResult)
+        ? registry.call(name, args, { allowedDirs, labels: labelsResult })
+        : labelsResult;
 
       // A dropped _meta dir is reported on the result, not swallowed: an
       // operator (or an agent reading the reply) should be able to see that

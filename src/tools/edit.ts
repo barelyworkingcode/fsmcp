@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
+import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
@@ -11,7 +11,7 @@ export function registerEdit(registry: ToolRegistry): void {
         'Perform exact string replacement in a file. By default, old_string must appear exactly once (fails if 0 or >1 matches). Use replace_all to replace every occurrence.',
       inputSchema: schema(
         {
-          file_path: stringProp('Absolute path to the file'),
+          file_path: stringProp(virtualPathDescription()),
           old_string: stringProp('Exact string to find'),
           new_string: stringProp('Replacement string'),
           replace_all: boolProp('Replace all occurrences (default: false)'),
@@ -26,7 +26,13 @@ export function registerEdit(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const filePathArg = requireStringArg(args, 'file_path');
       if (typeof filePathArg !== 'string') return filePathArg;
-      const filePath = filePathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPath (and everything after it) already expects -- see
+      // read.ts for the full reasoning.
+      const decoded = decodeInboundPath(filePathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const filePath = decoded;
 
       const oldStringArg = requireStringArg(args, 'old_string');
       if (typeof oldStringArg !== 'string') return oldStringArg;
@@ -48,14 +54,14 @@ export function registerEdit(registry: ToolRegistry): void {
       if (typeof replaceAllArg !== 'boolean') return replaceAllArg;
       const replaceAll = replaceAllArg;
 
-      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       let content: string;
       try {
         content = fs.readFileSync(filePath, 'utf-8');
       } catch {
-        return errorResult(`file not found: ${filePath}`);
+        return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
       }
 
       // Count occurrences
@@ -75,7 +81,11 @@ export function registerEdit(registry: ToolRegistry): void {
       const newContent = parts.join(newString);
       fs.writeFileSync(filePath, newContent, 'utf-8');
 
-      return textResult(`Replaced ${count} occurrence(s) in ${filePath}`);
+      return translateResult(
+        textResult(`Replaced ${count} occurrence(s) in ${filePath}`),
+        [filePath],
+        ctx.labels
+      );
     }
   );
 }

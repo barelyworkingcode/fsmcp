@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPathNoFollowFinal, refuseAllowedDirRoot } from '../security';
+import { checkPathNoFollowFinalV, decodeInboundPath, describeError, refuseAllowedDirRootV, translateResult } from '../vpath';
 
 // C3: cap total entries a single recursive delete may remove, so a runaway
 // (or a caller-supplied path several directories too high) is a loud
@@ -55,7 +55,7 @@ export function registerDelete(registry: ToolRegistry): void {
         `${MAX_DELETE_ENTRIES} entries per recursive delete.`,
       inputSchema: schema(
         {
-          path: stringProp('Absolute path to delete'),
+          path: stringProp(virtualPathDescription()),
           recursive: boolProp('Delete a non-empty directory and its contents (default: false)'),
         },
         ['path']
@@ -67,7 +67,16 @@ export function registerDelete(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const targetPathArg = requireStringArg(args, 'path');
       if (typeof targetPathArg !== 'string') return targetPathArg;
-      const targetPath = targetPathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPathNoFollowFinal (and everything after it) already
+      // expects -- see read.ts for the full reasoning. This runs BEFORE C2's
+      // no-follow-final check, not instead of it: the decoded string is
+      // still literal, un-followed, all the way to basename().
+      const decoded = decodeInboundPath(targetPathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const targetPath = decoded;
+
       const recursiveArg = parseBoolArg(args.recursive, 'recursive', false);
       if (typeof recursiveArg !== 'boolean') return recursiveArg;
       const recursive = recursiveArg;
@@ -83,14 +92,14 @@ export function registerDelete(registry: ToolRegistry): void {
       // accretes escape hatches it can never clean up. What must be in
       // scope is the directory entry being removed, not whatever it points
       // at.
-      const pathErr = checkPathNoFollowFinal(targetPath, ctx.allowedDirs);
+      const pathErr = checkPathNoFollowFinalV(targetPath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       let stat: fs.Stats;
       try {
         stat = fs.lstatSync(targetPath);
       } catch {
-        return errorResult(`not found: ${targetPath}`);
+        return translateResult(errorResult(`not found: ${targetPath}`), [targetPath], ctx.labels);
       }
 
       // The sandbox root itself must survive its occupant. Without this, a
@@ -102,7 +111,7 @@ export function registerDelete(registry: ToolRegistry): void {
       // about the `fs.rmSync(recursive: true)` syscall, not a rule specific
       // to this tool's name, and fs_move makes that same call in its
       // `overwrite: true` branch.
-      const rootErr = refuseAllowedDirRoot(targetPath, ctx.allowedDirs, 'delete');
+      const rootErr = refuseAllowedDirRootV(targetPath, ctx.allowedDirs, 'delete', ctx.labels);
       if (rootErr) return rootErr;
 
       // A symlink is unlinked directly, whether or not `recursive` was
@@ -113,31 +122,39 @@ export function registerDelete(registry: ToolRegistry): void {
         try {
           fs.unlinkSync(targetPath);
         } catch (err: unknown) {
-          return errorResult(err instanceof Error ? err.message : String(err));
+          return errorResult(describeError(err, ctx.labels));
         }
-        return textResult(`Deleted ${targetPath}`);
+        return translateResult(textResult(`Deleted ${targetPath}`), [targetPath], ctx.labels);
       }
 
       let children: string[];
       try {
         children = fs.readdirSync(targetPath);
       } catch (err: unknown) {
-        return errorResult(err instanceof Error ? err.message : String(err));
+        return errorResult(describeError(err, ctx.labels));
       }
 
       if (children.length > 0 && !recursive) {
-        return errorResult(
-          `${targetPath} is not empty (${children.length} entries); pass recursive: true to ` +
-            `delete it and its contents`
+        return translateResult(
+          errorResult(
+            `${targetPath} is not empty (${children.length} entries); pass recursive: true to ` +
+              `delete it and its contents`
+          ),
+          [targetPath],
+          ctx.labels
         );
       }
 
       if (recursive && children.length > 0) {
         const count = countEntries(targetPath, MAX_DELETE_ENTRIES);
         if (count > MAX_DELETE_ENTRIES) {
-          return errorResult(
-            `refusing to delete ${targetPath}: contains more than ${MAX_DELETE_ENTRIES} entries; ` +
-              `delete a narrower path instead`
+          return translateResult(
+            errorResult(
+              `refusing to delete ${targetPath}: contains more than ${MAX_DELETE_ENTRIES} entries; ` +
+                `delete a narrower path instead`
+            ),
+            [targetPath],
+            ctx.labels
           );
         }
       }
@@ -150,10 +167,10 @@ export function registerDelete(registry: ToolRegistry): void {
         // individually re-validated on the way in.
         fs.rmSync(targetPath, { recursive: true, force: false });
       } catch (err: unknown) {
-        return errorResult(err instanceof Error ? err.message : String(err));
+        return errorResult(describeError(err, ctx.labels));
       }
 
-      return textResult(`Deleted ${targetPath}`);
+      return translateResult(textResult(`Deleted ${targetPath}`), [targetPath], ctx.labels);
     }
   );
 }

@@ -1,9 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
-import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { grepBudgetMs } from './grep';
 
 const MAX_RESULTS = 200;
@@ -160,7 +161,7 @@ export function registerFind(registry: ToolRegistry): void {
       inputSchema: schema(
         {
           pattern: stringProp('Fuzzy filename pattern (subsequence match, e.g. "fmain" matches "fs/main.ts")'),
-          path: stringProp('Directory to search in (defaults to all allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
         },
         ['pattern']
       ),
@@ -178,10 +179,17 @@ export function registerFind(registry: ToolRegistry): void {
 
       let searchDirs: string[];
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
-        const pathErr = checkPath(p, ctx.allowedDirs);
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and the file walk below) already expect -- see
+        // read.ts for the full reasoning.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
+        const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
-        if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
+        if (!fs.existsSync(p)) {
+          return translateResult(errorResult(`directory not found: ${p}`), [p], ctx.labels);
+        }
         searchDirs = [p];
       } else if (ctx.allowedDirs.length > 0) {
         searchDirs = ctx.allowedDirs.filter((d) => fs.existsSync(d));
@@ -220,7 +228,11 @@ export function registerFind(registry: ToolRegistry): void {
           : 'No matches found.');
       }
 
-      const lines = capped.map((r) => r.file).join('\n');
+      // Issue #7, outbound: `inScope` above already re-validated every file
+      // through validatePath (the real, unmodified security check);
+      // hostToVirtualOrRedact only decides how to show a path that check
+      // already accepted, and redacts rather than emits one it can't map.
+      const lines = capped.map((r) => hostToVirtualOrRedact(r.file, ctx.labels)).join('\n');
       const notes: string[] = [];
       if (scored.length > MAX_RESULTS) {
         notes.push(`(showing ${MAX_RESULTS} of ${scored.length} matches)`);

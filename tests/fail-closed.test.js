@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { spawnServer } = require('./helpers');
+const { spawnServer, toVirtual, toVirtualVia } = require('./helpers');
 
 function mkTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-it-'));
@@ -36,26 +36,44 @@ test('server with no CLI --allowed-dir', async (t) => {
   });
 
   await t.test('_meta.allowed_dirs naming the dir permits fs_read inside it', async () => {
-    const result = await server.callTool('fs_read', { file_path: file }, { allowed_dirs: [tmp] });
+    // Issue #7: _meta.allowed_dirs stays host paths (operator/relay-side,
+    // deliberately unchanged); the fs_read ARGUMENT is what must now be
+    // virtual, addressed against the label _meta's one entry gets (d0, by
+    // position -- src/vpath.ts's assignLabels).
+    const result = await server.callTool('fs_read', { file_path: toVirtual(file, tmp) }, { allowed_dirs: [tmp] });
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /top secret/);
   });
 
   await t.test('_meta.allowed_dirs naming a different dir refuses fs_read', async () => {
     const otherDir = mkTmpDir();
-    const result = await server.callTool('fs_read', { file_path: file }, { allowed_dirs: [otherDir] });
+    // `file` lives under `tmp`, not `otherDir` -- the only root this call's
+    // scope grants a label for -- so it is addressed via toVirtualVia's
+    // "climb out with a literal .." shape, the same way a caller who knew
+    // the two directories were siblings could type one by hand. That still
+    // has to resolve through validatePath/canonicalizePath and land outside
+    // otherDir for this refusal to mean what it used to.
+    const result = await server.callTool(
+      'fs_read',
+      { file_path: toVirtualVia(file, otherDir) },
+      { allowed_dirs: [otherDir] }
+    );
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /outside allowed directories/i);
   });
 
   await t.test('_meta.allowed_dirs: ["/"] is the documented explicit opt-out', async () => {
-    const result = await server.callTool('fs_read', { file_path: file }, { allowed_dirs: ['/'] });
+    const result = await server.callTool('fs_read', { file_path: toVirtual(file, '/') }, { allowed_dirs: ['/'] });
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /top secret/);
   });
 
   await t.test('fs_write is refused with no scope', async () => {
     const target = path.join(tmp, 'new-file.txt');
+    // No scope at all (labels.length === 0): decodeInboundPath refuses on
+    // that alone, before ever looking at the argument's shape, so the
+    // argument here can stay a host path without weakening what this
+    // asserts -- see decodeInboundPath's doc in src/vpath.ts.
     const result = await server.callTool('fs_write', { file_path: target, content: 'x' });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /no allowed directories/i);
@@ -75,6 +93,8 @@ test('server with no CLI --allowed-dir', async (t) => {
   });
 
   await t.test('fs_glob with an explicit scope finds the file and never searches outside it', async () => {
+    // path omitted: fs_glob defaults to the allowed directories, which here
+    // is exactly tmp -- no virtual address needed to reach it.
     const result = await server.callTool('fs_glob', { pattern: '*.txt' }, { allowed_dirs: [tmp] });
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /secret\.txt/);
@@ -93,7 +113,7 @@ test('server with --allowed-dir <dir> on the CLI', async (t) => {
   t.after(() => server.close());
 
   await t.test('fs_read succeeds inside the CLI-configured dir with no _meta at all', async () => {
-    const result = await server.callTool('fs_read', { file_path: file });
+    const result = await server.callTool('fs_read', { file_path: toVirtual(file, tmp) });
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /cli scoped content/);
   });
@@ -102,7 +122,10 @@ test('server with --allowed-dir <dir> on the CLI', async (t) => {
     const outside = mkTmpDir();
     const outsideFile = path.join(outside, 'x.txt');
     fs.writeFileSync(outsideFile, 'x');
-    const result = await server.callTool('fs_read', { file_path: outsideFile });
+    // outsideFile is not under tmp (this call's only root); toVirtualVia
+    // climbs out to it with a literal "..", still resolved and refused by
+    // the real containment check, not by the address failing to parse.
+    const result = await server.callTool('fs_read', { file_path: toVirtualVia(outsideFile, tmp) });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /outside allowed directories/i);
   });
@@ -120,7 +143,7 @@ test('server with --allowed-dir / (explicit opt-out)', async (t) => {
   fs.writeFileSync(file, 'reachable from anywhere');
 
   await t.test('fs_read succeeds for an arbitrary absolute path', async () => {
-    const result = await server.callTool('fs_read', { file_path: file });
+    const result = await server.callTool('fs_read', { file_path: toVirtual(file, '/') });
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /reachable from anywhere/);
   });
@@ -160,7 +183,7 @@ test('a symlink out of an allowed dir is not a way out of it', async (t) => {
 
   await t.test('fs_write to a NEW file through the symlink is refused and writes nothing', async () => {
     const target = path.join(allowed, 'link', 'ESCAPED.txt');
-    const result = await server.callTool('fs_write', { file_path: target, content: 'escaped!' });
+    const result = await server.callTool('fs_write', { file_path: toVirtual(target, allowed), content: 'escaped!' });
     assert.equal(result.isError, true, 'fs_write must refuse');
     assert.match(result.content[0].text, /outside allowed directories/i);
     assert.equal(
@@ -177,7 +200,7 @@ test('a symlink out of an allowed dir is not a way out of it', async (t) => {
 
   await t.test('fs_read of an existing file through the symlink is refused', async () => {
     const result = await server.callTool('fs_read', {
-      file_path: path.join(allowed, 'link', 'existing.txt'),
+      file_path: toVirtual(path.join(allowed, 'link', 'existing.txt'), allowed),
     });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /outside allowed directories/i);
@@ -186,7 +209,7 @@ test('a symlink out of an allowed dir is not a way out of it', async (t) => {
 
   await t.test('fs_edit through the symlink is refused', async () => {
     const result = await server.callTool('fs_edit', {
-      file_path: path.join(allowed, 'link', 'existing.txt'),
+      file_path: toVirtual(path.join(allowed, 'link', 'existing.txt'), allowed),
       old_string: 'secret',
       new_string: 'edited',
     });
@@ -209,7 +232,7 @@ test('a symlink out of an allowed dir is not a way out of it', async (t) => {
   // everything. A legitimate new file inside the allowed dir still writes.
   await t.test('a legitimate new file inside the allowed dir still writes', async () => {
     const legit = path.join(allowed, 'nested', 'legit.txt');
-    const result = await server.callTool('fs_write', { file_path: legit, content: 'fine' });
+    const result = await server.callTool('fs_write', { file_path: toVirtual(legit, allowed), content: 'fine' });
     assert.equal(result.isError, undefined, result.content[0].text);
     assert.match(result.content[0].text, /Wrote 4 bytes/);
     assert.equal(fs.readFileSync(legit, 'utf-8'), 'fine');

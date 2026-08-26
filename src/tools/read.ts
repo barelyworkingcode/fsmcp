@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, intProp, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, intProp, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
+import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
 const IMAGE_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico',
@@ -31,7 +31,7 @@ export function registerRead(registry: ToolRegistry): void {
         'Read file contents with line numbers (cat -n format). Supports offset and limit for partial reads. Lines longer than 2000 characters are truncated. Refuses files over 10MB -- use fs_grep to search a larger one instead.',
       inputSchema: schema(
         {
-          file_path: stringProp('Absolute path to the file'),
+          file_path: stringProp(virtualPathDescription()),
           offset: intProp('Line number to start reading from (1-based)'),
           limit: intProp('Maximum number of lines to read (default: 2000)'),
         },
@@ -44,28 +44,49 @@ export function registerRead(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext): ReturnType<typeof textResult> => {
       const filePathArg = requireStringArg(args, 'file_path');
       if (typeof filePathArg !== 'string') return filePathArg;
-      const filePath = filePathArg;
 
-      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      // Issue #7: the client addresses files in the virtual space this call
+      // was granted (/<label>/...), never a host path -- decodeInboundPath
+      // is the only thing standing between the caller's argument and every
+      // check below, and it does not replace any of them: checkPathV runs
+      // security.ts's own checkPath, unmodified, on the host path it hands
+      // back, and only translates the message THAT returns.
+      const decoded = decodeInboundPath(filePathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const filePath = decoded;
+
+      const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       let stat: fs.Stats;
       try {
         stat = fs.statSync(filePath);
       } catch {
-        return errorResult(`file not found: ${filePath}`);
+        return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
       }
 
       if (stat.isDirectory()) return errorResult('path is a directory, not a file');
 
       if (stat.size > MAX_READ_BYTES) {
-        return errorResult(
-          `${filePath} is ${stat.size} bytes, over fs_read's ${MAX_READ_BYTES}-byte limit; ` +
-            `narrow with offset/limit is not possible because the whole file must be loaded ` +
-            `to find line boundaries -- use fs_grep to search it instead`
+        return translateResult(
+          errorResult(
+            `${filePath} is ${stat.size} bytes, over fs_read's ${MAX_READ_BYTES}-byte limit; ` +
+              `narrow with offset/limit is not possible because the whole file must be loaded ` +
+              `to find line boundaries -- use fs_grep to search it instead`
+          ),
+          [filePath],
+          ctx.labels
         );
       }
 
+      // From here down: real file bytes. Neither this nor the formatted
+      // text below is EVER passed through translateResult/hostToVirtual --
+      // this is a file's own content, which can legitimately contain
+      // something that reads like the sandbox's own host path (a config, a
+      // log, a script mentioning its own location), and must reach the
+      // caller byte for byte regardless (PR #10 review: a whole-result
+      // rewrite used to run here too, and a write-then-read round trip
+      // showed it silently corrupting exactly this case).
       // Image files: return base64
       const ext = path.extname(filePath).toLowerCase();
       if (IMAGE_EXTENSIONS.has(ext)) {

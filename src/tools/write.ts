@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, requireStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath } from '../security';
+import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
 
 // C5 ("max bytes on fs_read and fs_write"), same reasoning as fs_read's
 // MAX_READ_BYTES: an unbounded write is an unbounded synchronous allocation
@@ -21,7 +21,7 @@ export function registerWrite(registry: ToolRegistry): void {
         'Write content to a file. Creates the file and parent directories if they do not exist. Overwrites existing files. Refuses content over 10MB.',
       inputSchema: schema(
         {
-          file_path: stringProp('Absolute path to the file'),
+          file_path: stringProp(virtualPathDescription()),
           content: stringProp('Content to write'),
         },
         ['file_path', 'content']
@@ -34,13 +34,21 @@ export function registerWrite(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const filePathArg = requireStringArg(args, 'file_path');
       if (typeof filePathArg !== 'string') return filePathArg;
-      const filePath = filePathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPathV (and everything after it) already expects -- see
+      // read.ts for the full reasoning. security.ts's own checkPath is
+      // unmodified and still the thing that decides; checkPathV only
+      // translates the message it returns.
+      const decoded = decodeInboundPath(filePathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const filePath = decoded;
 
       const contentArg = requireStringArg(args, 'content');
       if (typeof contentArg !== 'string') return contentArg;
       const content = contentArg;
 
-      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
 
       const bytes = Buffer.byteLength(content, 'utf-8');
@@ -55,7 +63,7 @@ export function registerWrite(registry: ToolRegistry): void {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(filePath, content, 'utf-8');
 
-      return textResult(`Wrote ${bytes} bytes to ${filePath}`);
+      return translateResult(textResult(`Wrote ${bytes} bytes to ${filePath}`), [filePath], ctx.labels);
     }
   );
 }

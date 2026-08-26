@@ -1,8 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, optionalStringArg } from '../registry';
+import { ToolRegistry, schema, stringProp, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
-import { checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { LabelEntry } from '../types';
+import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
 
 const MAX_ENTRIES = 5000;
 
@@ -27,12 +29,12 @@ function entryType(entry: fs.Dirent): string {
  * separator or `..`, so it cannot name anything outside `dir` no matter what
  * that entry turns out to be.
  */
-function listOneDir(dir: string): { lines: string[] } | { error: string } {
+function listOneDir(dir: string, labels: LabelEntry[]): { lines: string[] } | { error: string } {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (err: unknown) {
-    return { error: err instanceof Error ? err.message : String(err) };
+    return { error: describeError(err, labels) };
   }
 
   const lines: string[] = [];
@@ -47,7 +49,15 @@ function listOneDir(dir: string): { lines: string[] } | { error: string } {
     } catch {
       // Vanished between readdir and lstat; still name it, with no stats.
     }
-    lines.push(`${entryType(entry)}\t${size}\t${mtime}\t${full}`);
+    // Issue #7, outbound: `full` is `path.join(validatedDir, entry.name)`,
+    // and this function's own doc comment already argues that can never
+    // land outside `dir` (readdir's own entry.name cannot contain a
+    // separator or ".."). hostToVirtualOrRedact still runs rather than
+    // trusting that argument: the redaction is free, and it is the same
+    // "do not emit a path this cannot prove is in scope" rule fs_glob/
+    // fs_find/fs_grep apply to output that a symlink genuinely could steer
+    // outside their own validated root.
+    lines.push(`${entryType(entry)}\t${size}\t${mtime}\t${hostToVirtualOrRedact(full, labels)}`);
   }
   return { lines };
 }
@@ -62,7 +72,7 @@ export function registerList(registry: ToolRegistry): void {
         `Capped at ${MAX_ENTRIES} entries.`,
       inputSchema: schema(
         {
-          path: stringProp('Directory to list (defaults to the allowed directories)'),
+          path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),
         },
         []
       ),
@@ -77,16 +87,25 @@ export function registerList(registry: ToolRegistry): void {
       let dirs: string[];
 
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
-        const pathErr = checkPath(p, ctx.allowedDirs);
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and everything after it) already expects -- see
+        // read.ts for the full reasoning. The omitted-path branch below
+        // needs no decoding: it falls back to ctx.allowedDirs, which are
+        // already host paths.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
+        const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
         let st: fs.Stats;
         try {
           st = fs.statSync(p);
         } catch {
-          return errorResult(`directory not found: ${p}`);
+          return translateResult(errorResult(`directory not found: ${p}`), [p], ctx.labels);
         }
-        if (!st.isDirectory()) return errorResult(`not a directory: ${p}`);
+        if (!st.isDirectory()) {
+          return translateResult(errorResult(`not a directory: ${p}`), [p], ctx.labels);
+        }
         dirs = [p];
       } else if (ctx.allowedDirs.length > 0) {
         // An absent path resolves to the scope, not to cwd or to everything
@@ -106,8 +125,10 @@ export function registerList(registry: ToolRegistry): void {
 
       const allLines: string[] = [];
       for (const dir of dirs) {
-        const result = listOneDir(dir);
-        if ('error' in result) return errorResult(`list error: ${result.error}`);
+        const result = listOneDir(dir, ctx.labels);
+        if ('error' in result) {
+          return translateResult(errorResult(`list error: ${result.error}`), [dir], ctx.labels);
+        }
         allLines.push(...result.lines);
       }
 

@@ -61,7 +61,11 @@ test('a ";" in a grep pattern does not run a second command (canary is not creat
   const fx = mkFixture();
   try {
     const pattern = `hello; touch ${fx.canary}; echo done`;
-    await grepWithFakeRg(fx, { pattern, path: fx.allowed, output_mode: 'content' });
+    // path is omitted, not fx.allowed: issue #7 refuses a raw host path as
+    // an argument, and fx.allowed IS this server's whole scope, so omitting
+    // it (fs_grep's own "defaults to all allowed directories") reaches
+    // exactly the same directory without needing a virtual-path helper here.
+    await grepWithFakeRg(fx, { pattern, output_mode: 'content' });
 
     // The filesystem is the assertion, not the tool's reply. Under the old
     // string-joined execSync this file exists.
@@ -91,7 +95,7 @@ test('command substitution in a grep pattern is text, not a subshell', async () 
   try {
     // Both spellings; either one being evaluated creates the canary.
     const pattern = 'hello$(touch ' + fx.canary + ')`touch ' + fx.canary + '`';
-    await grepWithFakeRg(fx, { pattern, path: fx.allowed });
+    await grepWithFakeRg(fx, { pattern });
 
     assert.equal(
       fs.existsSync(fx.canary),
@@ -109,7 +113,7 @@ test('a shell redirect in a grep pattern writes no file', async () => {
   const fx = mkFixture();
   try {
     const pattern = `hello > ${fx.canary}`;
-    await grepWithFakeRg(fx, { pattern, path: fx.allowed });
+    await grepWithFakeRg(fx, { pattern });
 
     assert.equal(fs.existsSync(fx.canary), false, 'a ">" in the pattern was honoured as a redirect');
     const argv = readArgvLog(fx.log)[0];
@@ -124,7 +128,6 @@ test('the glob and type filters are argv elements too, not shell source', async 
   try {
     await grepWithFakeRg(fx, {
       pattern: 'hello',
-      path: fx.allowed,
       glob: `*.ts; touch ${fx.canary}`,
       type: 'ts',
     });
@@ -162,9 +165,12 @@ test('buildRgArgs never emits an element that is two shell words glued together'
     3,
     5
   );
-  // Every flag and every value stands alone; nothing was pre-joined.
+  // Every flag and every value stands alone; nothing was pre-joined. Issue
+  // #7: always --json (never -l/-c/-n -- see buildRgArgs's doc for why),
+  // so the caller-supplied glob/type/pattern/path elements after it are the
+  // part under test here, unaffected by that mode switch.
   assert.deepEqual(argv, [
-    '-n', '-C', '3',
+    '--json', '-C', '3',
     '--glob', '*.{ts,js}',
     '--type', 'ts',
     '--max-count', '5',
@@ -175,7 +181,7 @@ test('buildRgArgs never emits an element that is two shell words glued together'
 test('buildRgArgs does not prepend the program name (it is argv, not a command line)', () => {
   const argv = buildRgArgs('x', ['/d'], undefined, undefined, 'files_with_matches', undefined, undefined);
   assert.ok(!argv.includes('rg'), 'the program name belongs in execFileSync, not in the argv array');
-  assert.deepEqual(argv, ['-l', '--', 'x', '/d']);
+  assert.deepEqual(argv, ['--json', '--', 'x', '/d']);
 });
 
 test('a newline in a pattern is one element, not two commands', () => {
