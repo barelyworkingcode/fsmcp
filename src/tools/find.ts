@@ -4,6 +4,7 @@ import { execFileSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
 import { grepBudgetMs } from './grep';
 
 const MAX_RESULTS = 200;
@@ -178,7 +179,12 @@ export function registerFind(registry: ToolRegistry): void {
 
       let searchDirs: string[];
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and the file walk below) already expect -- see
+        // read.ts for the full reasoning.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
         const pathErr = checkPath(p, ctx.allowedDirs);
         if (pathErr) return pathErr;
         if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
@@ -220,7 +226,11 @@ export function registerFind(registry: ToolRegistry): void {
           : 'No matches found.');
       }
 
-      const lines = capped.map((r) => r.file).join('\n');
+      // Issue #7, outbound: `inScope` above already re-validated every file
+      // through validatePath (the real, unmodified security check);
+      // hostToVirtualOrRedact only decides how to show a path that check
+      // already accepted, and redacts rather than emits one it can't map.
+      const lines = capped.map((r) => hostToVirtualOrRedact(r.file, ctx.labels)).join('\n');
       const notes: string[] = [];
       if (scored.length > MAX_RESULTS) {
         notes.push(`(showing ${MAX_RESULTS} of ${scored.length} matches)`);

@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath } from '../security';
+import { decodeInboundPath } from '../vpath';
 
 export function registerMkdir(registry: ToolRegistry): void {
   registry.register(
@@ -24,7 +25,14 @@ export function registerMkdir(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const dirPathArg = requireStringArg(args, 'path');
       if (typeof dirPathArg !== 'string') return dirPathArg;
-      const dirPath = dirPathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPath (and everything after it) already expects -- see
+      // read.ts for the full reasoning.
+      const decoded = decodeInboundPath(dirPathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const dirPath = decoded;
+
       const recursiveArg = parseBoolArg(args.recursive, 'recursive', true);
       if (typeof recursiveArg !== 'boolean') return recursiveArg;
       const recursive = recursiveArg;

@@ -3,6 +3,8 @@ import * as path from 'path';
 import { ToolRegistry, schema, stringProp, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { LabelEntry } from '../types';
+import { decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
 
 const MAX_ENTRIES = 5000;
 
@@ -27,7 +29,7 @@ function entryType(entry: fs.Dirent): string {
  * separator or `..`, so it cannot name anything outside `dir` no matter what
  * that entry turns out to be.
  */
-function listOneDir(dir: string): { lines: string[] } | { error: string } {
+function listOneDir(dir: string, labels: LabelEntry[]): { lines: string[] } | { error: string } {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -47,7 +49,15 @@ function listOneDir(dir: string): { lines: string[] } | { error: string } {
     } catch {
       // Vanished between readdir and lstat; still name it, with no stats.
     }
-    lines.push(`${entryType(entry)}\t${size}\t${mtime}\t${full}`);
+    // Issue #7, outbound: `full` is `path.join(validatedDir, entry.name)`,
+    // and this function's own doc comment already argues that can never
+    // land outside `dir` (readdir's own entry.name cannot contain a
+    // separator or ".."). hostToVirtualOrRedact still runs rather than
+    // trusting that argument: the redaction is free, and it is the same
+    // "do not emit a path this cannot prove is in scope" rule fs_glob/
+    // fs_find/fs_grep apply to output that a symlink genuinely could steer
+    // outside their own validated root.
+    lines.push(`${entryType(entry)}\t${size}\t${mtime}\t${hostToVirtualOrRedact(full, labels)}`);
   }
   return { lines };
 }
@@ -77,7 +87,14 @@ export function registerList(registry: ToolRegistry): void {
       let dirs: string[];
 
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and everything after it) already expects -- see
+        // read.ts for the full reasoning. The omitted-path branch below
+        // needs no decoding: it falls back to ctx.allowedDirs, which are
+        // already host paths.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
         const pathErr = checkPath(p, ctx.allowedDirs);
         if (pathErr) return pathErr;
         let st: fs.Stats;
@@ -106,7 +123,7 @@ export function registerList(registry: ToolRegistry): void {
 
       const allLines: string[] = [];
       for (const dir of dirs) {
-        const result = listOneDir(dir);
+        const result = listOneDir(dir, ctx.labels);
         if ('error' in result) return errorResult(`list error: ${result.error}`);
         allLines.push(...result.lines);
       }

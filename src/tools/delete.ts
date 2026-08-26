@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathNoFollowFinal, refuseAllowedDirRoot } from '../security';
+import { decodeInboundPath } from '../vpath';
 
 // C3: cap total entries a single recursive delete may remove, so a runaway
 // (or a caller-supplied path several directories too high) is a loud
@@ -67,7 +68,16 @@ export function registerDelete(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const targetPathArg = requireStringArg(args, 'path');
       if (typeof targetPathArg !== 'string') return targetPathArg;
-      const targetPath = targetPathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPathNoFollowFinal (and everything after it) already
+      // expects -- see read.ts for the full reasoning. This runs BEFORE C2's
+      // no-follow-final check, not instead of it: the decoded string is
+      // still literal, un-followed, all the way to basename().
+      const decoded = decodeInboundPath(targetPathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const targetPath = decoded;
+
       const recursiveArg = parseBoolArg(args.recursive, 'recursive', false);
       if (typeof recursiveArg !== 'boolean') return recursiveArg;
       const recursive = recursiveArg;

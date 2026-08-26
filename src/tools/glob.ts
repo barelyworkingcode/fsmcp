@@ -3,6 +3,7 @@ import { globSync } from 'glob';
 import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
 
 const MAX_RESULTS = 1000;
 
@@ -34,7 +35,12 @@ export function registerGlob(registry: ToolRegistry): void {
       // Determine search directories ("." is treated as omitted)
       let searchDirs: string[];
       if (pathArg && pathArg !== '.') {
-        const p = pathArg;
+        // Issue #7: decode the client's virtual-space address into the host
+        // path checkPath (and the glob walk below) already expect -- see
+        // read.ts for the full reasoning.
+        const decoded = decodeInboundPath(pathArg, ctx.labels);
+        if (typeof decoded !== 'string') return decoded;
+        const p = decoded;
         const pathErr = checkPath(p, ctx.allowedDirs);
         if (pathErr) return pathErr;
         if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
@@ -89,7 +95,11 @@ export function registerGlob(registry: ToolRegistry): void {
       withMtime.sort((a, b) => b.mtime - a.mtime);
 
       const capped = withMtime.slice(0, MAX_RESULTS);
-      const result = capped.map((f) => f.path).join('\n');
+      // Issue #7, outbound: every hit already passed validatePath above (the
+      // real, unmodified security check); hostToVirtualOrRedact only
+      // decides how to SHOW a path that check already accepted, and redacts
+      // rather than emits one it somehow can't map -- see vpath.ts.
+      const result = capped.map((f) => hostToVirtualOrRedact(f.path, ctx.labels)).join('\n');
 
       const suffix = allMatches.length > MAX_RESULTS
         ? `\n\n(showing ${MAX_RESULTS} of ${allMatches.length} matches)`

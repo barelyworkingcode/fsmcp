@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath } from '../security';
+import { decodeInboundPath } from '../vpath';
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
@@ -26,7 +27,13 @@ export function registerEdit(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const filePathArg = requireStringArg(args, 'file_path');
       if (typeof filePathArg !== 'string') return filePathArg;
-      const filePath = filePathArg;
+
+      // Issue #7: decode the client's virtual-space address into the host
+      // path checkPath (and everything after it) already expects -- see
+      // read.ts for the full reasoning.
+      const decoded = decodeInboundPath(filePathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const filePath = decoded;
 
       const oldStringArg = requireStringArg(args, 'old_string');
       if (typeof oldStringArg !== 'string') return oldStringArg;

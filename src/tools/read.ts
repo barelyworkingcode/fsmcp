@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ToolRegistry, schema, stringProp, intProp, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath } from '../security';
+import { decodeInboundPath } from '../vpath';
 
 const IMAGE_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico',
@@ -44,7 +45,15 @@ export function registerRead(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext): ReturnType<typeof textResult> => {
       const filePathArg = requireStringArg(args, 'file_path');
       if (typeof filePathArg !== 'string') return filePathArg;
-      const filePath = filePathArg;
+
+      // Issue #7: the client addresses files in the virtual space this call
+      // was granted (/<label>/...), never a host path -- decodeInboundPath
+      // is the only thing standing between the caller's argument and every
+      // check below, and it does not replace any of them: checkPath still
+      // runs, unmodified, on the host path it hands back.
+      const decoded = decodeInboundPath(filePathArg, ctx.labels);
+      if (typeof decoded !== 'string') return decoded;
+      const filePath = decoded;
 
       const pathErr = checkPath(filePath, ctx.allowedDirs);
       if (pathErr) return pathErr;

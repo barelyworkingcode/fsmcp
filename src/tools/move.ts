@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath, canonicalizePath, refuseAllowedDirRoot } from '../security';
+import { decodeInboundPath } from '../vpath';
 
 export function registerMove(registry: ToolRegistry): void {
   registry.register(
@@ -26,11 +27,20 @@ export function registerMove(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext) => {
       const sourceArg = requireStringArg(args, 'source');
       if (typeof sourceArg !== 'string') return sourceArg;
-      const source = sourceArg;
+      // Issue #7: decode both endpoints' virtual-space addresses into host
+      // paths before either reaches checkPath -- see read.ts for the full
+      // reasoning. C4 (both endpoints checked independently and in full)
+      // still applies to the decoded host paths exactly as before; decoding
+      // is not a scope decision of its own.
+      const decodedSource = decodeInboundPath(sourceArg, ctx.labels);
+      if (typeof decodedSource !== 'string') return decodedSource;
+      const source = decodedSource;
 
       const destinationArg = requireStringArg(args, 'destination');
       if (typeof destinationArg !== 'string') return destinationArg;
-      const destination = destinationArg;
+      const decodedDestination = decodeInboundPath(destinationArg, ctx.labels);
+      if (typeof decodedDestination !== 'string') return decodedDestination;
+      const destination = decodedDestination;
 
       const overwriteArg = parseBoolArg(args.overwrite, 'overwrite', false);
       if (typeof overwriteArg !== 'boolean') return overwriteArg;
