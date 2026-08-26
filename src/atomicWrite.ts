@@ -46,6 +46,25 @@ import * as crypto from 'crypto';
  * unlinkSync, writeFileSync) instead of adding a sixth call that would need
  * its own containment argument written before it ships.
  *
+ * **Peak disk usage roughly doubles while this runs.** The old file and the
+ * new temp file are both resident on disk at once until the rename -- unlike
+ * a direct truncate-then-write, which never needs more than the larger of
+ * the two. Measured: on a 2MB volume holding a 540KB file, writing 1.9MB of
+ * new content succeeded with the old truncate-then-write (540KB + 1.9MB
+ * exceeds 2MB, but the write only ever needed to hold 1.9MB at once) and
+ * fails here with ENOSPC (540KB + 1.9MB together do not fit). This is the
+ * trade being made, deliberately, not a regression to explain away: a write
+ * that fails leaves the ORIGINAL file intact and reports the failure, which
+ * is strictly better than a write that fails and leaves the original
+ * destroyed (the bug this function exists to fix, and the whole reason it
+ * exists). A volume sized to hold exactly one copy of its largest file, with
+ * nothing to spare, can no longer safely rewrite that file in place --
+ * that is a real capacity requirement this trade introduces, not a bug in
+ * how it is met. The error a caller sees in that case is a plain ENOSPC,
+ * with nothing in the message pointing at "atomic write needs headroom" as
+ * the reason -- worth knowing before assuming a full disk means the disk is
+ * actually full.
+ *
  * The temp name is dot-prefixed and carries a random suffix, not a fixed
  * one (e.g. `filePath + '.tmp'`): two calls racing the same target (or a
  * crash that leaves one behind) must not collide on, or be mistaken for, a
@@ -65,6 +84,11 @@ export function writeFileAtomic(filePath: string, data: Buffer, mode?: number): 
     // are dropped deliberately rather than replicated blind, since nothing
     // about "preserve the execute bit across an edit" implies "also
     // preserve setuid across a rewrite to a fresh inode."
+    // This is the line the peak-disk-usage tradeoff in this function's doc
+    // comment is about: `data` lands on disk here, in full, ALONGSIDE the
+    // still-intact original at `filePath` -- there is no point before the
+    // rename below where only one copy exists. A volume with room for the
+    // new content but not for both copies fails here with plain ENOSPC.
     fs.writeFileSync(tmpPath, data, mode !== undefined ? { mode: mode & 0o777 } : undefined);
     fs.renameSync(tmpPath, filePath);
   } catch (err) {

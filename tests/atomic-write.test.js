@@ -5,6 +5,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { spawnServer, buildScopeFixture, removeFixture, toVirtual } = require('./helpers');
 
 /**
@@ -250,3 +251,116 @@ test('fs_write and fs_edit through an in-scope symlink update the symlink\'s tar
     "fs_edit's edited content must land on the symlink's target, not on a new file replacing the link"
   );
 });
+
+/**
+ * Write-to-temp-then-rename needs the OLD file and the NEW content resident
+ * on disk simultaneously (see atomicWrite.ts's own doc comment), unlike the
+ * truncate-then-write it replaced, which never needed more than the larger
+ * of the two. That is the accepted cost of the fix above -- losing the
+ * original on a failed write is worse than failing the write -- but it is a
+ * real behavioural change: a write that used to fit a nearly-full volume
+ * can now fail with a plain ENOSPC that gives no hint the atomic strategy is
+ * why. This test exists to make that trade a decision a future change has to
+ * notice breaking, not an accident: a payload sized to fit the free volume
+ * on its own, written over an existing file that leaves too little headroom
+ * for both copies at once, must fail -- and the ORIGINAL file must still be
+ * there afterwards, byte-identical, which is the whole point of the fix
+ * this same scenario stresses.
+ *
+ * Needs a real free-space boundary, not the marker-based fault injection
+ * the tests above use: this property is about actual bytes-remaining
+ * arithmetic on a real filesystem, which nothing at the JS level can stand
+ * in for without re-implementing (and therefore risking bugs in) the very
+ * space accounting this test is trying to pin. hdiutil (disk image
+ * creation) is macOS-only, so this test skips itself cleanly elsewhere
+ * rather than fake the result it exists to make real -- consistent with the
+ * rest of this suite, which already assumes a POSIX filesystem throughout
+ * (symlinks, permission bits) and has no Windows CI leg to protect.
+ */
+function hdiutilAvailable() {
+  try {
+    execFileSync('hdiutil', ['info'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function makeSmallVolume(sizeMiB) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-vol-'));
+  const image = path.join(dir, 'vol.dmg');
+  const mountPoint = path.join(dir, 'mnt');
+  fs.mkdirSync(mountPoint);
+  execFileSync('hdiutil', ['create', '-size', `${sizeMiB}m`, '-fs', 'HFS+', '-volname', 'fsmcptest', image], {
+    stdio: 'ignore',
+  });
+  execFileSync('hdiutil', ['attach', image, '-mountpoint', mountPoint], { stdio: 'ignore' });
+  return {
+    root: mountPoint,
+    cleanup() {
+      try {
+        execFileSync('hdiutil', ['detach', mountPoint, '-force'], { stdio: 'ignore' });
+      } catch {
+        // Best-effort: a leaked mount in a tmpdir is a cleanup nuisance, not
+        // a reason to fail a test that has already made its assertions.
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test(
+  'fs_write: a payload that fits the free volume alone fails once an existing file leaves no room ' +
+    'for both copies at once, and the original survives (peak-disk-usage tradeoff, pinned deliberately)',
+  async (t) => {
+    if (!hdiutilAvailable()) {
+      t.skip('hdiutil not available on this platform');
+      return;
+    }
+
+    const vol = makeSmallVolume(2);
+    t.after(() => vol.cleanup());
+
+    const payloadSize = 1900000;
+
+    // Sanity half of the pin, run on the volume BEFORE `existing.txt` below
+    // claims any of its space: this exact payload size fits when nothing
+    // else is competing for room, so the failure asserted further down is
+    // specifically about needing space for TWO copies at once, not about
+    // the payload being too large for the volume outright.
+    const probe = path.join(vol.root, '.sanity-probe');
+    fs.writeFileSync(probe, Buffer.alloc(payloadSize, 'y'));
+    fs.unlinkSync(probe);
+
+    const target = path.join(vol.root, 'existing.txt');
+    const before = Buffer.alloc(540000, 'A');
+    fs.writeFileSync(target, before);
+
+    const server = spawnServer(['--allowed-dir', vol.root]);
+    t.after(() => server.close());
+    const v = (p) => toVirtual(p, vol.root);
+
+    const r = await server.callTool('fs_write', {
+      file_path: v(target),
+      content: 'y'.repeat(payloadSize),
+    });
+
+    assert.equal(
+      r.isError,
+      true,
+      'writing a payload that fits the volume alone must still fail when the existing file leaves ' +
+        'no room for both the old and new copies at once'
+    );
+    assert.match((r.content || []).map((c) => c.text).join(''), /ENOSPC/);
+
+    const after = fs.readFileSync(target);
+    assert.ok(
+      before.equals(after),
+      'the original file must survive byte-identical -- this is the entire point of paying the ' +
+        'peak-disk-usage cost: a failed write must never destroy what was already there'
+    );
+
+    const leftover = fs.readdirSync(vol.root).filter((n) => n.includes('.fsmcp-tmp-'));
+    assert.deepStrictEqual(leftover, [], 'a failed write must not leave its temp file behind');
+  }
+);
