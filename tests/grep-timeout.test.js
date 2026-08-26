@@ -164,7 +164,7 @@ test('the fallback bound is wired through a real server, not just callable', asy
     },
   });
   try {
-    const res = await server.callTool('fs_grep', { pattern: BOMB_PATTERN, path: dir });
+    const res = await server.callTool('fs_grep', { pattern: BOMB_PATTERN });
     const text = res.content[0].text;
     assert.match(text, /stopped after 150ms/, `expected a truncation report; got: ${text}`);
     assert.ok(!/^No matches found\.$/.test(text.trim()));
@@ -189,7 +189,7 @@ test('a ripgrep timeout is an error naming the timeout, not a silent partial', a
     },
   });
   try {
-    const res = await server.callTool('fs_grep', { pattern: 'hello', path: dir });
+    const res = await server.callTool('fs_grep', { pattern: 'hello' });
     const text = res.content[0].text;
 
     assert.equal(res.isError, true, 'a timed-out search must not be reported as a result');

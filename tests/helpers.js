@@ -138,6 +138,68 @@ function readArgvLog(log) {
 }
 
 /**
+ * Issue #7: build the virtual-space address a test should send over the wire
+ * for a path it constructed in host terms. `rootHostDir` is the allowed
+ * directory that address's label stands for; `label` defaults to "d0"
+ * because every fixture in this suite passes a single, unlabelled
+ * `--allowed-dir`, which src/vpath.ts's assignLabels always names "d0" (the
+ * first, and only, entry of the effective scope).
+ *
+ * This is a literal string replace of the `rootHostDir` PREFIX, not a real
+ * path.join: src/vpath.ts's virtualToHost is deliberately literal
+ * concatenation rather than a lexically-normalising join, precisely so a
+ * caller-supplied "../.." after the label reaches canonicalizePath's
+ * kernel-style walk unresolved rather than pre-collapsed -- this helper has
+ * to preserve that same shape, or a test built with it would stop
+ * exercising the exact escape it names. `hostPath` therefore must actually
+ * start with `rootHostDir`; anything else is a test construction bug, not a
+ * case this helper is meant to handle (see OUTSIDE_HOST_PATH below for a
+ * path that has no virtual form at all, on purpose).
+ */
+function toVirtual(hostPath, rootHostDir, label = 'd0') {
+  if (hostPath === rootHostDir) return `/${label}`;
+  if (!hostPath.startsWith(rootHostDir)) {
+    throw new Error(`toVirtual: ${JSON.stringify(hostPath)} does not start with ${JSON.stringify(rootHostDir)}`);
+  }
+  // rootHostDir === "/" (the --allowed-dir / opt-out) is the one case
+  // slicing off just rootHostDir's own length leaves the path's leading "/"
+  // glued straight onto the label with no separator of its own -- mirrors
+  // the fix in src/vpath.ts's hostToVirtual, for the same reason.
+  const sep = rootHostDir.endsWith('/') ? rootHostDir : `${rootHostDir}/`;
+  return `/${label}/${hostPath.slice(sep.length)}`;
+}
+
+/**
+ * Like toVirtual, for a host path that is NOT a descendant of `rootHostDir`
+ * -- a sibling directory outside the grant, the shape most "in -> out" /
+ * "out -> in" containment cases in this suite need. Built with
+ * `path.relative`, which climbs out with a literal ".." the same way a
+ * caller who already knows the shape of the filesystem around their grant
+ * could type one by hand; canonicalizePath (security.ts) then resolves that
+ * ".." against the REAL directory tree, exactly as it would for any other
+ * caller-supplied "..". This is a different, weaker guarantee than
+ * toVirtual's literal-suffix preservation (path.relative is free to
+ * normalise the middle of the path however Node likes), which is fine here
+ * because these cases are testing "does validatePath's containment check
+ * still refuse a path that climbs out of its root", not pinning one exact
+ * string shape for the traversal the way the escape-matrix's ".."-through-
+ * a-symlink cases do.
+ */
+function toVirtualVia(targetHostPath, rootHostDir, label = 'd0') {
+  return `/${label}/${path.relative(rootHostDir, targetHostPath)}`;
+}
+
+/**
+ * A raw host path is refused as an address by itself -- issue #7 does not
+ * accept one as a convenience alongside the virtual form, precisely so a
+ * client cannot use a guessable host path as a probe. Tests that want to
+ * pin THAT refusal (as opposed to a `toVirtual`-built address that decodes
+ * to something canonicalizePath then refuses) use this constant so the
+ * intent reads at the call site instead of an unexplained absolute string.
+ */
+const NOT_A_VIRTUAL_PATH = /is not a valid address/i;
+
+/**
  * A unique string that identifies bait content living outside the escape
  * matrix fixture's allowed dir. Used instead of a plain word ("secret") so a
  * false positive can't be explained away as a coincidental substring match
@@ -232,4 +294,14 @@ function removeFixture(fixture) {
   fs.rmSync(fixture.testRoot, { recursive: true, force: true });
 }
 
-module.exports = { spawnServer, makeFakeRg, readArgvLog, buildScopeFixture, removeFixture, OUTSIDE_CANARY };
+module.exports = {
+  spawnServer,
+  makeFakeRg,
+  readArgvLog,
+  buildScopeFixture,
+  removeFixture,
+  OUTSIDE_CANARY,
+  toVirtual,
+  toVirtualVia,
+  NOT_A_VIRTUAL_PATH,
+};

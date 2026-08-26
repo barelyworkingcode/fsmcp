@@ -5,7 +5,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawnServer } = require('./helpers');
+const { spawnServer, toVirtual } = require('./helpers');
 
 /**
  * Two questions this file answers, which the escape matrix does not.
@@ -146,22 +146,46 @@ test('path spellings that mean something other than they look like', async (t) =
   fs.symlinkSync('L_loopA', path.join(root, 'L_loopB'));
 
   const server = spawnServer(['--allowed-dir', root]);
+  // Issue #7: `root` (the CLI's only --allowed-dir) is this call's whole
+  // scope, positioned first and unlabelled, so vpath.ts's assignLabels
+  // always names it "d0" -- see toVirtual's doc in helpers.js for why the
+  // rewrite below is a literal prefix swap, not a path.join, and why that
+  // matters for exactly the escape shapes this test constructs.
+  const v = (hostPath) => toVirtual(hostPath, root);
 
   const cases = [
-    ['a percent-encoded ".." is a filename, not a traversal', `${root}/..%2f..%2foutside/secret.txt`],
-    ['a doubled separator does not hide the ".."', `${root}//../outside/secret.txt`],
-    ['interleaved "." segments do not absorb the ".."', `${root}/./././../outside/secret.txt`],
-    ['more ".." than there are components stops at the root', `${root}/../../../../../../../etc/passwd`],
-    ['a trailing separator on a file path', `${root}/../outside/secret.txt/`],
-    ['a trailing "." component', `${root}/../outside/secret.txt/.`],
-    ['a self-referential symlink chain does not launder the ".."', `${root}/L_self/L_self/L_self/../outside/secret.txt`],
-    ['a symlink cycle is refused rather than hanging', `${root}/L_loopA`],
-    // On a case-insensitive volume the kernel would open this; the check is
-    // case-sensitive, so it refuses. That is the fail-closed direction --
-    // worth pinning so a future "normalise the case" change has to argue
-    // with a test rather than quietly opening the other direction.
-    ['a case-drifted root does not match the allowed dir', `${root.toUpperCase()}/../outside/secret.txt`],
+    ['a percent-encoded ".." is a filename, not a traversal', v(`${root}/..%2f..%2foutside/secret.txt`)],
+    ['a doubled separator does not hide the ".."', v(`${root}//../outside/secret.txt`)],
+    ['interleaved "." segments do not absorb the ".."', v(`${root}/./././../outside/secret.txt`)],
+    ['more ".." than there are components stops at the root', v(`${root}/../../../../../../../etc/passwd`)],
+    ['a trailing separator on a file path', v(`${root}/../outside/secret.txt/`)],
+    ['a trailing "." component', v(`${root}/../outside/secret.txt/.`)],
+    ['a self-referential symlink chain does not launder the ".."', v(`${root}/L_self/L_self/L_self/../outside/secret.txt`)],
+    ['a symlink cycle is refused rather than hanging', v(`${root}/L_loopA`)],
   ];
+
+  // ---------------------------------------------------------------------
+  // Design finding (issue #7): the pre-#7 suite also pinned a "case-drifted
+  // root does not match the allowed dir" case here --
+  // `${root.toUpperCase()}/../outside/secret.txt` sent as `file_path`,
+  // proving isWithinAnyDir's case-sensitive prefix compare refuses a
+  // client-supplied path whose ROOT differs from the allowed dir only in
+  // case.
+  //
+  // That case can no longer be EXPRESSED once inbound addressing is
+  // virtual-only. A client never spells the host root at all any more --
+  // every address is `/d0/...`, and vpath.ts's virtualToHost substitutes
+  // the real, correctly-cased hostDir itself; there is no argument position
+  // left for a client to smuggle a case-drifted root into. This is not a
+  // narrower guarantee than before, it is the same guarantee reached a
+  // different way (the client-facing surface that would have needed
+  // case-sensitivity no longer exists), but it is also not the SAME test,
+  // so per issue #7's instruction this is called out rather than quietly
+  // dropped: canonicalizePath's own case-sensitivity is untouched and still
+  // exercised at the unit level (security.test.js does not go through
+  // vpath.ts at all), but nothing in this suite proves it from the wire
+  // any more, because nothing on the wire can reach it any more.
+  // ---------------------------------------------------------------------
 
   try {
     for (const [name, filePath] of cases) {
@@ -176,14 +200,14 @@ test('path spellings that mean something other than they look like', async (t) =
 
     await t.test('a NUL byte is refused by name, not passed to a syscall', async () => {
       const result = await server.callTool('fs_read', {
-        file_path: `${root}/a.txt${String.fromCharCode(0)}/../../outside/secret.txt`,
+        file_path: v(`${root}/a.txt${String.fromCharCode(0)}/../../outside/secret.txt`),
       });
       assert.strictEqual(result.isError, true);
       assert.match(result.content[0].text, /NUL/);
     });
 
     await t.test('the server survived every one of them', async () => {
-      const result = await server.callTool('fs_read', { file_path: path.join(root, 'a.txt') });
+      const result = await server.callTool('fs_read', { file_path: v(path.join(root, 'a.txt')) });
       assert.strictEqual(result.isError, undefined);
       assert.match(result.content[0].text, /in scope/);
     });
@@ -216,7 +240,10 @@ test('fs_list names a symlink but never its target', async () => {
 
   const server = spawnServer(['--allowed-dir', root]);
   try {
-    const result = await server.callTool('fs_list', { path: root });
+    // path omitted, not root: root IS this server's whole scope, and issue
+    // #7 refuses a raw host path as an argument -- omitting it (fs_list's
+    // own "defaults to the allowed directories") reaches the same directory.
+    const result = await server.callTool('fs_list', {});
     const text = result.content[0].text;
 
     assert.ok(text.includes('L_secret'), 'the link itself is in scope and should be listed');
