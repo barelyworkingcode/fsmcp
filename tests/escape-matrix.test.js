@@ -635,6 +635,51 @@ test('fs_move with overwrite:true onto the allowed_dir root does not erase the r
   );
 });
 
+// `(args.recursive as boolean) ?? false` -- what fs_delete used to write --
+// is a type assertion, not a check, and `??` only substitutes the default
+// for null/undefined. A non-empty *string* "false" is truthy in JS, so it
+// sailed straight through to `!recursive` reading it as true: a caller (or
+// a lossy layer upstream that stringifies booleans) spelling the opt-out as
+// text instead of JSON's `false` got the exact opposite of what they typed,
+// with fs_delete's whole safety contract -- recursive defaults to false, so
+// destroying a non-empty directory requires an explicit opt-in -- silently
+// inverted under it. Fixed by registry.ts's parseBoolArg, which refuses a
+// non-boolean cleanly instead of guessing.
+test('fs_delete treats recursive:"false" (a truthy string) as a bad argument, not as true', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const notes = path.join(fx.root, 'notes');
+  const r = await server.callTool('fs_delete', { path: notes, recursive: 'false' });
+
+  assert.equal(r.isError, true, 'a stringly-typed "false" must not be read as true');
+  assert.match(allText(r), /recursive must be true or false/i);
+  assert.equal(fs.existsSync(path.join(notes, 'note1.txt')), true, 'nothing should have been removed');
+});
+
+// Same mistake, same fix, for fs_move's `overwrite`: a caller sending
+// overwrite:"false" must not have an existing destination silently replaced
+// out from under them.
+test('fs_move treats overwrite:"false" (a truthy string) as a bad argument, not as true', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const source = path.join(fx.root, 'a.txt');
+  const destination = path.join(fx.root, 'notes', 'note1.txt');
+  const destBefore = fs.readFileSync(destination, 'utf-8');
+
+  const r = await server.callTool('fs_move', { source, destination, overwrite: 'false' });
+
+  assert.equal(r.isError, true, 'a stringly-typed "false" must not be read as true');
+  assert.match(allText(r), /overwrite must be true or false/i);
+  assert.equal(fs.readFileSync(destination, 'utf-8'), destBefore, 'the existing destination must survive untouched');
+  assert.ok(fs.existsSync(source), 'the refused move must not have touched the source either');
+});
+
 // C3's entry cap: a runaway (or a caller-supplied path several directories
 // too high) must be a loud refusal, not "however long it takes to remove
 // everything under it" -- and, just as importantly, not a PARTIAL delete
@@ -737,4 +782,62 @@ test('a non-array _meta.allowed_dirs fails the one call closed, and does not tak
   const control = await server.callTool('fs_read', { file_path: path.join(fx.root, 'a.txt') });
   assert.equal(control.isError, undefined, allText(control));
   assert.match(allText(control), /inside a\.txt/);
+});
+
+// ---------------------------------------------------------------------------
+// A missing or wrong-typed required argument used to reach whatever the
+// tool does with `undefined` (or the wrong-typed value) with no check in
+// between, and every tool's own way of mishandling that was different.
+// fs_find is the confirmed instance: calling it without `pattern` reached
+// `pattern.toLowerCase()` inside fuzzyScore, uncaught by anything upstream
+// of registry.call's backstop try/catch, and answered with a raw JS
+// internal-property message instead of naming the missing argument.
+// Fixed by registry.ts's requireStringArg, applied to every required
+// string argument across all ten tools.
+// ---------------------------------------------------------------------------
+test('fs_find without pattern refuses cleanly, not with a raw JS property-access error', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  // The exact mistake that surfaced this: a caller sent `query` instead of
+  // `pattern`, so `args.pattern` is `undefined`.
+  const r = await server.callTool('fs_find', { query: 'secret' });
+  assert.equal(r.isError, true);
+  assert.doesNotMatch(
+    allText(r),
+    /cannot read propert/i,
+    'the refusal must not be a raw JS TypeError message'
+  );
+  assert.match(allText(r), /pattern is required/i, 'the refusal must name the missing argument');
+});
+
+// fs_edit's new_string sent as JSON `null` used to be silently written into
+// the file as the four characters "null": Array.prototype.join stringifies
+// a `null` separator/element (unlike `undefined`, which it treats as "use
+// the default"), and `(args.new_string as string)` cannot tell the two
+// apart. That is corruption reported as success, not a crash -- strictly
+// worse than the TypeError the same mistake throws when old_string is the
+// wrong type instead. Fixed by requiring new_string (and old_string,
+// file_path) to actually be strings before either ever reaches
+// content.split/parts.join.
+test('fs_edit refuses new_string: null instead of writing the word "null" into the file', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const file = path.join(fx.root, 'a.txt');
+  const before = fs.readFileSync(file, 'utf-8');
+
+  const r = await server.callTool('fs_edit', {
+    file_path: file,
+    old_string: 'inside',
+    new_string: null,
+  });
+
+  assert.equal(r.isError, true, 'new_string: null must be refused, not treated as a replacement value');
+  assert.match(allText(r), /new_string must be a string/i);
+  assert.equal(fs.readFileSync(file, 'utf-8'), before, 'the file must be untouched by the refused edit');
 });

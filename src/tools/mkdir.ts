@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath } from '../security';
 
@@ -22,8 +22,12 @@ export function registerMkdir(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
-      const dirPath = args.path as string;
-      const recursive = (args.recursive as boolean) ?? true;
+      const dirPathArg = requireStringArg(args, 'path');
+      if (typeof dirPathArg !== 'string') return dirPathArg;
+      const dirPath = dirPathArg;
+      const recursiveArg = parseBoolArg(args.recursive, 'recursive', true);
+      if (typeof recursiveArg !== 'boolean') return recursiveArg;
+      const recursive = recursiveArg;
 
       const pathErr = checkPath(dirPath, ctx.allowedDirs);
       if (pathErr) return pathErr;

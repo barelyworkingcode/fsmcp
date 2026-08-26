@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath, canonicalizePath, refuseAllowedDirRoot } from '../security';
 
@@ -24,9 +24,17 @@ export function registerMove(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
-      const source = args.source as string;
-      const destination = args.destination as string;
-      const overwrite = (args.overwrite as boolean) ?? false;
+      const sourceArg = requireStringArg(args, 'source');
+      if (typeof sourceArg !== 'string') return sourceArg;
+      const source = sourceArg;
+
+      const destinationArg = requireStringArg(args, 'destination');
+      if (typeof destinationArg !== 'string') return destinationArg;
+      const destination = destinationArg;
+
+      const overwriteArg = parseBoolArg(args.overwrite, 'overwrite', false);
+      if (typeof overwriteArg !== 'boolean') return overwriteArg;
+      const overwrite = overwriteArg;
 
       // C4: both endpoints are validated, independently and in full. A move
       // is really two path-governed operations wearing one name -- the

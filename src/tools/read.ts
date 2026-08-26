@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, intProp } from '../registry';
+import { ToolRegistry, schema, stringProp, intProp, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPath } from '../security';
 
@@ -29,7 +29,9 @@ export function registerRead(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext): ReturnType<typeof textResult> => {
-      const filePath = args.file_path as string;
+      const filePathArg = requireStringArg(args, 'file_path');
+      if (typeof filePathArg !== 'string') return filePathArg;
+      const filePath = filePathArg;
 
       const pathErr = checkPath(filePath, ctx.allowedDirs);
       if (pathErr) return pathErr;

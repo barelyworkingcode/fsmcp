@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
+import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathNoFollowFinal, refuseAllowedDirRoot } from '../security';
 
@@ -65,8 +65,12 @@ export function registerDelete(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
-      const targetPath = args.path as string;
-      const recursive = (args.recursive as boolean) ?? false;
+      const targetPathArg = requireStringArg(args, 'path');
+      if (typeof targetPathArg !== 'string') return targetPathArg;
+      const targetPath = targetPathArg;
+      const recursiveArg = parseBoolArg(args.recursive, 'recursive', false);
+      if (typeof recursiveArg !== 'boolean') return recursiveArg;
+      const recursive = recursiveArg;
 
       // C2: validated WITHOUT following the final component. The ordinary,
       // fully-canonicalizing validatePath is right for read and write --

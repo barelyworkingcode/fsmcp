@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolRegistry, schema, stringProp } from '../registry';
+import { ToolRegistry, schema, stringProp, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
@@ -71,10 +71,13 @@ export function registerList(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
+      const pathArg = optionalStringArg(args, 'path');
+      if (typeof pathArg === 'object') return pathArg; // a wrong-typed path is an MCPCallResult refusal
+
       let dirs: string[];
 
-      if (args.path && args.path !== '.') {
-        const p = args.path as string;
+      if (pathArg && pathArg !== '.') {
+        const p = pathArg;
         const pathErr = checkPath(p, ctx.allowedDirs);
         if (pathErr) return pathErr;
         let st: fs.Stats;

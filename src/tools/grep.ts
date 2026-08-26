@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import { ToolRegistry, schema, stringProp, intProp, enumProp } from '../registry';
+import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
@@ -87,17 +87,22 @@ export function registerGrep(registry: ToolRegistry): void {
       category: 'File System',
     },
     (args: Record<string, unknown>, ctx: ToolContext) => {
-      const pattern = args.pattern as string;
+      const patternArg = requireStringArg(args, 'pattern');
+      if (typeof patternArg !== 'string') return patternArg;
+      const pattern = patternArg;
       const globFilter = args.glob as string | undefined;
       const typeFilter = args.type as string | undefined;
       const outputMode = (args.output_mode as string) ?? 'files_with_matches';
       const contextLines = args.context as number | undefined;
       const headLimit = args.head_limit as number | undefined;
 
+      const pathArg = optionalStringArg(args, 'path');
+      if (typeof pathArg === 'object') return pathArg; // a wrong-typed path is an MCPCallResult refusal
+
       // Determine search paths ("." is treated as omitted)
       let searchPaths: string[];
-      if (args.path && args.path !== '.') {
-        const p = args.path as string;
+      if (pathArg && pathArg !== '.') {
+        const p = pathArg;
         const pathErr = checkPath(p, ctx.allowedDirs);
         if (pathErr) return pathErr;
         searchPaths = [p];
