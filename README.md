@@ -248,6 +248,45 @@ is a property of the relay in front of it, and is worth checking with
 `relayremote list --schema` on the deployment you actually run (plain
 `list` truncates the description, which is where the note lives).
 
+There was a second exception, unintended and now closed, and it is worth
+stating plainly because of how ordinary the trigger was. `fs_grep`'s ripgrep
+backend returned ripgrep's own stderr to the client verbatim, and ripgrep --
+like essentially every Unix tool -- writes `<path>: <reason>`. So one
+`fs_grep` against a granted folder an operator had renamed, or a drive that
+was not mounted this morning, or a directory with awkward permissions,
+answered with the host's real absolute path: the account name, the layout
+above the grant, the lot. Nothing about the call was unusual; the second
+trigger fires on a default-scope search with no `path` argument at all. The
+generic backstop that was supposed to catch this did not, because its
+path-boundary test accepted only `/`, a newline or end-of-string after a
+granted directory -- and a colon is none of those, so naming the granted
+**root** leaked while naming anything *inside* it did not. Both halves are
+fixed (issue #22): the error path translates the search directories it
+already knows, the way every other call site in fsmcp does, and the boundary
+test now accepts the punctuation a diagnostic actually puts after a path.
+
+The visible consequence is that `fs_grep` and `fs_find` answer like their
+siblings now. A directory that does not exist is `directory not found:
+/d0/nodir`, the same sentence `fs_glob` and `fs_list` give; one that cannot
+be read is `directory not readable: /d1`. Previously the first of those
+produced *"fsmcp: internal error -- ... This is a bug in fsmcp ... please
+report it"* for a plain typo, which is what a backstop meant to fire once a
+year looks like when it becomes a tool's normal error path. And because
+ripgrep exits non-zero for *any* error it hit, including one it walked
+straight past, a single unreadable file anywhere under a searched tree used
+to discard every match found alongside it -- `fs_grep` now returns those
+matches with an explicit note that they are a floor rather than a complete
+answer, and `fs_find` does the same with its file listing instead of
+answering `No matches found.` for a root it could not open.
+
+Two residues, stated rather than assumed. A path in ripgrep's stderr that
+lies under **no** granted directory (ripgrep naming its own config file, say)
+has nothing to be translated against, so the last-resort branch that quotes
+ripgrep can still surface one; and a granted root that is *missing* is still
+dropped silently from a default-scope search by a check `fs_grep`,
+`fs_glob`, `fs_find` and `fs_list` all share, so such a call answers as
+though the scope were smaller rather than saying a root went away.
+
 ### A symlink out of the sandbox is refused, even one a human placed
 
 A symlink that lives inside an allowed directory but resolves outside it is

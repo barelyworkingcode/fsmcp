@@ -460,6 +460,51 @@ export function describeError(err: unknown, labels: LabelEntry[]): string {
 }
 
 /**
+ * The character class a granted directory must be followed by for the
+ * backstop below to call it a leak.
+ *
+ * The question this answers is not "what ends a path" -- nothing does, on
+ * Unix, where every byte except `/` and NUL is a legal filename character.
+ * It is "what can follow a granted directory in a DIAGNOSTIC written by a
+ * tool, in a way a sibling directory's longer name never would". The two
+ * errors are not symmetric, and the class is deliberately biased toward the
+ * cheaper one: a false positive costs one error message, replaced by the
+ * generic refusal below; a false negative costs the host path itself, which
+ * is the thing this whole module exists to prevent.
+ *
+ * Accepted, and why:
+ *   `/`               a descendant path -- the original case.
+ *   `\s` (incl. `\n`) any line or word break; a message that ends at the
+ *                     path, or continues after a space.
+ *   `:`               `<path>: <reason>`, which is what essentially every
+ *                     Unix tool writes -- ripgrep, the C library's own
+ *                     `perror` convention, Go, Rust. Its absence from this
+ *                     class was issue #22: `rg: <granted root>: Permission
+ *                     denied` walked straight through the backstop, while
+ *                     the byte-identical message naming anything INSIDE
+ *                     that root (followed by `/`) was caught.
+ *   `'` `"` `` ` ``   a quoted path. Node's own errno messages quote:
+ *                     `EACCES: permission denied, scandir '/granted/root'`,
+ *                     so this is not hypothetical either.
+ *   `,` `;`           list separators in a message naming several paths.
+ *   `)` `]` `}` `>` `|`  a path closing a parenthetical, a bracketed
+ *                     context, or the left half of an `a -> b` arrow.
+ *
+ * Deliberately NOT accepted -- every one of these is an ordinary character
+ * *inside* a directory name, so accepting it would make the alarm fire on
+ * an unrelated sibling that merely shares a prefix (`/allowed/project` vs
+ * `/allowed/project-old`, the case the boundary test exists for): letters,
+ * digits, `.`, `-`, `_`, `~`, `+`, `=`, `@`, `#`, `%`.
+ *
+ * Note what this does NOT try to be: a way to decide whether some substring
+ * of free text IS a path. It only decides whether an occurrence of one
+ * exact, already-known granted directory looks like that directory rather
+ * than the head of a longer name. Anything more would be the whole-result
+ * rewrite PR #10 removed, wearing a different hat.
+ */
+const PATH_BOUNDARY = "(?=[/\\s:,;'\"`)\\]}>|]|$)";
+
+/**
  * Final backstop, not a translation mechanism: if an ERROR result somehow
  * still contains a literal granted host directory after every deliberate
  * translation site above, that is a bug -- something reached the client
@@ -481,14 +526,25 @@ export function describeError(err: unknown, labels: LabelEntry[]): string {
  * a host directory). Restricting the scan to `isError` avoids it entirely:
  * nothing in this codebase returns raw file content on an error path.
  *
- * A path-boundary lookahead (matching `hostToVirtual`/the old whole-result
- * rewrite) avoids flagging an unrelated sibling directory that happens to
- * share a prefix (`/allowed/project` inside `/allowed/project-old`).
+ * A path-boundary lookahead (`PATH_BOUNDARY` above, and see its doc for the
+ * exact class and the reasoning behind each character in it) avoids
+ * flagging an unrelated sibling directory that happens to share a prefix
+ * (`/allowed/project` inside `/allowed/project-old`).
+ *
+ * **This is an alarm, and a caller that relies on it is the bug.** Issue #22
+ * is what that reliance looks like in practice: `fs_grep`'s ripgrep error
+ * branch translated nothing and left this function to catch whatever `rg`
+ * printed, so a one-character gap in the boundary class (no `:`) was the
+ * only thing between a remote client and the host's real absolute path --
+ * and in the cases where the alarm DID fire, its generic "this is a bug in
+ * fsmcp" text was what an agent got for mistyping a directory name. Both
+ * halves are fixed at that call site, where the paths are known; the class
+ * was widened as defence in depth, not as the fix.
  */
 export function redactLeakedHostPaths(result: MCPCallResult, labels: LabelEntry[]): MCPCallResult {
   if (!result.isError || labels.length === 0) return result;
   const leaked = labels.some(({ hostDir }) => {
-    const re = new RegExp(`${escapeRegExp(hostDir)}(?=[/\n]|$)`);
+    const re = new RegExp(`${escapeRegExp(hostDir)}${PATH_BOUNDARY}`);
     return result.content.some((item) => re.test(item.text));
   });
   if (!leaked) return result;

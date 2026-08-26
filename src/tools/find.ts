@@ -5,7 +5,7 @@ import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, 
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
-import { grepBudgetMs } from './grep';
+import { grepBudgetMs, unsearchableReason } from './grep';
 
 const MAX_RESULTS = 200;
 
@@ -36,8 +36,27 @@ try {
  * regex, no risk of "these are the matches I found" reading as more complete
  * than it is), so there is nothing to lose by keeping it and reporting the
  * truncation instead.
+ *
+ * `failed` is the same argument applied to ripgrep's OTHER way of not
+ * finishing (issue #22, found alongside fs_grep's leak). rg exits 2 for any
+ * error it hit, including one it walked straight past -- one unreadable
+ * directory anywhere under the scope is enough -- and this used to answer
+ * that with `{ files: [], truncated: false }`, which the caller then
+ * reported as `No matches found.`, a SUCCESS. Two things wrong with it, both
+ * measured: a whole granted root that could not be read (mode 000) made
+ * fs_find claim there was nothing matching in ANY root, silently discarding
+ * the real hits from the readable ones, and it made "the search found
+ * nothing" and "the search could not run" the same reply -- the exact
+ * distinction the timeout handling above already refuses to blur. So the
+ * partial listing is kept, like the timeout's, and the failure is reported
+ * to the caller, which decides what to say.
+ *
+ * ripgrep's stderr is deliberately NOT read here. fs_find never showed it
+ * and does not start now: the caller diagnoses the search roots itself
+ * (`unsearchableReason`, grep.ts) rather than repeating rg's free text,
+ * which is where fs_grep's host-path leak came from.
  */
-function listFilesRg(dirs: string[], timeoutMs: number): { files: string[]; truncated: boolean } {
+function listFilesRg(dirs: string[], timeoutMs: number): { files: string[]; truncated: boolean; failed: boolean } {
   try {
     const output = execFileSync('rg', ['--files', '--no-follow', '--', ...dirs], {
       encoding: 'utf-8',
@@ -45,13 +64,14 @@ function listFilesRg(dirs: string[], timeoutMs: number): { files: string[]; trun
       maxBuffer: 10 * 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return { files: output.split('\n').filter(Boolean), truncated: false };
+    return { files: output.split('\n').filter(Boolean), truncated: false, failed: false };
   } catch (err: unknown) {
     const e = (err ?? {}) as { code?: string; stdout?: unknown };
-    if (e.code === 'ETIMEDOUT' && typeof e.stdout === 'string') {
-      return { files: e.stdout.split('\n').filter(Boolean), truncated: true };
+    const partial = typeof e.stdout === 'string' ? e.stdout.split('\n').filter(Boolean) : [];
+    if (e.code === 'ETIMEDOUT') {
+      return { files: partial, truncated: true, failed: false };
     }
-    return { files: [], truncated: false };
+    return { files: partial, truncated: false, failed: true };
   }
 }
 
@@ -64,7 +84,7 @@ function listFilesRg(dirs: string[], timeoutMs: number): { files: string[]; trun
  * here can be handed a name that lives outside the directory being walked
  * because of one.
  */
-function listFilesFallback(dirs: string[], deadline: number): { files: string[]; truncated: boolean } {
+function listFilesFallback(dirs: string[], deadline: number): { files: string[]; truncated: boolean; failed: boolean } {
   const files: string[] = [];
   let truncated = false;
 
@@ -99,7 +119,13 @@ function listFilesFallback(dirs: string[], deadline: number): { files: string[];
     walk(dir);
     if (truncated) break;
   }
-  return { files, truncated };
+  // No `failed` from this walker: it reports what it could read and skips
+  // what it could not, per-directory, and has no aggregate failure to
+  // report. The search roots themselves are checked before either backend
+  // runs (see the handler), which is the case that matters -- an unreadable
+  // directory deeper in the tree is skipped silently here exactly as it
+  // always has been.
+  return { files, truncated, failed: false };
 }
 
 /**
@@ -187,8 +213,15 @@ export function registerFind(registry: ToolRegistry): void {
         const p = decoded;
         const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
-        if (!fs.existsSync(p)) {
-          return translateResult(errorResult(`directory not found: ${p}`), [p], ctx.labels);
+        // Issue #22: "is it there" was never the whole question. A granted
+        // directory this process cannot READ (mode 000, or a macOS
+        // TCC-protected folder) passes existsSync, then produces no files
+        // and no error, and fs_find answered `No matches found.` for it --
+        // a success, about a directory it never looked inside.
+        // `unsearchableReason` (grep.ts) answers both, in the same words.
+        const reason = unsearchableReason(p);
+        if (reason) {
+          return translateResult(errorResult(`${reason}: ${p}`), [p], ctx.labels);
         }
         searchDirs = [p];
       } else if (ctx.allowedDirs.length > 0) {
@@ -203,9 +236,20 @@ export function registerFind(registry: ToolRegistry): void {
       const budgetMs = grepBudgetMs();
       const deadline = Date.now() + budgetMs;
 
-      const { files, truncated } = rgAvailable
+      const { files, truncated, failed } = rgAvailable
         ? listFilesRg(searchDirs, budgetMs)
         : listFilesFallback(searchDirs, deadline);
+
+      // What fsmcp can say for itself about why the walk failed, in the same
+      // words fs_glob/fs_list/fs_grep use -- never ripgrep's own text (see
+      // listFilesRg). Only computed on failure: the syscalls are pointless
+      // otherwise, and asking about a directory nothing went wrong with
+      // would be work for its own sake.
+      const unsearchable = failed
+        ? searchDirs
+            .map((d) => ({ dir: d, reason: unsearchableReason(d) }))
+            .filter((x): x is { dir: string; reason: string } => x.reason !== null)
+        : [];
 
       // Every returned path is re-validated before it reaches the caller --
       // the same treatment fs_glob's hits get and for the same reason: what
@@ -223,6 +267,22 @@ export function registerFind(registry: ToolRegistry): void {
 
       const capped = scored.slice(0, MAX_RESULTS);
       if (capped.length === 0) {
+        if (failed) {
+          // Nothing to report and the walk did not finish: this is an error,
+          // not an empty answer. "No matches found." is a claim about every
+          // file in scope and this call cannot make it.
+          if (unsearchable.length > 0) {
+            return translateResult(
+              errorResult(unsearchable.map(({ dir, reason }) => `${reason}: ${dir}`).join('; ')),
+              unsearchable.map(({ dir }) => dir),
+              ctx.labels
+            );
+          }
+          return errorResult(
+            'find error: the file walk did not complete and produced nothing, so nothing can be '
+              + 'reported about the files in scope.'
+          );
+        }
         return textResult(truncated
           ? 'No matches found (the file walk was cut short by the search budget, so this is a floor, not a complete answer).'
           : 'No matches found.');
@@ -241,6 +301,20 @@ export function registerFind(registry: ToolRegistry): void {
         notes.push(
           `[fsmcp: the file walk was cut short after ${budgetMs}ms; this ranking is a floor over ` +
             `the files found before then, not every file in scope]`
+        );
+      }
+      if (failed) {
+        // Results exist, so this is a floor rather than an error -- but it
+        // must say so, the same way the truncation note does. Virtual paths
+        // only, and fsmcp's own words: this note rides on a SUCCESS result,
+        // which `redactLeakedHostPaths` is `isError`-scoped and cannot see
+        // (PR #10), so nothing derived from ripgrep's output belongs in it.
+        const what = unsearchable.length > 0
+          ? unsearchable.map(({ dir, reason }) => `${reason}: ${hostToVirtualOrRedact(dir, ctx.labels)}`).join('; ')
+          : 'one or more paths in scope could not be read';
+        notes.push(
+          `[fsmcp: the file walk did not cover every file in scope -- ${what}. This ranking is a ` +
+            `floor over the files that could be listed, not every file in scope]`
         );
       }
 

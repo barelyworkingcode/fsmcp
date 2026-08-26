@@ -4,7 +4,7 @@ import { execFileSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, scopeViolationResult, ToolContext, LabelEntry } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
-import { checkPathV, decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
+import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { decodeUtf8Strict } from '../encoding';
 
 // Detect ripgrep at load time.
@@ -61,6 +61,88 @@ export function grepBudgetMs(): number {
   return GREP_TIMEOUT_MS;
 }
 
+/**
+ * Why one search path cannot be searched -- a reason phrase in the exact
+ * words this codebase's other tools already use (`fs_glob`, `fs_find` and
+ * `fs_list` all answer `directory not found: <path>`) -- or null when it is
+ * fine.
+ *
+ * This exists because of what ripgrep does NOT hand back. rg reports a
+ * failure as free text on stderr (`rg: <path>: Permission denied (os error
+ * 13)`, `rg: <path>: IO error for operation on <path>: No such file or
+ * directory (os error 2)` -- both measured against ripgrep 15.2.0, not
+ * guessed) with no structure to it: no `.path` property the way a
+ * `NodeJS.ErrnoException` carries one for `describeError`, and nothing like
+ * the `data.path.text` field its `--json` match stream provides. Recovering
+ * the path from that prose would mean a parser for ripgrep's error
+ * messages, which is precisely the fragility issue #7 moved this file OFF
+ * when `--json` replaced plain-text parsing for matches -- and a wrong split
+ * there would not mis-format a result, it would emit a host path.
+ *
+ * So the path is never recovered from rg's output at all. fsmcp already
+ * knows which directories it put on rg's argv, in host terms, and it can ask
+ * the filesystem about them itself. Nothing in this function reads a byte of
+ * ripgrep's stdout or stderr.
+ *
+ * Read/execute is checked, not just existence, because the two triggers in
+ * issue #22 are one of each: a granted root renamed out from under a running
+ * call (gone) and a granted root this process cannot read (mode 000, or a
+ * macOS TCC-protected folder). `fs.accessSync` asks the kernel the same
+ * question rg asked -- `R_OK` for a file, `R_OK | X_OK` for a directory,
+ * since listing one needs both.
+ *
+ * A negative answer is never an oracle: every path this is called on has
+ * already been through `checkPathV`/`validatePath` (an explicit `path`
+ * argument) or IS one of this call's allowed directories (default scope), so
+ * the caller only ever learns about a directory it was already granted.
+ */
+export function unsearchableReason(searchPath: string): string | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(searchPath);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ENOENT and ENOTDIR both mean "this name resolves to nothing" (the
+    // second is a path whose parent turned out to be a file). Anything else
+    // -- EACCES or EPERM on a parent directory -- is a permission answer,
+    // and calling it "not found" would send an operator looking for the
+    // wrong problem, which is the same conflation this issue is about.
+    if (code === 'ENOENT' || code === 'ENOTDIR') return 'directory not found';
+    return 'directory not readable';
+  }
+  const isDir = stat.isDirectory();
+  try {
+    fs.accessSync(searchPath, isDir ? fs.constants.R_OK | fs.constants.X_OK : fs.constants.R_OK);
+  } catch {
+    return isDir ? 'directory not readable' : 'file not readable';
+  }
+  return null;
+}
+
+/** Every path in `searchPaths` that cannot be searched, with the reason. */
+function unsearchablePaths(searchPaths: string[]): { path: string; reason: string }[] {
+  const problems: { path: string; reason: string }[] = [];
+  for (const p of searchPaths) {
+    const reason = unsearchableReason(p);
+    if (reason !== null) problems.push({ path: p, reason });
+  }
+  return problems;
+}
+
+/**
+ * The error a tool returns for search paths it cannot search, in the same
+ * shape and the same words `fs_glob`/`fs_find`/`fs_list` use -- host paths
+ * embedded and then translated at this construction site, which is the
+ * per-call-site pattern the rest of this codebase follows (CLAUDE.md,
+ * "Outbound translation is deliberate"). `redactLeakedHostPaths` stays what
+ * it is meant to be behind this: an alarm for a path nobody translated, not
+ * the thing that makes this message safe.
+ */
+function unsearchableError(problems: { path: string; reason: string }[], labels: LabelEntry[]) {
+  const message = problems.map(({ path: p, reason }) => `${reason}: ${p}`).join('; ');
+  return translateResult(errorResult(message), problems.map((x) => x.path), labels);
+}
+
 export function registerGrep(registry: ToolRegistry): void {
   registry.register(
     {
@@ -112,6 +194,21 @@ export function registerGrep(registry: ToolRegistry): void {
         const p = decoded;
         const pathErr = checkPathV(p, ctx.allowedDirs, ctx.labels);
         if (pathErr) return pathErr;
+        // Issue #22: answer for a directory that is not there (or cannot be
+        // read) in the same words the sibling tools do, BEFORE either
+        // backend runs -- fs_glob, fs_find and fs_list all check this
+        // up front and all answer `directory not found: /d0/nodir`.
+        // fs_grep did not, and the two backends failed differently and both
+        // wrongly: ripgrep exits 2 and its stderr came back verbatim (so an
+        // ordinary typo produced `redactLeakedHostPaths`'s "this is a bug in
+        // fsmcp, please report it" -- an alarm as the routine error path),
+        // while the Node fallback's walker swallows the ENOENT from its own
+        // `statSync` and reports "No matches found.", which is a claim about
+        // a directory that does not exist. One check here fixes both, and
+        // it is the caller's own already-validated path, so it says nothing
+        // the caller did not already address.
+        const reason = unsearchableReason(p);
+        if (reason) return unsearchableError([{ path: p, reason }], ctx.labels);
         searchPaths = [p];
       } else if (ctx.allowedDirs.length > 0) {
         searchPaths = ctx.allowedDirs.filter((d) => fs.existsSync(d));
@@ -398,12 +495,97 @@ function grepWithRg(
       );
     }
 
-    // Any other failure. stderr first, but it is empty for a whole class of
-    // spawn failures, and an error message with nothing in it is the one
-    // thing this must not produce.
+    // Any other failure -- in practice ripgrep's exit 2, which it uses for
+    // ANY error it hit, including one it carried on past.
+    //
+    // Issue #22: this branch used to be `errorResult(`grep error: ${stderr}`)`
+    // and nothing else, the one call site in this codebase that translated
+    // no path at all, on the reasoning that rg's prose has no path field to
+    // translate and that `redactLeakedHostPaths` would catch anything that
+    // slipped. It did not. rg writes `<path>: <reason>`, the backstop's
+    // boundary class did not accept a colon, and so a message naming a
+    // granted ROOT went to the client verbatim -- the host's account name,
+    // the layout above the grant, the real absolute path -- while the
+    // byte-identical message naming anything INSIDE that root (followed by
+    // `/`) was caught. Reproduced live twice: a granted root renamed out
+    // from under a call, and a granted root with mode 000, the second on a
+    // default-scope search with no `path` argument at all.
+    //
+    // The fix is the one the rest of this codebase already uses: translate
+    // at the construction site. The paths that can appear in rg's stderr are
+    // not arbitrary -- they are `searchPaths`, which fsmcp itself just put on
+    // the argv, or descendants of them, and a descendant is always lexically
+    // prefixed by its ancestor (`translatePathIn`'s substring match, the
+    // same property `describeError` relies on for a syscall error naming a
+    // path deeper than the one the caller passed). So no parser for
+    // ripgrep's message is needed, or wanted: `translateResult(result,
+    // searchPaths, labels)` renames the known strings and leaves the rest of
+    // the text -- including the caller's own echoed pattern on a regex parse
+    // error -- byte for byte.
+    //
+    // Before falling back to rg's own words, though, this asks the
+    // filesystem what is wrong itself (`unsearchablePaths`), because "rg
+    // said something" is a poor answer when fsmcp can say `directory not
+    // readable: /d1` the way every sibling tool would.
+    const problems = unsearchablePaths(searchPaths);
+
+    // rg exits 2 even when it searched everything else successfully -- one
+    // unreadable file anywhere under a granted tree is enough (measured:
+    // matches on stdout, `<path>: Permission denied` on stderr, exit 2).
+    // Discarding those matches and answering with an error was the old
+    // behaviour, and it is wrong in the common case: an agent searching a
+    // real project tree that contains a single mode-000 file got no results
+    // at all. Report what rg did find, and say plainly that it is a floor --
+    // the same shape `grepFallback` below already uses for a search its
+    // budget cut short. This note is fsmcp's own words plus VIRTUAL paths
+    // only: it rides on a SUCCESS result, which `redactLeakedHostPaths` is
+    // structurally unable to inspect (it is `isError`-scoped by design, PR
+    // #10), so nothing built from rg's text may go in it.
+    const stdout = typeof e.stdout === 'string' ? e.stdout : '';
+    const partial = stdout.length > 0 ? formatRgJson(stdout, outputMode, allowedDirs, labels) : '';
+    if (partial !== '') {
+      const what = problems.length > 0
+        ? problems.map(({ path: p, reason }) => `${reason}: ${hostToVirtualOrRedact(p, labels)}`).join('; ')
+        : 'ripgrep could not read every path in scope (a file or directory whose permissions '
+          + 'deny it, or one that changed while the search ran)';
+      return textResult(
+        `${partial}\n\n[fsmcp: these results are a floor, not a complete answer -- ${what}. `
+          + `Files that could not be read were not searched, and one of them may match.]`
+      );
+    }
+
+    // Nothing came back, so this is an error, and the question is whose
+    // account of it to give: fsmcp's own (`directory not readable: /d1`) or
+    // ripgrep's. The two can both be true at once -- an unreadable granted
+    // root AND a pattern rg refuses to compile -- and answering with the
+    // filesystem's story when the real fault was the pattern would send a
+    // caller after the wrong thing.
+    //
+    // `--json`'s own event stream settles it, structurally, with no reading
+    // of rg's prose: rg emits a `summary` event once it has actually run a
+    // search, and emits nothing at all on stdout when it rejects its own
+    // arguments (measured against ripgrep 15.2.0: a missing directory or an
+    // unreadable one still produces a summary; `--type nosuchtype`, an
+    // unparseable `--glob`, and a pattern that fails to compile produce
+    // empty stdout). So a summary means the search ran and hit the
+    // filesystem, where fsmcp can say something better than rg can; no
+    // summary means only rg knows why it refused. If a future ripgrep
+    // changes that, the failure mode is a misattributed message, never a
+    // leaked path -- both branches below are translated.
+    const searchRan = parseRgJson(stdout).some((ev) => ev.type === 'summary');
+    if (problems.length > 0 && searchRan) return unsearchableError(problems, labels);
+
+    // Last resort: rg's own words, now translated. stderr first, but it is
+    // empty for a whole class of spawn failures, and an error message with
+    // nothing in it is the one thing this must not produce. What can still
+    // reach a caller untranslated here is a path that is under NO granted
+    // directory (ripgrep naming its own config file from
+    // RIPGREP_CONFIG_PATH, say) -- fsmcp has nothing to translate that
+    // against and the backstop cannot know it either, so it stays a
+    // documented residue rather than a claim this branch is now airtight.
     const stderr = typeof e.stderr === 'string' ? e.stderr.trim() : '';
     const detail = stderr || e.message || String(err);
-    return errorResult(`grep error: ${detail}`);
+    return translateResult(errorResult(`grep error: ${detail}`), searchPaths, labels);
   }
 }
 
