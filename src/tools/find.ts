@@ -6,6 +6,7 @@ import { textResult, errorResult, scopeViolationResult, ToolContext } from '../t
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 import { grepBudgetMs, unsearchableReason } from './grep';
 
 const MAX_RESULTS = 200;
@@ -56,19 +57,39 @@ try {
  * and does not start now: the caller diagnoses the search roots itself
  * (`unsearchableReason`, grep.ts) rather than repeating rg's free text,
  * which is where fs_grep's host-path leak came from.
+ *
+ * `--null`, and it is not cosmetic (found while fixing issue #37). This
+ * split its stdout on "\n", and `rg --files` writes one path per line -- so
+ * a filename containing a newline arrived as TWO strings, neither of which
+ * names anything. Measured against ripgrep 15.2.0: a file called
+ * `we<LF>ird.txt` came back as `./we` and `ird.txt`, both were dropped by
+ * the `validatePath` re-check, and the file was simply INVISIBLE to fs_find
+ * on every host with ripgrep installed -- while the Node fallback, which
+ * builds its paths from `readdir` entries, listed it fine. That is issue
+ * #37's defect pointing inward: the same character, the same separator
+ * assumption, one layer earlier. Escaping the path on the way out (which
+ * #37 does) would have been a promise about output fs_find could not keep,
+ * since it never had the name to escape. `--null` makes ripgrep terminate
+ * each path with a NUL, which is the one byte a POSIX filename cannot
+ * contain, so the split is exact rather than probable. The trailing empty
+ * string a NUL-TERMINATED (not separated) stream leaves is dropped by the
+ * same `filter(Boolean)` that was already there.
  */
 function listFilesRg(dirs: string[], timeoutMs: number): { files: string[]; truncated: boolean; failed: boolean } {
   try {
-    const output = execFileSync('rg', ['--files', '--no-follow', '--', ...dirs], {
+    const output = execFileSync('rg', ['--files', '--no-follow', '--null', '--', ...dirs], {
       encoding: 'utf-8',
       timeout: timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return { files: output.split('\n').filter(Boolean), truncated: false, failed: false };
+    return { files: output.split('\0').filter(Boolean), truncated: false, failed: false };
   } catch (err: unknown) {
     const e = (err ?? {}) as { code?: string; stdout?: unknown };
-    const partial = typeof e.stdout === 'string' ? e.stdout.split('\n').filter(Boolean) : [];
+    // A killed rg may have been cut off mid-path; splitting on NUL means the
+    // survivors are whole paths and only the unterminated tail is lost,
+    // where splitting on "\n" could have kept a truncated one.
+    const partial = typeof e.stdout === 'string' ? e.stdout.split('\0').filter(Boolean) : [];
     if (e.code === 'ETIMEDOUT') {
       return { files: partial, truncated: true, failed: false };
     }
@@ -183,8 +204,12 @@ export function registerFind(registry: ToolRegistry): void {
       name: 'fs_find',
       description:
         'Fast fuzzy filename search: ranks files under the allowed directories by how well their ' +
-        `name matches pattern (subsequence match with contiguity/word-boundary bonuses). ` +
-        `Backed by "rg --files --no-follow" with a Node walker fallback. Capped at ${MAX_RESULTS} results.`,
+        'name matches pattern (subsequence match with contiguity/word-boundary bonuses). ' +
+        'Returns virtual paths ("/<label>/...", never a host filesystem path), best match first, ' +
+        'one per line and nothing else on the line. ' +
+        pathFieldEscapingRules('result') + ' ' +
+        RESULT_TRAILER_RULE + ' ' +
+        `Backed by "rg --files --no-follow --null" with a Node walker fallback. Capped at ${MAX_RESULTS} results.`,
       inputSchema: schema(
         {
           pattern: stringProp('Fuzzy filename pattern (subsequence match, e.g. "fmain" matches "fs/main.ts")'),
@@ -293,7 +318,13 @@ export function registerFind(registry: ToolRegistry): void {
       // through validatePath (the real, unmodified security check);
       // hostToVirtualOrRedact only decides how to show a path that check
       // already accepted, and redacts rather than emits one it can't map.
-      const rendered = capped.map((r) => hostToVirtualOrRedact(r.file, ctx.labels));
+      //
+      // Issue #37: escaped on the way out, `fs_list`'s scheme unchanged --
+      // one path per line, nothing else on the line, so a name containing a
+      // newline stays one result instead of becoming two. After the virtual
+      // translation, never before (escaping first would change the string
+      // the prefix match runs against).
+      const rendered = capped.map((r) => escapePathField(hostToVirtualOrRedact(r.file, ctx.labels)));
 
       // Issue #19: 200 results is the tightest of this codebase's four
       // existing caps and the least likely of them to reach a megabyte, but

@@ -7,6 +7,7 @@ import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { decodeUtf8Strict } from '../encoding';
 import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 
 // Issue #19, second repro: fs_grep in `output_mode: "content"` capped NOTHING
 // -- not a line count, not a byte count. fs_find caps at 200 results, fs_glob
@@ -84,6 +85,54 @@ function renderGrepResult(
   const result = textResult(text);
   if (capped.capped || incomplete) result._meta = { truncated: true };
   return result;
+}
+
+/**
+ * fs_grep's path column, escaped (issue #37) -- and the one decision in this
+ * issue that is not a copy of `fs_list`'s.
+ *
+ * THE PATH ONLY. `content` mode emits `path:line:content`, and `content` is
+ * the file's own matched bytes. Those are never escaped, never translated,
+ * never touched: PR #10 is the precedent, where a whole-result rewrite
+ * silently corrupted a file whose bytes contained the sandbox path, caught
+ * by a write-then-read byte round trip. Escaping the content field would be
+ * that same mistake in a new coat -- `fs_grep` would report a line that does
+ * not match what `fs_read` returns for the same file, and a caller would
+ * have no way to know which of the two to believe. `fs_grep` is a VIEW of a
+ * file and the view has to be of the file.
+ *
+ * ":" ON TOP OF THE FOUR. `fs_list`'s scheme escapes the backslash and the
+ * three characters that carry structure in ITS format; here the structural
+ * character is the colon, so it joins them. A path containing ":" broke
+ * `path:line:content` and `path:count` independently of newlines and always
+ * had -- `fs_grep` would emit `/d0/a:b.txt:3:hit` and a caller splitting on
+ * ":" would read the path as `/d0/a`, the line number as `b.txt`, and hand
+ * the wrong file to the next call. A colon is legal in a POSIX filename and
+ * fsMCP's own `fs_write`/`fs_move` will happily create one. So the promise
+ * this makes is exact: the path field never contains an unescaped colon, so
+ * the first unescaped colon on the line is where the path ends.
+ *
+ * Applied in EVERY output mode, including `files_with_matches`, where ":"
+ * separates nothing. Uniformity is the point: one unescaper works on every
+ * `fs_grep` reply, rather than a caller having to remember which mode it
+ * asked for before it can parse the answer.
+ *
+ * WHAT THIS DOES NOT FIX, stated because an unstated gap is the thing this
+ * issue is about: with `context` > 0 the ripgrep backend reproduces plain
+ * rg's own separators, and a CONTEXT line uses "-" where a match line uses
+ * ":" (`path-line-content`). "-" is NOT escaped, and it is not going to be:
+ * hyphens are ubiquitous in real paths, so escaping them would put a
+ * backslash in nearly every line of every context-mode reply to make a rare
+ * case parseable -- a universal cost for a narrow benefit, and mode- or
+ * argument-conditional escaping would be worse than either. The consequence
+ * is documented in the tool description instead: a caller parsing a
+ * `context` reply mechanically should key on the first unescaped ":" or "-",
+ * and a path containing "-" can defeat that. A caller that must handle
+ * arbitrary filenames should use `files_with_matches`, whose lines are one
+ * escaped path each and are unambiguous.
+ */
+function escapeGrepPath(p: string): string {
+  return escapePathField(p, ':');
 }
 
 // Detect ripgrep at load time.
@@ -228,11 +277,24 @@ export function registerGrep(registry: ToolRegistry): void {
       name: 'fs_grep',
       description:
         'Search file contents with regex. Uses ripgrep if available, falls back to Node.js. ' +
-        'Default output mode is files_with_matches (file paths only). Returns a BOUNDED result: ' +
-        'at most 1000 result lines, and at most 1MiB of them. A bounded reply always says so -- ' +
-        'inline as "(showing X of Y result lines)" and structurally as _meta.truncated -- so a ' +
-        'partial answer is never mistakable for a complete one. Narrow with path, glob, type or ' +
-        'head_limit to see the rest.',
+        'Default output mode is files_with_matches (one path per line); count is "path:count"; ' +
+        'content is "path:line:content", with rg\'s "--" group separator between non-contiguous ' +
+        'groups and, when context is set, "path-line-content" for a context line. ' +
+        pathFieldEscapingRules('result', ':') + ' ' +
+        'The CONTENT field is the file\'s own matched bytes and is NEVER escaped or altered in ' +
+        'any way -- it is what fs_read would return for that line -- so parse a content line by ' +
+        'scanning left to right for the first UNESCAPED ":" (or "-", for a context line): ' +
+        'everything before it is the escaped path, and everything after the line number and its ' +
+        'separator is verbatim content that may itself contain any character, ":" included. One ' +
+        'residual ambiguity, stated rather than hidden: "-" is not escaped, so if you pass ' +
+        'context, a path containing "-" cannot be told from the context-line separator. Use ' +
+        'files_with_matches, whose lines are one escaped path each, if you must parse paths ' +
+        'mechanically. ' +
+        RESULT_TRAILER_RULE + ' ' +
+        'Returns a BOUNDED result: at most 1000 result lines, and at most 1MiB of them. A ' +
+        'bounded reply always says so -- inline as "(showing X of Y result lines)" and ' +
+        'structurally as _meta.truncated -- so a partial answer is never mistakable for a ' +
+        'complete one. Narrow with path, glob, type or head_limit to see the rest.',
       inputSchema: schema(
         {
           pattern: stringProp('Regex pattern to search for'),
@@ -469,7 +531,7 @@ export function formatRgJson(
       const p = ev.data?.path?.text;
       if (typeof p !== 'string' || seen.has(p) || !inScope(p)) continue;
       seen.add(p);
-      lines.push(hostToVirtualOrRedact(p, labels));
+      lines.push(escapeGrepPath(hostToVirtualOrRedact(p, labels)));
     }
     return lines;
   }
@@ -484,7 +546,7 @@ export function formatRgJson(
       const p = ev.data?.path?.text;
       const count = ev.data?.stats?.matched_lines;
       if (typeof p !== 'string' || typeof count !== 'number' || !inScope(p)) continue;
-      lines.push(`${hostToVirtualOrRedact(p, labels)}:${count}`);
+      lines.push(`${escapeGrepPath(hostToVirtualOrRedact(p, labels))}:${count}`);
     }
     return lines;
   }
@@ -512,7 +574,9 @@ export function formatRgJson(
     }
     const sep = ev.type === 'match' ? ':' : '-';
     const content = text.endsWith('\n') ? text.slice(0, -1) : text;
-    lines.push(`${hostToVirtualOrRedact(p, labels)}${sep}${lineNumber}${sep}${content}`);
+    // `content` goes in raw -- see escapeGrepPath's doc. Only the path is
+    // escaped, and the separator is rg's own.
+    lines.push(`${escapeGrepPath(hostToVirtualOrRedact(p, labels))}${sep}${lineNumber}${sep}${content}`);
     lastPath = p;
     lastLine = lineNumber;
   }
@@ -745,7 +809,12 @@ export function grepFallback(
   // passed" the same as "labels is genuinely empty" and redact every path,
   // which is right for a real empty-scope call but wrong for the unit tests
   // below that never had a concept of labels to begin with.
-  const displayPath = (f: string): string => (labels === undefined ? f : hostToVirtualOrRedact(f, labels));
+  // Issue #37: escaped after translation, in every mode, exactly as
+  // `formatRgJson` does it -- the two backends must agree about the format,
+  // or the escaping a caller is told about depends on whether the host
+  // happens to have ripgrep installed.
+  const displayPath = (f: string): string =>
+    escapeGrepPath(labels === undefined ? f : hostToVirtualOrRedact(f, labels));
   const deadline = Date.now() + budgetMs;
   const expired = () => Date.now() >= deadline;
 

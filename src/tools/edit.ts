@@ -5,13 +5,66 @@ import { checkPathV, decodeInboundPath, refuseAllowedDirRootWriteV, translateRes
 import { decodeUtf8Strict, hasLoneSurrogate } from '../encoding';
 import { writeFileAtomic } from '../atomicWrite';
 import { canonicalizePath } from '../security';
+import { MAX_RESPONSE_BYTES, wireBytes } from '../limits';
+
+// Issue #38, the inbound half. #19 bounded what crosses the stdio transport
+// and bounded it for `fs_write` only, so `fs_edit` -- the OTHER tool that
+// takes caller-supplied file content off the wire -- had no inbound bound at
+// all. Measured by an independent verifier: a 3 MB `new_string` landed on
+// disk through `fs_edit` while the byte-identical `fs_write` refused at
+// 1,048,576. The effective inbound ceiling was therefore 1 MiB through one
+// tool and ~10 MiB through the other (relay's own `bridge.MaxMessageSize`,
+// which refuses an oversized REQUEST frame cleanly -- the inbound direction
+// was never the outage direction; #19's outage was on stdout). What was
+// wrong is not an outage, it is that the limit fsMCP publishes was untrue
+// for half its own write surface, and `fs_edit` was the one mutating tool
+// whose input nothing here bounded.
+//
+// The same number as `fs_write`'s inbound cap, for the same reason and out
+// of the same constant: these are two spellings of one operation ("put
+// caller-supplied text into a file"), and a caller should not have to learn
+// which tool it picked in order to know what fits.
+//
+// Applied to `old_string` AS WELL AS `new_string`. `old_string` is equally
+// caller-supplied, equally unbounded, and equally a whole file's worth of
+// text in the shape this tool is used for (replace this large block with
+// that one); bounding only the half that reaches the disk would leave the
+// message -- the thing that actually has to fit -- unbounded.
+const MAX_STRING_WIRE_BYTES = MAX_RESPONSE_BYTES;
+
+// Issue #38, the allocation half, and the same number `fs_read` uses for the
+// same hazard. `fs_edit` read its target with a bare `fs.readFileSync` and
+// no size check whatsoever: an `fs_edit` against a multi-gigabyte file is an
+// unbounded synchronous allocation in a process that serves every other
+// caller from one loop -- precisely what `MAX_READ_BYTES` exists to prevent,
+// reached through a different door. (`fs_write` has the same floor in
+// `MAX_WRITE_BYTES`; `fs_edit` was the only file-loading path without one.)
+//
+// Duplicated as a local constant rather than imported from `read.ts`,
+// matching what `write.ts` already does with `MAX_WRITE_BYTES`: these are
+// per-tool allocation floors that issue #16 turns into separate operator
+// flags, and collapsing them into one shared constant now would pre-empt
+// that by deciding they must always be equal. They are equal today because
+// nothing justifies making a caller reason about two numbers, not because
+// they are the same knob.
+const MAX_EDIT_READ_BYTES = 10 * 1024 * 1024;
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
     {
       name: 'fs_edit',
       description:
-        'Perform exact string replacement in a file. By default, old_string must appear exactly once (fails if 0 or >1 matches). Use replace_all to replace every occurrence. old_string must be a non-empty string different from new_string: an empty search string, and a search string identical to its replacement, are both refused rather than performed (see below). new_string may be empty -- that is a deletion.',
+        'Perform exact string replacement in a file. By default, old_string must appear exactly ' +
+        'once (fails if 0 or >1 matches). Use replace_all to replace every occurrence. ' +
+        'old_string must be a non-empty string different from new_string: an empty search ' +
+        'string, and a search string identical to its replacement, are both refused rather than ' +
+        'performed (see below). new_string may be empty -- that is a deletion. old_string and ' +
+        'new_string are each refused above 1MiB as they appear in the request (after JSON ' +
+        'escaping), the same bound fs_write puts on content, and the file being edited is ' +
+        'refused above 10MiB because the whole of it has to be loaded to find old_string. ' +
+        'There is no offset, append or windowed mode: a file over that size cannot be edited ' +
+        'through fsMCP, and a replacement over that size has to be made as several smaller ' +
+        'edits anchored on the surrounding text.',
       inputSchema: schema(
         {
           file_path: stringProp(virtualPathDescription()),
@@ -85,6 +138,37 @@ export function registerEdit(registry: ToolRegistry): void {
       // on which syscall happens to fail first.
       const rootErr = refuseAllowedDirRootWriteV(filePath, ctx.allowedDirs, 'edit', ctx.labels);
       if (rootErr) return rootErr;
+
+      // Issue #38: measured on the WIRE FORM of each string -- what it costs
+      // inside the JSON request line -- not on `.length`, which is UTF-16
+      // code units and under-counts every non-ASCII character and by 6x
+      // every C0 control byte. `wireBytes` calls the same JSON encoder the
+      // transport does, so this is the real number rather than an estimate;
+      // estimating is the mistake #19 is about. See limits.ts.
+      //
+      // Before the surrogate scan and before the file is opened, for
+      // `fs_write`'s reason: a message this server is not willing to accept
+      // should not first pay for a full walk of the string, and nothing
+      // should be read (let alone written) on account of a request that is
+      // too big to be carrying it.
+      for (const [name, value] of [['new_string', newString], ['old_string', oldString]] as const) {
+        const bytes = wireBytes(value);
+        if (bytes > MAX_STRING_WIRE_BYTES) {
+          return errorResult(
+            `${name} is ${bytes} bytes on the wire, over fs_edit's ${MAX_STRING_WIRE_BYTES}-byte ` +
+              `message byte limit -- fsMCP bounds what crosses the stdio transport, not just what ` +
+              `lands on disk, because a request line this long is dropped (or kills the ` +
+              `connection) before it ever reaches a size check here. fs_edit has no offset, ` +
+              `append or streaming mode, so "send the rest in the next call" is not available the ` +
+              `way it sounds -- but an edit does not need one to be divisible, because the file's ` +
+              `own text is the anchor: replace one smaller region whose surrounding text is ` +
+              `unique, then anchor the next call on the text the previous call just wrote, and ` +
+              `repeat. If the whole file is being replaced rather than edited, that is fs_write, ` +
+              `which is bounded at the same ${MAX_STRING_WIRE_BYTES} bytes per call and equally ` +
+              `has no append mode.`
+          );
+        }
+      }
 
       // A lone UTF-16 surrogate in new_string cannot be encoded as valid
       // UTF-8 at all (see encoding.ts's hasLoneSurrogate doc) -- refused
@@ -180,19 +264,60 @@ export function registerEdit(registry: ToolRegistry): void {
         );
       }
 
+      // The stat comes FIRST now (issue #38), and it does two jobs.
+      //
+      // The size is the one this issue is about: `fs.readFileSync` on a file
+      // of any size was the whole of fs_edit's read path, so the allocation
+      // was decided by whatever happened to be on disk inside the grant.
+      // Asking `stat` before opening anything is how `fs_read` and
+      // `fs_write` already bound theirs, and it means an over-size file
+      // costs one syscall rather than a gigabyte of resident memory in a
+      // process every other caller is waiting on.
+      //
+      // The mode is the second job and is unchanged in purpose: this file is
+      // about to be rewritten onto a fresh inode (writeFileAtomic below),
+      // which gets the process's default mode unless told otherwise --
+      // silently dropping, say, a script's execute bit on every edit. It
+      // used to be read after the content, from the same successfully-opened
+      // path; it is read here instead, from the stat that has to happen
+      // anyway, and the read below still has its own failure branch.
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(filePath);
+      } catch {
+        return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
+      }
+
+      // The refusal says what a caller can actually do, which for fs_edit is
+      // not what it is for fs_write. fs_write's over-size message can
+      // suggest writing in pieces; fs_edit has to load the whole file to
+      // find `old_string` at all, and there is no windowed edit to fall back
+      // to, so the honest answer is that a file this large cannot be edited
+      // through fsMCP -- it can be inspected, and that is a different verb.
+      if (stat.size > MAX_EDIT_READ_BYTES) {
+        return translateResult(
+          errorResult(
+            `${filePath} is ${stat.size} bytes, over fs_edit's ${MAX_EDIT_READ_BYTES}-byte read ` +
+              `limit. fs_edit has to load the whole file to find old_string, and fsMCP is a ` +
+              `single synchronous process, so a read this large stalls every other caller; there ` +
+              `is no windowed or streaming edit to fall back to. Inspect it with fs_read ` +
+              `(encoding: "base64" plus byte_offset/byte_length reads a file of any size in ` +
+              `windows), but a file this large cannot be edited in place through fsMCP at all.`
+          ),
+          [filePath],
+          ctx.labels
+        );
+      }
+
+      const existingMode = stat.mode;
       let raw: Buffer;
-      let existingMode: number;
       try {
         raw = fs.readFileSync(filePath);
-        // Read alongside the content, not after: this file is about to be
-        // rewritten onto a fresh inode (writeFileAtomic below), and that
-        // inode gets the process's default mode unless told otherwise --
-        // silently dropping, say, a script's execute bit on every edit.
-        // Fetched from the same successfully-opened path the content came
-        // from, so there is no separate failure mode to handle here beyond
-        // the one already caught below.
-        existingMode = fs.statSync(filePath).mode;
       } catch {
+        // Still reachable and still the right answer after the stat above:
+        // `statSync` succeeds for a directory (and for a file this process
+        // may not open), and `readFileSync` is what then fails with EISDIR
+        // or EACCES.
         return translateResult(errorResult(`file not found: ${filePath}`), [filePath], ctx.labels);
       }
 
