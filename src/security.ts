@@ -406,6 +406,56 @@ export interface NarrowedDirs {
  * reports it on the result rather than narrowing the scope in a way nothing
  * ever tells the operator about.
  */
+/**
+ * The result of sanitizeMetaAllowedDirs: see below for what each field means
+ * and why this exists as a separate step before narrowAllowedDirs at all.
+ */
+export interface SanitizedMetaDirs {
+  metaDirs: string[] | undefined;
+  /** True when the raw value was present but not an array of strings. */
+  malformed: boolean;
+}
+
+/**
+ * Validate that a raw `_meta.allowed_dirs` value off the wire is actually
+ * the `string[] | undefined` narrowAllowedDirs assumes it is, before it ever
+ * reaches that function -- narrowAllowedDirs's own type signature used to be
+ * the only thing asserting this, and a type assertion at the wire boundary
+ * (`meta?.allowed_dirs as string[] | undefined` in main.ts) checks nothing:
+ * it changes what TypeScript believes the value is, not what it is.
+ *
+ * A caller (or a misbehaving relay) sending `_meta.allowed_dirs` as `null`,
+ * a bare object, a number, a boolean, or an array containing a non-string
+ * element used to reach `for (const metaDir of metaDirs)` in
+ * narrowAllowedDirs's "CLI set" branches with something JavaScript cannot
+ * iterate, or reach `canonicalizePath(metaDir)` with something
+ * `path.isAbsolute` cannot accept -- both throw synchronously, and that
+ * throw happens in main.ts's request handler, OUTSIDE registry.call's
+ * try/catch (which wraps only the tool handler, reached later). fsmcp is
+ * one synchronous stdio loop serving every caller; an uncaught exception
+ * there crashes the whole process, taking down every OTHER in-flight or
+ * future call along with the one that sent the bad value. That is a worse
+ * outcome than any answer this one call could give, including a wrong one.
+ *
+ * The fix is not "reject the call with a clean error" alone -- fsmcp does
+ * that too, via `malformed`, so an operator can see what happened -- it is
+ * that a malformed value is treated exactly like a `_meta.allowed_dirs: []`
+ * a caller sent on purpose: an explicit assertion of an empty scope.
+ * narrowAllowedDirs already has a rule for "present but empty" (it is not
+ * the same as absent, and it does not fall back to the CLI grant -- see its
+ * own doc comment), so routing a malformed value through that existing rule
+ * means the fail-closed behaviour is proven once, by the tests that already
+ * cover the empty-array row, rather than needing a second, parallel
+ * fail-closed path that could drift from the first.
+ */
+export function sanitizeMetaAllowedDirs(raw: unknown): SanitizedMetaDirs {
+  if (raw === undefined) return { metaDirs: undefined, malformed: false };
+  if (Array.isArray(raw) && raw.every((entry) => typeof entry === 'string')) {
+    return { metaDirs: raw as string[], malformed: false };
+  }
+  return { metaDirs: [], malformed: true };
+}
+
 export function narrowAllowedDirs(cliDirs: string[], metaDirs: string[] | undefined): NarrowedDirs {
   if (cliDirs.length === 0) {
     // No CLI grant to intersect against: _meta is the whole scope when

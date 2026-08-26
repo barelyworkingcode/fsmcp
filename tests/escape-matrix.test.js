@@ -680,3 +680,61 @@ test('a symlink to the real /etc is refused on read (the one place the real path
   assert.equal(r.isError, true);
   assert.match(allText(r), /outside allowed directories/i);
 });
+
+// ---------------------------------------------------------------------------
+// main.ts reads `_meta.allowed_dirs` off the wire and hands it straight to
+// narrowAllowedDirs as `string[] | undefined` -- a type assertion, not a
+// check. narrowAllowedDirs's own "CLI set" branches (the ordinary
+// relay-mediated deployment: `--allowed-dir <root>` plus a per-call
+// `_meta`) do `for (const metaDir of metaDirs)` the moment `metaDirs` is
+// anything other than `undefined`. A caller who sends `_meta.allowed_dirs`
+// as `null`, a bare object, or a number -- not an array at all -- turns
+// that loop into `for (const x of null)` / `for (const x of {})`, which
+// V8 throws for synchronously: "TypeError: ... is not iterable". That
+// throw happens in main.ts's request handler, OUTSIDE registry.call's
+// try/catch (registry.ts only wraps the tool handler itself, and this
+// throw happens before a tool handler is ever reached while computing the
+// ctx it would be called with), so it is an uncaught exception in a
+// readline 'line' listener -- which Node does not recover from. fsmcp is
+// one synchronous stdio loop serving every caller; this crashes the whole
+// process, taking down every OTHER in-flight or future call with it, from
+// a single malformed field on one call. That is the exact failure mode
+// grep.ts's timeout comment warns about ("it takes every tool with it for
+// every caller"), reachable here with no regex and no ripgrep at all.
+//
+// Fixed by validating `_meta.allowed_dirs` is genuinely an array before it
+// ever reaches narrowAllowedDirs: anything else is treated the same as a
+// caller-supplied empty array (a scope of nothing -- C1's "asserting a
+// scope of nothing" reasoning), which fails closed instead of throwing,
+// and is reported on the result the same way a dropped entry already is.
+// ---------------------------------------------------------------------------
+test('a non-array _meta.allowed_dirs fails the one call closed, and does not take the server down with it', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const malformedValues = [null, {}, 42, 'not-an-array', true, [42], [null]];
+
+  for (const badValue of malformedValues) {
+    const r = await server.callTool(
+      'fs_read',
+      { file_path: path.join(fx.root, 'a.txt') },
+      { allowed_dirs: badValue }
+    );
+    assert.equal(
+      r.isError,
+      true,
+      `_meta.allowed_dirs: ${JSON.stringify(badValue)} must fail closed, not silently succeed`
+    );
+  }
+
+  // The server process must still be alive and answering -- a crash on any
+  // one of the malformed calls above would make every request after it
+  // (including this one, from a well-behaved caller with no _meta at all)
+  // hang until the test's own request timeout, rather than fail fast and
+  // visibly.
+  const control = await server.callTool('fs_read', { file_path: path.join(fx.root, 'a.txt') });
+  assert.equal(control.isError, undefined, allText(control));
+  assert.match(allText(control), /inside a\.txt/);
+});

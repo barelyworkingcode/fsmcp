@@ -1,7 +1,7 @@
 import { createInterface } from 'readline';
 import { ToolRegistry } from './registry';
 import { ToolContext } from './types';
-import { parseAllowedDirs, narrowAllowedDirs } from './security';
+import { parseAllowedDirs, narrowAllowedDirs, sanitizeMetaAllowedDirs } from './security';
 import { registerRead } from './tools/read';
 import { registerWrite } from './tools/write';
 import { registerEdit } from './tools/edit';
@@ -134,7 +134,19 @@ rl.on('line', (line: string) => {
       // collapsing it with `?? []` (what this also used to do) is exactly
       // what would silently break the "CLI set, _meta absent" row.
       const meta = params._meta as Record<string, unknown> | undefined;
-      const metaDirs = meta?.allowed_dirs as string[] | undefined;
+      // `meta?.allowed_dirs as string[] | undefined` used to be handed
+      // straight to narrowAllowedDirs. That cast changes what TypeScript
+      // believes the value is, not what it is: a caller sending
+      // `_meta.allowed_dirs: null` (or an object, a number, or an array
+      // with a non-string entry) reached a `for...of` or a
+      // `path.isAbsolute()` inside narrowAllowedDirs with something it
+      // cannot accept, threw, and crashed this whole synchronous process --
+      // outside registry.call's try/catch, which only wraps the tool
+      // handler reached later. sanitizeMetaAllowedDirs (security.ts) checks
+      // the value is actually an array of strings before narrowAllowedDirs
+      // ever sees it, and treats anything else as the caller asserting an
+      // empty scope -- fail closed, not a crash.
+      const { metaDirs, malformed: metaDirsMalformed } = sanitizeMetaAllowedDirs(meta?.allowed_dirs);
       const { allowedDirs, droppedMetaDirs } = narrowAllowedDirs(cliAllowedDirs, metaDirs);
       const ctx: ToolContext = { allowedDirs };
 
@@ -153,6 +165,22 @@ rl.on('line', (line: string) => {
             text:
               `[fsmcp: _meta.allowed_dirs entries were dropped because they are not contained ` +
               `within any --allowed-dir root: ${droppedMetaDirs.join(', ')}]`,
+          },
+        ];
+      }
+
+      // Same visibility for a malformed _meta.allowed_dirs (not an array of
+      // strings at all): the call ran with an empty scope rather than
+      // crashing, and that should be as visible as a dropped entry is,
+      // not a silent downgrade nobody can see happened.
+      if (metaDirsMalformed) {
+        result.content = [
+          ...result.content,
+          {
+            type: 'text',
+            text:
+              `[fsmcp: _meta.allowed_dirs was not an array of strings; treated as an empty ` +
+              `scope (deny all) for this call]`,
           },
         ];
       }
