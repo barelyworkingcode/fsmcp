@@ -50,6 +50,7 @@ const path = require('path');
 
 const {
   spawnServer,
+  waitFor,
   buildScopeFixture,
   removeFixture,
   OUTSIDE_CANARY,
@@ -423,10 +424,18 @@ test('row 15: --allowed-dir root + _meta.allowed_dirs ["/"] never widens past ro
   assert.equal(outsideRead.isError, true, 'the widen to "/" must never succeed');
   assert.doesNotMatch(allText(outsideRead), new RegExp(OUTSIDE_CANARY));
 
-  // The drop is reported, not silent (C1's explicit requirement): the
-  // operator-visible notice must name "/" as the rejected entry.
+  // The drop is reported, not silent (C1's explicit requirement) -- but
+  // reported to the CLIENT as a fact and a count, never as the rejected
+  // entry itself (issue #26). This used to assert the notice named "/",
+  // which for this row is a harmless string and for the row that matters
+  // (an operator's second root that failed containment) is a host path the
+  // client was never granted, on a success result, where nothing else in
+  // this server can catch it.
   assert.match(allText(outsideRead), /_meta\.allowed_dirs entries were dropped/i);
-  assert.match(allText(outsideRead), /\//);
+  assert.match(allText(outsideRead), /1 of them/);
+  // The entry itself goes to the operator, on stderr.
+  await waitFor(() => server.stderr().includes('_meta.allowed_dirs entries were dropped'));
+  assert.match(server.stderr(), /--allowed-dir root: \/\./);
 
   // Because "/" was the only _meta dir and it was dropped, the effective
   // scope for THIS call is empty -- so even an in-scope read refuses too.
@@ -580,7 +589,21 @@ test('C1: all four rows of the CLI/_meta narrowing table', async (t) => {
       const r = await server.callTool('fs_read', { file_path: toVirtual(notesFile, notesDir) }, meta);
       assert.equal(r.isError, undefined, allText(r));
       assert.match(allText(r), /_meta\.allowed_dirs entries were dropped/i);
-      assert.match(allText(r), new RegExp(fx.outside.replace(/[/\\]/g, '.')));
+      // Issue #26: the client is told HOW MANY entries were dropped, not
+      // WHICH. This assertion used to be its exact inverse -- it required
+      // the result to name `fx.outside` -- which is the defect: a host path
+      // the client was never granted, echoed on a SUCCESS result, outside
+      // vpath.ts's translation and outside redactLeakedHostPaths's
+      // isError-scoped backstop. Nothing could have caught it either: a
+      // dropped directory is by construction absent from ctx.labels, so
+      // there is no granted hostDir for a redactor to match it against.
+      assert.match(allText(r), /1 of them/);
+      assert.doesNotMatch(allText(r), new RegExp(fx.outside.replace(/[/\\]/g, '.')));
+      // ...and the operator, who is the one who can fix the configuration,
+      // still gets the path -- on stderr, the same split assignLabels uses
+      // for a duplicate label.
+      await waitFor(() => server.stderr().includes(fx.outside));
+      assert.match(server.stderr(), new RegExp(fx.outside.replace(/[/\\]/g, '.')));
     } finally {
       server.close();
     }

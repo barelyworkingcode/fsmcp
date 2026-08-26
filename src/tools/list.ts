@@ -16,13 +16,82 @@ function entryType(entry: fs.Dirent): string {
 }
 
 /**
+ * Issue #31: make a path safe to put in a tab-separated, one-line-per-entry
+ * record.
+ *
+ * `fs_list` documents its output as `"type\tsize\tmtime\tpath"`, one line
+ * per entry, and a caller has nothing to parse it with except a split on
+ * `\n` and then on `\t`. A newline in a FILENAME -- legal on every POSIX
+ * filesystem including APFS, and creatable through fsMCP's own `fs_write`
+ * and `fs_move` -- was emitted raw, so one entry became two lines: a
+ * phantom record with no type and no size, and a real record whose path
+ * stopped at the newline. The format did not fail; it silently stopped
+ * being the format, in the caller's parser rather than here.
+ *
+ * Escaping rather than skipping the entry (the other candidate in the
+ * issue): refusing to list a file whose name contains a separator makes a
+ * real, reachable file invisible to the one tool whose job is to say what
+ * is there, and every other tool would still happily operate on it by name.
+ * A parsing problem is not worth trading for a file that cannot be found.
+ * Structured content instead of a text table is the clean answer and a much
+ * larger change, worth it only if these tools are reworked as a group.
+ *
+ * The scheme is C-style and deliberately minimal: a literal backslash
+ * becomes `\\`, and the three characters that carry structure in this format
+ * -- newline, carriage return, tab -- become `\n`, `\r`, `\t`. Nothing else
+ * is touched. The backslash pass must come FIRST and must be
+ * unconditional, or the scheme is not decodable: a real file named
+ * `a\nb` (backslash, n) would otherwise emit the identical bytes as a file
+ * whose name contains an actual newline, and a caller unescaping would
+ * conjure a newline into a name that never had one. That unconditional
+ * pass is the one behaviour change for ordinary paths -- a path containing
+ * a backslash now emits it doubled -- and it is the price of the format
+ * being reversible at all.
+ *
+ * Applied to the already-translated virtual path (or the redaction
+ * placeholder), never to the host path: what goes on the wire is what has
+ * to be parseable, and escaping before translation would change the string
+ * `hostToVirtualOrRedact` matches its prefix against.
+ *
+ * The tool description states these rules, because a caller cannot parse a
+ * format whose escaping is unstated -- an escaping scheme nobody is told
+ * about turns one silent corruption into a different one.
+ */
+function escapePathField(p: string): string {
+  return p
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+}
+
+/**
  * List one directory's immediate children.
  *
  * `lstat`, never `stat`: fs_list names what physically sits in the directory
- * entry table, not what a symlink among them points at. Reporting a symlink
- * as "symlink", with the size and mtime of the link itself, means an entry
- * pointing outside the allowed directory is disclosed only as a name and a
- * type -- exactly what it is -- with nothing about it resolved or followed.
+ * entry table, not what a symlink among them points at. A symlink is
+ * reported as "symlink", with its own mtime and a size of ZERO, so an entry
+ * pointing outside the allowed directory is disclosed as a name, a type and
+ * a timestamp, with nothing about its target resolved, followed, or
+ * measured.
+ *
+ * The zero is issue #28 and is not cosmetic. This used to print `st.size`
+ * for a symlink like any other entry, and for a symlink `st_size` IS THE
+ * BYTE LENGTH OF THE TARGET PATH STRING -- so the size column was an exact
+ * measurement of a path the client is not allowed to know exists, on the
+ * one entry type where every other surface in this server refuses to say
+ * anything at all (`fs_read` of that same link is "outside allowed
+ * directories"). A `latest -> /Volumes/Backup/2026-08-26-nightly` shape is
+ * ordinary in a real tree, and its length confirms or eliminates a guessed
+ * host path in a single call; `fs_move` lets a client rename links freely,
+ * so links can be enumerated cheaply too. Zero costs nothing to report,
+ * because a link's own size is not the size of anything a caller can read:
+ * every operation here either refuses or acts on the link itself.
+ *
+ * The comment this replaces claimed a containment property the code did not
+ * have -- "disclosed only as a name and a type", while the size column was
+ * disclosing the exact length of the target. Now it is true.
+ *
  * There is no recursion here for the same fs_glob/fs_grep-shaped reasoning
  * to apply to: every path this returns is `path.join(dir, entry.name)` for
  * an `entry.name` readdir itself produced, which cannot contain a path
@@ -44,7 +113,11 @@ function listOneDir(dir: string, labels: LabelEntry[]): { lines: string[] } | { 
     let mtime = '';
     try {
       const st = fs.lstatSync(full);
-      size = st.size;
+      // Issue #28: a symlink's st_size is the length of its target path, not
+      // the size of anything the caller can read -- see this function's doc.
+      // Taken from `st` rather than the readdir Dirent so the answer comes
+      // from the same lstat the size itself came from.
+      size = st.isSymbolicLink() ? 0 : st.size;
       mtime = st.mtime.toISOString();
     } catch {
       // Vanished between readdir and lstat; still name it, with no stats.
@@ -57,7 +130,12 @@ function listOneDir(dir: string, labels: LabelEntry[]): { lines: string[] } | { 
     // "do not emit a path this cannot prove is in scope" rule fs_glob/
     // fs_find/fs_grep apply to output that a symlink genuinely could steer
     // outside their own validated root.
-    lines.push(`${entryType(entry)}\t${size}\t${mtime}\t${hostToVirtualOrRedact(full, labels)}`);
+    // escapePathField (issue #31) runs on the virtual path, i.e. last: only
+    // the path field can contain a character that carries structure here
+    // (type, size and mtime are all generated by this line).
+    lines.push(
+      `${entryType(entry)}\t${size}\t${mtime}\t${escapePathField(hostToVirtualOrRedact(full, labels))}`
+    );
   }
   return { lines };
 }
@@ -67,9 +145,19 @@ export function registerList(registry: ToolRegistry): void {
     {
       name: 'fs_list',
       description:
-        'List the immediate contents of a directory (non-recursive). One line per entry: ' +
-        '"type\\tsize\\tmtime\\tpath". Defaults to the allowed directories when path is omitted. ' +
-        `Capped at ${MAX_ENTRIES} entries.`,
+        'List the immediate contents of a directory (non-recursive). One line per entry, ' +
+        'tab-separated: "type\\tsize\\tmtime\\tpath". type is one of file, directory, symlink, ' +
+        'other. size is bytes, and is always 0 for a symlink (a link\'s own size measures its ' +
+        'target path, which is not yours to read). mtime is ISO 8601. The path field is ' +
+        'backslash-escaped so that one entry is always exactly one line, whatever the filename: ' +
+        'a literal backslash is written "\\\\", a newline "\\n", a carriage return "\\r" and a tab ' +
+        '"\\t"; no other character is escaped, and no other field is escaped. Unescape by ' +
+        'scanning left to right and consuming a backslash together with the character after it ' +
+        '-- do not run the four replacements independently, or "\\\\n" (an escaped backslash ' +
+        'followed by the letter n) decodes to a newline that is not in the name. ' +
+        'Defaults to the allowed directories when path is omitted. ' +
+        `Capped at ${MAX_ENTRIES} entries; when it caps, a blank line and a "(showing X of Y ` +
+        `entries)" trailer follow the last entry.`,
       inputSchema: schema(
         {
           path: stringProp(virtualPathDescription('Optional; defaults to every directory in this call\'s granted scope.')),

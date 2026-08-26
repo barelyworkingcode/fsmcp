@@ -10,10 +10,10 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 | `fs_read` | yes | Read a file: a line-numbered UTF-8 text view (default), or exact bytes as base64 |
 | `fs_glob` | yes | Find files by glob pattern |
 | `fs_grep` | yes | Search file contents with regex |
-| `fs_list` | yes | List one directory's immediate contents (non-recursive): name, type, size, mtime |
+| `fs_list` | yes | List one directory's immediate contents (non-recursive): type, size, mtime, name -- one escaped line per entry (see "`fs_list`'s line format" below) |
 | `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) |
 | `fs_write` | no | Write or create files (UTF-8 text or exact bytes via base64) |
-| `fs_edit` | no | Find-and-replace string editing |
+| `fs_edit` | no | Find-and-replace string editing (literal, UTF-8 text only) |
 | `fs_mkdir` | no | Create a directory (recursive by default) |
 | `fs_move` | no | Move or rename a file or directory |
 | `fs_delete` | no | Delete a file, symlink, or directory |
@@ -57,7 +57,7 @@ fsmcp --allowed-dir /
 
 ### `_meta` may only narrow the CLI grant, never widen it
 
-When fsmcp is run with `--allowed-dir` **and** a caller supplies `_meta.allowed_dirs` on a call, the effective scope is their **intersection**: each `_meta` directory is kept only if it resolves inside one of the `--allowed-dir` roots, and any that don't are dropped (and reported back on the result, not silently). `_meta.allowed_dirs` is treated as caller-supplied input, the same as any other argument on the wire -- fsmcp does not assume anything upstream of it (relay, or whatever configured relay) has already enforced a boundary, so it never lets `_meta` grant more than the operator already typed on the command line:
+When fsmcp is run with `--allowed-dir` **and** a caller supplies `_meta.allowed_dirs` on a call, the effective scope is their **intersection**: each `_meta` directory is kept only if it resolves inside one of the `--allowed-dir` roots, and any that don't are dropped (and reported back on the result, not silently -- as a count to the client, with the entries themselves on stderr for the operator). `_meta.allowed_dirs` is treated as caller-supplied input, the same as any other argument on the wire -- fsmcp does not assume anything upstream of it (relay, or whatever configured relay) has already enforced a boundary, so it never lets `_meta` grant more than the operator already typed on the command line:
 
 | `--allowed-dir` (CLI) | `_meta.allowed_dirs` | effective scope |
 |---|---|---|
@@ -125,6 +125,80 @@ string, replace it), so it refuses to operate on a file whose bytes are not
 valid UTF-8 at all, rather than rewriting it as corrupted UTF-8. There is no
 base64 mode for `fs_edit` -- a byte-level splice is not a string
 replacement.
+
+### `fs_edit` refuses an edit that has no meaning, rather than performing one
+
+`fs_edit` matches literally, with `content.split(old).join(new)`. That is
+exact and cheap for a real search string, and silently meaningless for two
+arguments a caller reaches without trying.
+
+**An empty `old_string` is refused**, before the file is read.
+`"hello".split("")` splits into individual *characters*, so the occurrence
+count was `length - 1` and the join interleaved the replacement between every
+character: `hello` was written back to disk as `hXeXlXlXoX`, reported as
+`Replaced 5 occurrence(s)`, on a success result, with relay's audit recording
+`ok`. There is no such thing as "the place where the empty string occurs" --
+the count of 5 was an artefact of `split`, not a fact about the file.
+
+The un-flagged path was the worse half. Without `replace_all`, the reply was
+`old_string found 5 times. Use replace_all or provide more context to make it
+unique` -- a sensible sentence about a real string, a nonsense one about an
+empty one, and a refusal whose own suggested remedy is the flag that destroys
+the file. So the refusal is on the emptiness, not on the count.
+
+The realistic trigger is not a caller typing `""`. It is an agent whose search
+string came from a variable that resolved empty -- a templated edit, or a
+value it failed to extract from a previous `fs_read`. It believes it is making
+a targeted replacement. `old_string` also carries `minLength: 1` in the
+published schema, so a caller that validates before sending sees the
+constraint without having to make the call to learn it.
+
+**`old_string` identical to `new_string` is refused too**, rather than let
+through and reported as a no-op. It is not a no-op on disk: `fs_edit` rewrites
+through a temp file and a rename, so an identical-strings "edit" still
+replaces the file (new inode, any hard link to it broken, mtime moved) with
+byte-for-byte the content it already had -- a real mutation with nothing to
+show for it, announced as `Replaced N occurrence(s)`, which reads as a change
+that happened. A refusal is what makes a caller look at its own strings; a
+`0 changes` success would still be counted as a completed step by anything
+branching on `isError`.
+
+**An empty `new_string` is legitimate and unaffected** -- that is a deletion,
+and it still works.
+
+### `fs_list`'s line format
+
+`fs_list` emits one line per entry, tab-separated, `type\tsize\tmtime\tpath`.
+Two things about that record are worth knowing before parsing it.
+
+**The path field is backslash-escaped.** A literal backslash is written `\\`, a
+newline `\n`, a carriage return `\r`, a tab `\t`. Nothing else is escaped, and
+no other field is. Decode by scanning left to right and consuming a backslash
+together with the character after it -- *not* by running the four
+replacements independently, which turns `\\n` (an escaped backslash followed by
+the letter n) into a newline that was never in the name.
+
+A filename containing a newline is legal on every POSIX filesystem, APFS
+included, and creatable through fsMCP's own `fs_write` and `fs_move`. Emitted
+raw, one entry became two lines: a phantom record with no type and no size,
+and a real record truncated at the newline. Nothing errored -- the format
+silently stopped being the format, and the failure landed in the caller's
+parser rather than here. The alternative of skipping such an entry was
+rejected: it would make a real, reachable file invisible to the one tool whose
+job is to say what is there, while every other tool still operated on it by
+name. `fs_glob`, `fs_find` and `fs_grep` join their results with `\n` too and
+do **not** escape yet.
+
+**A symlink's size is always `0`.** `fs_list` uses `lstat`, never `stat` -- it
+must not follow the link -- and `st_size` for a symlink is the byte length of
+the *target path string*. So the size column used to be an exact measurement
+of a path the client is not allowed to know exists, on the one entry type
+every other surface refuses to say anything about at all (`fs_read` of that
+same link is "outside allowed directories"). A `latest ->
+/Volumes/Backup/2026-08-26-nightly` link is ordinary in a real tree, and its
+length confirms or eliminates a guessed host path in a single call. A link's
+own size is not the size of anything a caller can read, so there is nothing to
+lose by reporting zero.
 
 `fs_write` and `fs_edit` replace a file by writing the new content to a
 temp file in the same directory and renaming it into place, so a write that
@@ -236,17 +310,32 @@ speaking to, cannot fail closed on the answer, and does not claim to. The
 guarantee fsmcp keeps is the one it can: **no host path in any tool result,
 error, or search hit fsmcp emits.**
 
-That guarantee has one documented exception, and it predates this change: when
-a call's `_meta.allowed_dirs` contains an entry that is not inside any
-`--allowed-dir` root, fsmcp appends a report naming the dropped entries as raw
-host paths, on a SUCCESS result, outside the virtual path space. It is
-reachable in a relay deployment whose registration carries `--allowed-dir`
-args *and* whose profile grants a directory outside them — the two disagree,
-and the client is told which entry was discarded. `disclose` does not reach
-that surface; see the note in CLAUDE.md. Whether the description relay writes carries one
-is a property of the relay in front of it, and is worth checking with
-`relayremote list --schema` on the deployment you actually run (plain
-`list` truncates the description, which is where the note lives).
+That guarantee used to have one documented exception, and it no longer does.
+When a call's `_meta.allowed_dirs` contains an entry that is not inside any
+`--allowed-dir` root, fsmcp appends a report saying so -- and that report used
+to name the dropped entries as raw host paths, on a SUCCESS result, outside
+the virtual path space. It was reachable in a relay deployment whose
+registration carries `--allowed-dir` args *and* whose profile grants a
+directory outside them: the two disagree, and the client was told which
+operator-configured entry was discarded. `disclose` does not reach that
+surface, and neither could a backstop -- a dropped directory is by
+construction not one of the granted roots, so there is no label to translate
+it to.
+
+It is now split the way a duplicate-label refusal already was: **the entries
+go to stderr, where the operator reads them, and the client is told the fact
+and the count** ("N entries were dropped, your effective scope is narrower
+than the one you were sent"). The client is still told it is confined --
+an agent that cannot see its own limits behaves worse, not better -- but not
+where. It stays a note rather than a refusal because, unlike a duplicate
+label, the narrowing has exactly one correct reading and is already the
+fail-closed one; refusing every call would turn an operator's over-tight CLI
+floor into an outage of a grant that is still valid.
+
+Whether the description relay writes carries a scope note is a property of the
+relay in front of it, and is worth checking with `relayremote list --schema`
+on the deployment you actually run (plain `list` truncates the description,
+which is where the note lives).
 
 ### A symlink out of the sandbox is refused, even one a human placed
 
