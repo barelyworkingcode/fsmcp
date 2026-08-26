@@ -52,6 +52,8 @@ nothing covers it. Every row below is the state *after* this pass; the
 | C6 | write fails partway → original intact, no temp file | `TestAtomicReplaceWritePartwayFailureLeavesOriginalIntact` (new; `RLIMIT_FSIZE` forces `write(2)` to fail mid-write deterministically) | **missing** | covered |
 | C7 | concurrent writes never tear | `TestAtomicReplaceConcurrentWritesNeverTear` (new) | **missing** — no test anywhere touched concurrency | covered |
 | C8 | no temp file survives any failure path | `TestAtomicReplaceNoTempFileLeftAfterSuccess`, `TestAtomicReplaceNoTempFileLeftAfterAttrFailure`, `TestAtomicReplaceRefusesUndeletableTarget`, `TestAtomicReplaceWritePartwayFailureLeavesOriginalIntact` | covered | covered |
+| C9 | file-flag target refused, naming chflags | `TestAtomicReplaceDistinguishesAFileFlagFromAnACL`, `TestWriteNamesTheRightRemedyForEachCause` | **missing** — only the ACL cause was planted, so both shared one diagnosis | covered |
+| C10 | file flags not preserved across a replace | `TestAtomicReplaceDoesNotPreserveFileFlags` | **missing** | covered |
 
 Hard-link-breaks-on-replace ("known and deliberate", not independently
 numbered) is pinned by `TestAtomicReplaceBreaksHardLink`.

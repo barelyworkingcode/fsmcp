@@ -356,6 +356,15 @@ directory followed by `rename`.
 replace, the file's **mode, extended attributes and ACL are preserved
 exactly**, and `umask` does not eat mode bits. If they cannot be preserved,
 the write is **refused** and the file left unchanged — never silently dropped.
+
+**BSD file flags are not in that list, and are not preserved.** A `hidden` or
+`nodump` flag is gone after a replace. This is a consequence of how the
+attributes above are carried — `cp -pN`, whose `-N` suppresses flags — and `-N`
+is not optional: copying `uchg` onto the temp file makes fsMCP's own artifact
+undeletable, so a failed write would strand a `.fsmcp-tmp-*` file in the
+caller's directory. A flag that forbids replacement (`uchg`/`schg`,
+`uappnd`/`sappnd`) never reaches this point at all: `rename(2)` refuses, and the
+write is refused with the flag named.
 This is review issue #20; prove it with a test that asserts `ls -le` and
 `xattr -l` output is identical before and after.
 

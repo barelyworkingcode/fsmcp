@@ -137,8 +137,15 @@ func mapAtomicReplaceError(err error, p string) *proto.CallToolResult {
 		return proto.NewErrorResult(proto.ErrNotAFile, "not a regular file", p)
 	case errors.Is(err, errAttrsUnpreservable):
 		return proto.NewErrorResult(proto.ErrIOError, "the file's mode, extended attributes or ACL could not be preserved; nothing was written", p)
+	case errors.Is(err, errTargetFlagged):
+		return proto.NewErrorResult(proto.ErrIOError, "this file carries a BSD file flag that forbids replacing it (uchg/schg immutable, or uappnd/sappnd append-only), and fsMCP replaces a file by renaming over it, so it cannot be written; nothing was changed. Clearing the flag with chflags makes it writable through fsMCP", p)
 	case errors.Is(err, errTargetUndeletable):
-		return proto.NewErrorResult(proto.ErrIOError, "this file's ACL denies delete, and fsMCP replaces a file by renaming over it, so it cannot be written; nothing was changed. Remove the deny-delete entry to make it writable through fsMCP", p)
+		// "most likely" rather than a flat assertion: the file flags are ruled
+		// out above, but rename(2) also returns EPERM for a sticky parent
+		// directory owned by someone else, and naming a cause this cannot
+		// actually confirm is what made the old message send callers after a
+		// deny-delete entry on files that had no ACL at all.
+		return proto.NewErrorResult(proto.ErrIOError, "replacing this file is denied, most likely by a \"deny delete\" ACL entry on it — \"ls -le\" shows one — and fsMCP replaces a file by renaming over it, so it cannot be written; nothing was changed. Removing that entry makes it writable through fsMCP", p)
 	default:
 		return Fail(err, p)
 	}

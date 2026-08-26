@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"syscall"
 
 	"fsmcp/internal/proto"
 )
@@ -31,6 +32,43 @@ var errAttrsUnpreservable = errors.New("attributes could not be preserved")
 // delete. Such a file can still be modified in place — the ACE protects the
 // inode, not the bytes — but fsMCP commits through a rename, which it forbids.
 var errTargetUndeletable = errors.New("target cannot be replaced")
+
+// errTargetFlagged marks a replace refused because the target carries a BSD
+// file flag that forbids being replaced. Kept distinct from
+// errTargetUndeletable even though rename(2) reports both as EPERM: the
+// remedies are different commands, and a caller told to remove an ACL entry on
+// a file that has no ACL at all is being sent after something that is not there.
+var errTargetFlagged = errors.New("target is protected by a file flag")
+
+// BSD file flags that make rename(2) refuse to replace a file. Package syscall
+// does not export them on darwin and fsMCP takes no module dependency, so the
+// four values from <sys/stat.h> are named here. Verified against real files:
+// chflags uchg sets 0x2 and chflags uappnd sets 0x4, and both refuse the
+// rename — so append-only belongs here beside immutable, not just the latter.
+const (
+	flagUserImmutable   = 0x00000002 // UF_IMMUTABLE
+	flagUserAppend      = 0x00000004 // UF_APPEND
+	flagSystemImmutable = 0x00020000 // SF_IMMUTABLE
+	flagSystemAppend    = 0x00040000 // SF_APPEND
+
+	flagsForbiddingReplace = flagUserImmutable | flagUserAppend |
+		flagSystemImmutable | flagSystemAppend
+)
+
+// hasReplaceForbiddingFlag reports whether name carries one of those flags. It
+// is a diagnostic, not a gate: the rename has already failed by the time this
+// runs, and all it decides is which cause the refusal names.
+func hasReplaceForbiddingFlag(root *Root, name string) bool {
+	fi, err := root.Lstat(name)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return st.Flags&flagsForbiddingReplace != 0
+}
 
 // AtomicReplace commits data through a temp file in targetPath's own
 // directory, then renames it over targetPath.
@@ -75,13 +113,17 @@ func AtomicReplace(root *Root, targetPath string, data []byte) error {
 		}
 	}
 
-	// A "deny delete" ACL blocks rename(2) on both sides, so a file carrying
-	// one cannot be replaced. That ACE exists precisely to protect the inode
-	// from being replaced, so stripping it to get the write through would
-	// defeat the protection it is enforcing. Refuse, and say what would have
-	// to change.
+	// A "deny delete" ACE and an immutable/append-only file flag both block
+	// rename(2), so a file carrying either cannot be replaced. Each exists
+	// precisely to protect the inode from being replaced, so clearing one to
+	// get the write through would defeat the protection it is enforcing.
+	// Refuse — and distinguish them, because rename reports both as EPERM
+	// while the two are undone by different commands.
 	if err := root.Rename(tmpPath, targetPath); err != nil {
 		if exists && errors.Is(err, fs.ErrPermission) {
+			if hasReplaceForbiddingFlag(root, targetPath) {
+				return errTargetFlagged
+			}
 			return errTargetUndeletable
 		}
 		return err
@@ -199,6 +241,13 @@ func writeAndClose(f *os.File, data []byte) error {
 // call after cp reasserts exactly perm (0-0777), which drops any set-id or
 // sticky bit cp copied and cannot itself be eaten by umask, closing that
 // gap without touching the xattrs or ACL chmod(2) never reads.
+//
+// This is deliberate too: -N suppresses copying BSD file flags, and removing
+// it strands fsMCP's own artifacts. Copying uchg onto the temp file makes that
+// temp undeletable by the process that just created it, so discardTemp cannot
+// clean up and a .fsmcp-tmp-* file is left in the caller's directory on every
+// failure path. The cost is that flags are not carried across a replace, which
+// DESIGN.md states as a non-guarantee rather than leaving it to be discovered.
 func preserveAttributes(root *Root, targetPath, tmpPath string, perm fs.FileMode) error {
 	// This is deliberate: these two strings are built by concatenation,
 	// not path/filepath.Join. Join would lexically collapse a ".." in

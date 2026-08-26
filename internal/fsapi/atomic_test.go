@@ -545,3 +545,109 @@ func tempLeftovers(t *testing.T, dir string) []string {
 	}
 	return found
 }
+
+// A BSD file flag reaches AtomicReplace as the same EPERM from rename(2) that a
+// deny-delete ACE does, and the refusal is equally correct — but the remedy is
+// chflags, not chmod, so the two must not collapse into one diagnosis. Before
+// they were distinguished, a uchg file with no ACL at all was told to remove a
+// deny-delete entry that did not exist.
+func TestAtomicReplaceDistinguishesAFileFlagFromAnACL(t *testing.T) {
+	if _, err := exec.LookPath("chflags"); err != nil {
+		t.Skip("chflags(1) not available")
+	}
+	root, rootDir := newTestRoot(t)
+
+	for _, flag := range []string{"uchg", "uappnd"} {
+		t.Run(flag, func(t *testing.T) {
+			name := "flagged-" + flag + ".txt"
+			target := filepath.Join(rootDir, name)
+			if err := os.WriteFile(target, []byte("protected"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("chflags", flag, target).CombinedOutput(); err != nil {
+				t.Skipf("could not set %s: %v (%s)", flag, err, out)
+			}
+			t.Cleanup(func() { exec.Command("chflags", "no"+flag, target).Run() })
+
+			err := AtomicReplace(root, name, []byte("overwritten"))
+			if !errors.Is(err, errTargetFlagged) {
+				t.Fatalf("AtomicReplace = %v, want errTargetFlagged (an ACL diagnosis here names a remedy the file cannot use)", err)
+			}
+			if errors.Is(err, errTargetUndeletable) {
+				t.Error("a file flag was reported as an ACL denial")
+			}
+
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "protected" {
+				t.Errorf("content = %q, want it unchanged", got)
+			}
+			// The refusal must not strand fsMCP's own artifact either.
+			entries, err := os.ReadDir(rootDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), ".fsmcp-tmp-") {
+					t.Errorf("temp file %q left behind after a refused replace", e.Name())
+				}
+			}
+		})
+	}
+}
+
+// The message a caller actually reads, not just the sentinel: each cause names
+// its own remedy, and neither names the other's.
+func TestWriteNamesTheRightRemedyForEachCause(t *testing.T) {
+	flagged := mapAtomicReplaceError(errTargetFlagged, "f.txt")
+	acl := mapAtomicReplaceError(errTargetUndeletable, "f.txt")
+
+	flaggedText := flagged.Content[0].Text
+	aclText := acl.Content[0].Text
+
+	if !strings.Contains(flaggedText, "chflags") {
+		t.Errorf("a file-flag refusal does not mention chflags: %s", flaggedText)
+	}
+	if strings.Contains(flaggedText, "deny delete") {
+		t.Errorf("a file-flag refusal points at a deny-delete ACL entry that need not exist: %s", flaggedText)
+	}
+	if !strings.Contains(aclText, "deny delete") {
+		t.Errorf("an ACL refusal does not mention the deny-delete entry: %s", aclText)
+	}
+	if strings.Contains(aclText, "chflags") {
+		t.Errorf("an ACL refusal points at chflags: %s", aclText)
+	}
+}
+
+// cp -pN's -N is load-bearing, so what it costs is pinned: file flags do not
+// survive a replace. DESIGN.md states this as a non-guarantee; the test keeps
+// the document and the behaviour together.
+func TestAtomicReplaceDoesNotPreserveFileFlags(t *testing.T) {
+	if _, err := exec.LookPath("chflags"); err != nil {
+		t.Skip("chflags(1) not available")
+	}
+	root, rootDir := newTestRoot(t)
+	target := filepath.Join(rootDir, "hidden.txt")
+	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// "hidden" does not forbid replacement, so the write succeeds and the flag's
+	// fate is observable — unlike uchg, which never gets past rename.
+	if out, err := exec.Command("chflags", "hidden", target).CombinedOutput(); err != nil {
+		t.Skipf("could not set hidden: %v (%s)", err, out)
+	}
+
+	if err := AtomicReplace(root, "hidden.txt", []byte("after")); err != nil {
+		t.Fatalf("AtomicReplace: %v", err)
+	}
+
+	fi, err := os.Lstat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Flags != 0 {
+		t.Errorf("st_flags = 0x%08x, want 0 — DESIGN.md states flags are NOT preserved", st.Flags)
+	}
+}

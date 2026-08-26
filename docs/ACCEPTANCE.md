@@ -77,6 +77,8 @@ from a self-move.
 | C6 | a write that fails partway | original intact, no temp file left |
 | C7 | concurrent writes | never tear; a reader sees old or new, never half |
 | C8 | no temp file survives any failure path | directory listing clean after each |
+| C9 | a target protected by a **file flag** (`uchg`/`uappnd`) | refused, file unchanged, and the refusal names `chflags` — never a deny-delete ACL entry the file does not have |
+| C10 | BSD file flags across a successful replace | **not preserved** — a stated non-guarantee, since `cp -pN`'s `-N` is what stops a copied `uchg` stranding fsMCP's own temp file |
 
 **Known and deliberate:** a replace breaks a hard link to the target (new
 inode). Assert it rather than fix it — the alternative is in-place truncation,
