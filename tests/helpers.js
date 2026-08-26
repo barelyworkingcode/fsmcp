@@ -2,6 +2,7 @@
 
 const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
@@ -136,4 +137,99 @@ function readArgvLog(log) {
     .map((l) => JSON.parse(l));
 }
 
-module.exports = { spawnServer, makeFakeRg, readArgvLog };
+/**
+ * A unique string that identifies bait content living outside the escape
+ * matrix fixture's allowed dir. Used instead of a plain word ("secret") so a
+ * false positive can't be explained away as a coincidental substring match
+ * somewhere in the fixture's own in-scope content.
+ */
+const OUTSIDE_CANARY = 'CANARY-6f19a3-outside-secret-must-never-be-named-in-scope';
+
+/**
+ * Build the fixture root from issue #5, Part 5 -- programmatically, in a
+ * fresh temp dir, so it never collides with a real path on the machine
+ * running the suite and never leaves anything checked into the repo. Each
+ * test that needs it calls this itself and cleans up with removeFixture in
+ * a t.after, rather than sharing one fixture across tests: several of the
+ * cases here (fs_delete, fs_move) mutate the fixture, and a shared instance
+ * would make one test's cleanup order change another test's answer.
+ *
+ * Layout (bait deliberately outside `root`, so "refused" and "no result"
+ * stay distinguishable -- a tool that can't see outside root and a tool
+ * that was refused permission to look would otherwise produce the same
+ * empty answer):
+ *
+ *   <testRoot>/root/                  <- the only allowed_dir
+ *       a.txt
+ *       notes/note1.txt
+ *       deep/nested/dirs/
+ *       link-out       -> <testRoot>/fake-etc   (dir symlink, out of scope)
+ *       link-out-file  -> ../../outside/secret.txt
+ *       dangling       -> ../../outside/nothere (target never created)
+ *       sub/link-up    -> ../..
+ *   <testRoot>/outside/               <- never in scope
+ *       secret.txt                    <- contains OUTSIDE_CANARY
+ *   <testRoot>/fake-etc/              <- a stand-in for /etc, NOT /etc itself
+ *       passwd                       <- contains its own canary string
+ *
+ * `fake-etc` stands in for the real `/etc` in the containment-write-and-
+ * delete cases (row 12): pointing `link-out` at the actual `/etc` would mean
+ * a bug in the code under test could really touch the host's /etc, which is
+ * exactly the kind of test failure that shouldn't exist. The real /etc is
+ * used exactly once, in escape-matrix.test.js's own read-only symlink case,
+ * and never for anything that writes or deletes.
+ *
+ * realpath'd up front: on macOS, os.tmpdir() is reached through the
+ * /var -> /private/var symlink, so every path built under it is *itself*
+ * behind a symlink hop before the fixture's own symlinks even come into
+ * play. Without resolving that first, every "inside root" assertion below
+ * would be comparing an unresolved path against validatePath's resolved
+ * answer and would fail for a reason that has nothing to do with what the
+ * test is checking.
+ */
+function buildScopeFixture() {
+  const testRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-escape-')));
+  const root = path.join(testRoot, 'root');
+  const outside = path.join(testRoot, 'outside');
+  const fakeEtc = path.join(testRoot, 'fake-etc');
+
+  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  fs.mkdirSync(fakeEtc, { recursive: true });
+
+  fs.writeFileSync(path.join(root, 'a.txt'), 'inside a.txt\n');
+  fs.mkdirSync(path.join(root, 'notes'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'notes', 'note1.txt'), 'a note\n');
+  fs.mkdirSync(path.join(root, 'deep', 'nested', 'dirs'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'sub'), { recursive: true });
+
+  fs.writeFileSync(path.join(outside, 'secret.txt'), OUTSIDE_CANARY);
+  fs.writeFileSync(path.join(fakeEtc, 'passwd'), 'root:x:0:0:fake-etc-standin-not-the-real-thing\n');
+
+  // Directory symlink pointing clean out of scope, at the /etc stand-in.
+  fs.symlinkSync(fakeEtc, path.join(root, 'link-out'));
+  // Relative symlink to a specific file outside, for the "write through a
+  // symlink" case (row 4).
+  fs.symlinkSync(path.join('..', '..', 'outside', 'secret.txt'), path.join(root, 'link-out-file'));
+  // Dangling symlink: its target is never created, so a write through it
+  // would be the only thing that ever brings that path into existence --
+  // which is exactly what row 5 must prove never happens.
+  fs.symlinkSync(path.join('..', '..', 'outside', 'nothere'), path.join(root, 'dangling'));
+  // sub/link-up -> ../.. resolves (kernel-style, from the symlink's own
+  // directory `root/sub`) to testRoot. Combined with a query path that
+  // appends its own "../.." after it, this is the exact shape
+  // security.ts's canonicalizePath docstring warns about: a lexical
+  // (string-collapsing) resolver cancels "link-up/../.." against "sub" and
+  // reads the whole thing as staying inside root, while the kernel resolves
+  // the symlink first and applies ".." to *that*, landing well outside.
+  fs.symlinkSync(path.join('..', '..'), path.join(root, 'sub', 'link-up'));
+
+  return { testRoot, root, outside, fakeEtc, canary: OUTSIDE_CANARY };
+}
+
+/** Remove everything buildScopeFixture created. */
+function removeFixture(fixture) {
+  fs.rmSync(fixture.testRoot, { recursive: true, force: true });
+}
+
+module.exports = { spawnServer, makeFakeRg, readArgvLog, buildScopeFixture, removeFixture, OUTSIDE_CANARY };
