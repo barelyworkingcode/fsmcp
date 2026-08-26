@@ -11,12 +11,20 @@ export function registerEdit(registry: ToolRegistry): void {
     {
       name: 'fs_edit',
       description:
-        'Perform exact string replacement in a file. By default, old_string must appear exactly once (fails if 0 or >1 matches). Use replace_all to replace every occurrence.',
+        'Perform exact string replacement in a file. By default, old_string must appear exactly once (fails if 0 or >1 matches). Use replace_all to replace every occurrence. old_string must be a non-empty string different from new_string: an empty search string, and a search string identical to its replacement, are both refused rather than performed (see below). new_string may be empty -- that is a deletion.',
       inputSchema: schema(
         {
           file_path: stringProp(virtualPathDescription()),
-          old_string: stringProp('Exact string to find'),
-          new_string: stringProp('Replacement string'),
+          // minLength is spelled inline rather than by extending
+          // registry.ts's stringProp: this is the only argument in the whole
+          // server that has a length floor, and a shared helper for one
+          // caller would put the constraint further from the refusal that
+          // actually enforces it. The handler's own check below is the real
+          // enforcement -- a JSON Schema keyword is a courtesy to a caller
+          // that validates before sending, and fsmcp validates nothing off
+          // the wire by schema.
+          old_string: { ...stringProp('Exact string to find. Must not be empty.'), minLength: 1 },
+          new_string: stringProp('Replacement string. May be empty (deletes old_string).'),
           replace_all: boolProp('Replace all occurrences (default: false)'),
         },
         ['file_path', 'old_string', 'new_string']
@@ -90,6 +98,85 @@ export function registerEdit(registry: ToolRegistry): void {
             'encoding -- writing it would silently substitute U+FFFD for it. This usually means ' +
             'new_string was already corrupted before it reached fs_edit; re-derive it from the ' +
             'original source rather than writing it as-is.'
+        );
+      }
+
+      // Issue #30. An empty old_string is refused here, before the file is
+      // read, because there is no such thing as "the place where the empty
+      // string occurs" -- and the code below would otherwise answer that
+      // non-question with something actively destructive rather than with a
+      // miss. `content.split("")` splits into individual CHARACTERS, so
+      // `parts.length - 1` counts (length - 1) phantom "occurrences" and
+      // `parts.join(newString)` interleaves new_string between every
+      // character of the file: "hello" with new_string "X" becomes
+      // "hXeXlXlXoX", written to disk, reported as `Replaced 5
+      // occurrence(s)` on a SUCCESS result. Nothing downstream catches it,
+      // because from split/join's point of view nothing went wrong.
+      //
+      // The un-flagged path is worse than it looks, not better: with
+      // replace_all absent the caller gets `old_string found 5 times. Use
+      // replace_all or provide more context to make it unique.` -- a
+      // sensible sentence about a real string, a nonsense one about an
+      // empty one, and a refusal whose own remedy is the flag that destroys
+      // the file. So the refusal has to happen HERE, on the emptiness,
+      // rather than being left to the uniqueness check to express badly.
+      //
+      // The realistic trigger is not a caller typing "": it is an agent
+      // whose old_string came from a variable that resolved empty -- a
+      // templated edit, or a value it failed to extract from a previous
+      // fs_read. It believes it is making a targeted replacement.
+      //
+      // This is the same "the operation has no meaning, so refuse it rather
+      // than pick a behaviour" stance the rest of this codebase already
+      // takes: fs_edit's own non-unique match, assignLabels on a duplicate
+      // label, validatePath on an empty scope, narrowAllowedDirs keeping
+      // absent and empty distinct instead of collapsing them.
+      if (oldString === '') {
+        return errorResult(
+          'old_string must not be empty. An empty search string does not identify a location in ' +
+            'the file -- fs_edit would interleave new_string between every character and report ' +
+            'that as a successful replacement. If old_string came from a variable, it resolved ' +
+            'empty; re-derive it (for example from an fs_read of this file) before retrying. ' +
+            'To insert text at a known point, pass the surrounding text as old_string and the ' +
+            'surrounding text with the insertion as new_string.'
+        );
+      }
+
+      // Issue #30, the neighbouring case: old_string === new_string is
+      // refused too, and for the same reason rather than by analogy.
+      //
+      // It is not a harmless no-op that this could let through and report
+      // honestly. fs_edit rewrites through writeFileAtomic, which renames a
+      // fresh temp file over the target -- so an identical-strings "edit"
+      // still replaces the inode, breaks any hard link to it, and bumps
+      // mtime, while the content is byte-for-byte what it already was. That
+      // is a real mutation of the file with no change to show for it, and
+      // `Replaced 3 occurrence(s)` is a true sentence that will be read as
+      // "the change landed" by the one reader it is written for. An agent
+      // told that moves on; the edit it believed in never existed.
+      //
+      // The trigger is the same shape as the empty case -- two template
+      // variables that resolved to the same value, or a new_string
+      // re-derived from the file it was about to be written into -- and it
+      // runs into the same misleading remedy first: without replace_all it
+      // is told to add the flag "to make it unique", which for identical
+      // strings makes a bigger nothing happen.
+      //
+      // Refused rather than reported as a no-op success because a refusal
+      // is the answer that makes the caller look at its own strings. A
+      // success result saying "0 changes" would still be counted as a
+      // completed step by anything scanning for isError, which is exactly
+      // the reading that is wrong here. Nothing legitimate is lost: a
+      // caller that genuinely wants the file's bytes unchanged has already
+      // got them.
+      if (oldString === newString) {
+        return errorResult(
+          'old_string and new_string are identical, so this edit would change nothing. It is ' +
+            'refused rather than performed: fs_edit rewrites the file through a temp-file rename, ' +
+            'so it would still replace the file (new inode, new mtime, any hard link to it broken) ' +
+            'and report a replacement count that reads as a change that did not happen. If these ' +
+            'two came from separate variables, they resolved to the same value -- re-derive ' +
+            'new_string before retrying.'
         );
       }
 

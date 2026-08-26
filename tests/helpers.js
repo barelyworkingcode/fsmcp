@@ -78,7 +78,13 @@ function spawnServer(args = [], opts = {}) {
     child.kill();
   }
 
-  return { request, callTool, close, child };
+  // `stderr()` is a getter rather than the accumulated string itself
+  // because the string is appended to as the child runs -- a snapshot taken
+  // at spawn time would always be empty. fsmcp writes operator-only detail
+  // there deliberately (vpath.ts's duplicate-label refusal, main.ts's
+  // dropped-_meta report), so a test that pins "the client is told the fact
+  // and the operator is told the paths" has to be able to read both halves.
+  return { request, callTool, close, child, stderr: () => stderr };
 }
 
 /**
@@ -125,6 +131,28 @@ console.log('fake-rg-ran');
   fs.writeFileSync(rg, script);
   fs.chmodSync(rg, 0o755);
   return { bin, log };
+}
+
+/**
+ * Poll `predicate` until it is true, or fail after `timeoutMs`.
+ *
+ * Needed for anything that asserts on a server's STDERR: stdout and stderr
+ * are two separate pipes, so the 'data' event carrying a diagnostic line is
+ * not ordered against the JSON-RPC response that shares the same handler
+ * turn. Awaiting the response therefore proves nothing about stderr having
+ * arrived yet, and a bare assertion on it is a race that passes locally and
+ * fails on a loaded machine. Polling, rather than a fixed sleep, keeps the
+ * happy path fast and still gives a slow one room.
+ */
+async function waitFor(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() > deadline) {
+      throw new Error(`waitFor: condition still false after ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 /** Read back the argv arrays a makeFakeRg stand-in recorded. */
@@ -296,6 +324,7 @@ function removeFixture(fixture) {
 
 module.exports = {
   spawnServer,
+  waitFor,
   makeFakeRg,
   readArgvLog,
   buildScopeFixture,

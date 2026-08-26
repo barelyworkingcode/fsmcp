@@ -214,14 +214,83 @@ rl.on('line', (line: string) => {
       // part of what relay sent was refused for widening the grant, rather
       // than the call quietly running with a narrower scope than the caller
       // thought it asked for.
+      //
+      // Issue #26: reported as a FACT AND A COUNT to the client, with the
+      // entries themselves going to stderr for the operator. This used to
+      // name the dropped entries as raw host paths, on a SUCCESS result --
+      // the one shape nothing else in this server can catch:
+      // `vpath.ts`'s translation is applied per known path at each
+      // construction site and these paths belong to no site, `disclose:
+      // "count"` governs a tool DESCRIPTION rather than a result payload,
+      // and `redactLeakedHostPaths` is `isError`-scoped by design (PR #10,
+      // so it can never scan fs_read/fs_grep success content). Widening
+      // that backstop would not help either: a dropped directory is BY
+      // CONSTRUCTION not in `ctx.labels` -- the redaction works by knowing
+      // the granted roots, and this path is precisely one that is not
+      // granted. There is nothing to translate it to. The only fix is to
+      // stop naming it.
+      //
+      // It was reachable in the deployment this server exists for, not just
+      // over bare stdio. Relay builds `_meta` server-side from stored
+      // context, which was once read here as "a client cannot reach this";
+      // server-side is not the same as in-scope. Register fsmcp with
+      // `--args --allowed-dir /A` while the profile's allowed_dirs also
+      // names `/B` and relay sends both: `/B` fails C1, and `/B` -- an
+      // operator-configured host path the client was never granted -- was
+      // echoed to a remote client on a successful result, appended to every
+      // call (reads, writes, listings, and refusals alike) for as long as
+      // the misconfiguration stood.
+      //
+      // The split follows `assignLabels`' duplicate-label refusal exactly,
+      // for the same reasons in both directions. stderr gets the detail
+      // because the operator is the only party who can fix the
+      // configuration and the only one entitled to the paths; stderr is not
+      // the protocol stream (stdout is), so it cannot corrupt a response,
+      // and it is where a stdio MCP's host collects a child's diagnostics.
+      // The client gets the fact and the count because an agent that cannot
+      // see it is confined behaves WORSE, not better (the same reasoning
+      // that made `disclose: "count"` "count" rather than "none") -- but
+      // knowing its scope is narrower than its profile asks for requires no
+      // knowledge of the host's directory layout. The client can do nothing
+      // with the paths in any case: it cannot fix the configuration.
+      //
+      // Deliberately a note and not a refusal, unlike a duplicate label.
+      // The two look similar and are not: a duplicate label leaves the
+      // address space with NO correct reading (a `/<label>/...` path names
+      // two different files, and picking one silently gives a caller the
+      // wrong file's bytes), whereas this narrowing has exactly one, is
+      // specified by C1's own table, and is already fail-closed -- the
+      // effective scope is the intersection, which is the safe answer, not
+      // a guess between two. Refusing every call would turn an operator's
+      // over-tight CLI floor into a total outage of a capability whose
+      // remaining grant is still valid, and it would fire on the ordinary,
+      // intended shape of "the operator tightened the floor" rather than on
+      // an ambiguity. If this ever needs to be louder, the levers are this
+      // stderr line and relay's own scope note (which currently renders the
+      // profile's count rather than the effective one -- filed against
+      // relay), not a refusal fsmcp cannot distinguish from correct use.
       if (droppedMetaDirs.length > 0) {
+        // The operator's copy, with the detail needed to fix it.
+        process.stderr.write(
+          `fsmcp: _meta.allowed_dirs entries were dropped because they are not contained within ` +
+            `any --allowed-dir root: ${droppedMetaDirs.join(', ')}. The call ran with the ` +
+            `narrowed scope. This server's --allowed-dir arguments and the allowed_dirs it was ` +
+            `sent disagree; an operator must reconcile them.\n`
+        );
+        // The count, not the coordinates. The sentence a client can act on
+        // is "your scope is narrower than the one your profile names, by N
+        // entries"; the entries themselves tell it nothing it can use and
+        // are exactly what it must not be told.
         result.content = [
           ...result.content,
           {
             type: 'text',
             text:
               `[fsmcp: _meta.allowed_dirs entries were dropped because they are not contained ` +
-              `within any --allowed-dir root: ${droppedMetaDirs.join(', ')}]`,
+              `within any --allowed-dir root -- ${droppedMetaDirs.length} of them. This call's ` +
+              `effective scope is that much narrower than the scope it was sent, and the ` +
+              `dropped entries are not addressable from here. They are named in this server's ` +
+              `stderr, for the operator, who is the party that can reconcile the two.]`,
           },
         ];
       }
