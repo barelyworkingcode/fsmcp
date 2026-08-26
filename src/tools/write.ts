@@ -6,6 +6,7 @@ import { checkPathV, decodeInboundPath, refuseAllowedDirRootWriteV, translateRes
 import { hasLoneSurrogate, isValidBase64 } from '../encoding';
 import { writeFileAtomic } from '../atomicWrite';
 import { canonicalizePath } from '../security';
+import { MAX_RESPONSE_BYTES, base64SourceCeiling, wireBytes } from '../limits';
 
 // C5 ("max bytes on fs_read and fs_write"), same reasoning as fs_read's
 // MAX_READ_BYTES: an unbounded write is an unbounded synchronous allocation
@@ -14,7 +15,33 @@ import { canonicalizePath } from '../security';
 // every other caller is also waiting on. Checked against the argument's
 // byte length before either mkdirSync or writeFileSync runs, so a refusal
 // creates nothing -- not even the parent directories.
+//
+// This is a bound on the ALLOCATION and it cannot fire at today's defaults,
+// because the message bound below is ~10x tighter and every path reaches it
+// first (a JSON-escaped string is never SHORTER than its own UTF-8 encoding,
+// so 1 MiB on the wire implies at most 1 MiB of bytes; base64's ceiling is
+// tighter still at 768 KiB decoded). It is kept rather than deleted for the
+// same reason fs_read keeps MAX_READ_BYTES: issue #16 makes these numbers
+// operator flags, they answer different questions, and an operator who
+// raises the message budget past 10 MiB should still hit an allocation floor
+// that was reasoned for this process rather than for relay's scanner. Do not
+// remove it as "unreachable" without also removing the reason it exists.
 const MAX_WRITE_BYTES = 10 * 1024 * 1024;
+
+// The inbound half of issue #19. fs_read's defect was that it bounded the
+// file rather than the response; fs_write had the identical defect pointing
+// the other way, and it was worse in one respect: a base64 `content` for a
+// 10 MiB file is a ~13.3 MiB REQUEST line, and relay cannot carry that any
+// more than it can carry a 13.3 MiB response -- so the call fsmcp was
+// advertising as legal could never arrive at all. The refusal here is
+// therefore not the primary fix; the tool DESCRIPTION is, because a request
+// that is too long to carry never reaches this function to be refused. What
+// this check buys is that the two agree: the limit fsmcp publishes is the
+// limit fsmcp enforces, so an agent that reads the description and stays
+// inside it is not relying on a number nothing checks, and a caller that
+// arrives over some other transport with no line cap is held to the same
+// bound rather than being quietly special.
+const MAX_CONTENT_WIRE_BYTES = MAX_RESPONSE_BYTES;
 
 export function registerWrite(registry: ToolRegistry): void {
   registry.register(
@@ -26,7 +53,10 @@ export function registerWrite(registry: ToolRegistry): void {
         '"content" verbatim -- no normalisation, no newline translation. encoding: "base64" ' +
         'decodes "content" as base64 and writes those exact bytes, unmodified; use it to write ' +
         'back anything read from fs_read with encoding: "base64" (a PNG, or any other non-UTF-8 ' +
-        'file). Refuses content over 10MB.',
+        'file). "content" is refused if it exceeds 1MiB as it appears in the request (after JSON ' +
+        'escaping), which in encoding: "base64" means a file of at most 768KiB, since base64 ' +
+        'inflates by 4/3. There is no offset or append mode: a file larger than that cannot be ' +
+        'assembled through fs_write in several calls.',
       inputSchema: schema(
         {
           file_path: stringProp(virtualPathDescription()),
@@ -93,6 +123,39 @@ export function registerWrite(registry: ToolRegistry): void {
       const rootErr = refuseAllowedDirRootWriteV(filePath, ctx.allowedDirs, 'write to', ctx.labels);
       if (rootErr) return rootErr;
 
+      // Issue #19, inbound. Measured on the wire form of `content` -- what
+      // it costs inside the JSON request line -- not on `content.length`
+      // (UTF-16 code units, which under-counts every non-ASCII character)
+      // and not on the decoded bytes (which under-counts base64 by 4/3 and
+      // is not even computed yet). `wireBytes` calls the same JSON encoder
+      // the transport does, so this is the real number rather than an
+      // estimate; estimating is the mistake this issue is about.
+      //
+      // Before the decode, deliberately: the base64 validity check and the
+      // surrogate scan below both walk the whole string, and a message this
+      // server is not willing to accept should not pay for that first. It
+      // does mean an over-size, malformed-base64 `content` is reported as
+      // over-size rather than as malformed -- correct precedence, since the
+      // size is a property of the message and the malformedness a property
+      // of an argument the message was too big to be carrying anyway.
+      const contentWireBytes = wireBytes(content);
+      if (contentWireBytes > MAX_CONTENT_WIRE_BYTES) {
+        const advice =
+          encoding === 'base64'
+            ? `base64 inflates by 4/3, so the largest file this mode can write in one call is ` +
+              `${base64SourceCeiling(MAX_CONTENT_WIRE_BYTES)} bytes. fs_write has no offset or ` +
+              `append mode, so a bigger file cannot be assembled from several calls either -- ` +
+              `moving a large binary is not something fsMCP can do byte-exactly.`
+            : `write it in smaller pieces (e.g. an initial fs_write followed by fs_edit against ` +
+              `the file it created) instead.`;
+        return errorResult(
+          `content is ${contentWireBytes} bytes on the wire, over fs_write's ` +
+            `${MAX_CONTENT_WIRE_BYTES}-byte message byte limit -- fsMCP bounds what crosses the ` +
+            `stdio transport, not just what lands on disk, because a request line this long is ` +
+            `dropped (or kills the connection) before it ever reaches a size check here. ${advice}`
+        );
+      }
+
       let bytes: Buffer;
       if (encoding === 'base64') {
         // isValidBase64 first: Buffer.from(s, 'base64') is a lenient
@@ -130,10 +193,15 @@ export function registerWrite(registry: ToolRegistry): void {
         bytes = Buffer.from(content, 'utf-8');
       }
 
+      // The allocation floor (see MAX_WRITE_BYTES above). Unreachable while
+      // the message bound is 1 MiB, kept because the two are independent
+      // knobs under issue #16 and this one is the one that protects the
+      // process rather than the transport.
       if (bytes.length > MAX_WRITE_BYTES) {
         return errorResult(
-          `content is ${bytes.length} bytes, over fs_write's ${MAX_WRITE_BYTES}-byte limit; write it ` +
-            `in smaller pieces (e.g. with fs_edit against an existing file) instead`
+          `content decodes to ${bytes.length} bytes, over fs_write's ${MAX_WRITE_BYTES}-byte ` +
+            `allocation limit; write it in smaller pieces (e.g. with fs_edit against an existing ` +
+            `file) instead`
         );
       }
 

@@ -2,10 +2,89 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
-import { textResult, errorResult, scopeViolationResult, ToolContext, LabelEntry } from '../types';
+import { textResult, errorResult, scopeViolationResult, MCPCallResult, ToolContext, LabelEntry } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { decodeUtf8Strict } from '../encoding';
+import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+
+// Issue #19, second repro: fs_grep in `output_mode: "content"` capped NOTHING
+// -- not a line count, not a byte count. fs_find caps at 200 results, fs_glob
+// at 1000, fs_list at 5000; fs_grep's content mode was bounded only by how
+// much matching text happened to be in the granted folder, so an ordinary
+// grep for a common word over a large granted repository produced a result
+// past relay's 10 MiB frame cap and permanently wedged the MCP for every
+// grant on the host (measured: ~6 MiB of matching lines came back fine at
+// ~8 MB; 10 MiB of matching lines returned "bufio.Scanner: token too long"
+// and every later call, on every profile, failed until Relay.app was
+// relaunched). Note the difference from the fs_read case in the same issue:
+// there fsmcp died, here fsmcp survived and relay's stdout reader died. Same
+// outage.
+//
+// 1000 lines, matching fs_glob's cap rather than inventing a fourth number:
+// these are the same kind of quantity (one result per line, a caller scans
+// them) and there is no reason for fs_grep to be more generous than the tool
+// that lists filenames. A line cap alone is not enough -- a matched line can
+// be a kilobyte of minified source -- so `capLines` applies the shared byte
+// budget as well and reports which bound it hit.
+//
+// REFUSING is deliberately NOT the answer here, and this is the one place in
+// this codebase where that is true. PR #13's rule ("represent it losslessly
+// in the encoding the caller asked for, or refuse") binds a FIDELITY mode:
+// fs_read's base64 path promises byte-exactness and round-trips through
+// fs_write, so a shortened payload there would be undetectable from the
+// content and is refused outright. fs_grep has never promised that. It is a
+// search returning a VIEW -- already filtered by pattern, already re-ordered,
+// already truncated by `head_limit` and by the wall-clock budget -- and a
+// search that found too much has still done useful work. So it answers the
+// way fs_glob and fs_read's line paging already do: a bounded result that
+// SAYS it is bounded, inline for a human ("showing X of Y result lines") and
+// structurally for a program (`_meta.truncated`). Do not "fix" this by making
+// it refuse, and do not "fix" fs_read's base64 mode by making it truncate;
+// the two sit on opposite sides of that line on purpose.
+const MAX_RESULT_LINES = 1000;
+
+/**
+ * Build fs_grep's reply from its result lines, bounded and honest about it.
+ *
+ * `totalLines` is how many lines the search actually produced, which may be
+ * more than `lines` contains (grepFallback stops collecting once it is past
+ * the cap but keeps counting, so the "of N" is the real N rather than the
+ * size of the array that survived).
+ *
+ * `trailingNotes` carries the pre-existing "search stopped after Nms" floor
+ * note, and `incomplete` is set whenever this result is not the whole answer
+ * for ANY reason -- the byte/line cap, or the wall-clock budget. Both land on
+ * the same `_meta.truncated` flag fs_read uses, because they are the same
+ * statement: this response does not contain the whole of what it was asked to
+ * represent. A caller must be able to branch on that without pattern-matching
+ * English out of the payload.
+ */
+function renderGrepResult(
+  lines: string[],
+  totalLines: number,
+  trailingNotes: string[],
+  incomplete: boolean,
+): MCPCallResult {
+  const capped = capLines(lines, MAX_RESULT_LINES, totalLines);
+  const notes = [...trailingNotes];
+  if (capped.capped) {
+    const why =
+      capped.reason === 'bytes'
+        ? `, cut at fs_grep's ${MAX_RESPONSE_BYTES}-byte response limit`
+        : '';
+    notes.unshift(`(showing ${capped.shown} of ${capped.total} result lines${why})`);
+  }
+  const text =
+    notes.length === 0
+      ? capped.text
+      : capped.text === ''
+        ? notes.join('\n')
+        : `${capped.text}\n\n${notes.join('\n')}`;
+  const result = textResult(text);
+  if (capped.capped || incomplete) result._meta = { truncated: true };
+  return result;
+}
 
 // Detect ripgrep at load time.
 //
@@ -148,7 +227,12 @@ export function registerGrep(registry: ToolRegistry): void {
     {
       name: 'fs_grep',
       description:
-        'Search file contents with regex. Uses ripgrep if available, falls back to Node.js. Default output mode is files_with_matches (file paths only).',
+        'Search file contents with regex. Uses ripgrep if available, falls back to Node.js. ' +
+        'Default output mode is files_with_matches (file paths only). Returns a BOUNDED result: ' +
+        'at most 1000 result lines, and at most 1MiB of them. A bounded reply always says so -- ' +
+        'inline as "(showing X of Y result lines)" and structurally as _meta.truncated -- so a ' +
+        'partial answer is never mistakable for a complete one. Narrow with path, glob, type or ' +
+        'head_limit to see the rest.',
       inputSchema: schema(
         {
           pattern: stringProp('Regex pattern to search for'),
@@ -342,6 +426,11 @@ function parseRgJson(output: string): RgJsonEvent[] {
  * for content mode) -- with every path re-validated and translated to its
  * virtual form on the way out.
  *
+ * Returns the LINES, not a joined string: issue #19 made the result size a
+ * bounded quantity, and the bound is applied per line (`renderGrepResult`),
+ * so joining here would only mean splitting again a moment later. Nothing
+ * about the per-line contract changed.
+ *
  * Re-validation is not defense in depth here, it is the actual containment
  * step for this tool's output, the same reasoning fs_glob/fs_find already
  * apply to their own hits: whatever walked the tree chose what got reported,
@@ -360,7 +449,7 @@ export function formatRgJson(
   outputMode: string,
   allowedDirs: string[],
   labels: LabelEntry[],
-): string {
+): string[] {
   const events = parseRgJson(output);
   const scopeCache = new Map<string, boolean>();
   const inScope = (p: string): boolean => {
@@ -382,7 +471,7 @@ export function formatRgJson(
       seen.add(p);
       lines.push(hostToVirtualOrRedact(p, labels));
     }
-    return lines.join('\n');
+    return lines;
   }
 
   if (outputMode === 'count') {
@@ -397,7 +486,7 @@ export function formatRgJson(
       if (typeof p !== 'string' || typeof count !== 'number' || !inScope(p)) continue;
       lines.push(`${hostToVirtualOrRedact(p, labels)}:${count}`);
     }
-    return lines.join('\n');
+    return lines;
   }
 
   // content: reconstruct plain rg's own separators -- ":" for a matched
@@ -427,7 +516,7 @@ export function formatRgJson(
     lastPath = p;
     lastLine = lineNumber;
   }
-  return lines.join('\n');
+  return lines;
 }
 
 function grepWithRg(
@@ -460,8 +549,9 @@ function grepWithRg(
       maxBuffer: 40 * 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const filtered = formatRgJson(output, outputMode, allowedDirs, labels);
-    return textResult(filtered === '' ? 'No matches found.' : filtered);
+    const resultLines = formatRgJson(output, outputMode, allowedDirs, labels);
+    if (resultLines.length === 0) return textResult('No matches found.');
+    return renderGrepResult(resultLines, resultLines.length, [], false);
   } catch (err: unknown) {
     const e = (err ?? {}) as {
       status?: number | null;
@@ -676,6 +766,19 @@ export function grepFallback(
   const walkTruncated = expired();
 
   const results: string[] = [];
+  // Issue #19: `results` used to grow without any bound at all in content
+  // mode -- one entry per matched (and per context) line, for every file in
+  // the grant. That is the array that became a 10 MiB response line and
+  // wedged relay's stdout reader. Collection now stops at the same cap the
+  // reply is rendered with, while `totalResultLines` keeps counting, so the
+  // "(showing X of Y)" note names the real Y rather than the size of the
+  // array that survived -- and the process stops holding a result it was
+  // never going to be able to send.
+  let totalResultLines = 0;
+  const emit = (line: string): void => {
+    totalResultLines++;
+    if (results.length < MAX_RESULT_LINES) results.push(line);
+  };
   let resultCount = 0;
   let filesSearched = 0;
   let stopped = walkTruncated;
@@ -726,11 +829,11 @@ export function grepFallback(
     if (matchingLines.length > 0) {
       switch (outputMode) {
         case 'files_with_matches':
-          results.push(displayPath(file));
+          emit(displayPath(file));
           resultCount++;
           break;
         case 'count':
-          results.push(`${displayPath(file)}:${matchingLines.length}`);
+          emit(`${displayPath(file)}:${matchingLines.length}`);
           resultCount++;
           break;
         case 'content': {
@@ -748,7 +851,7 @@ export function grepFallback(
           // this kind of content).
           const shownPath = displayPath(file);
           for (const idx of sortedLines) {
-            results.push(`${shownPath}:${idx + 1}:${lines[idx]}`);
+            emit(`${shownPath}:${idx + 1}:${lines[idx]}`);
           }
           resultCount += matchingLines.length;
           break;
@@ -780,19 +883,25 @@ export function grepFallback(
       + `${scope}. These results are a floor, not a complete answer: a file that was not `
       + `searched may still match.]`;
 
-    if (results.length === 0) {
-      return textResult(
+    if (totalResultLines === 0) {
+      // Issue #19: this was already a bounded answer and already said so in
+      // prose; it now says so structurally too, so `_meta.truncated` means
+      // one thing across every fs_grep reply ("this is not the whole
+      // answer") rather than covering only the cases added later.
+      const empty = textResult(
         `No matches in the ${filesSearched} file(s) searched before the search stopped.\n${note}`
       );
+      empty._meta = { truncated: true };
+      return empty;
     }
-    return textResult(`${results.join('\n')}\n\n${note}`);
+    return renderGrepResult(results, totalResultLines, [note], true);
   }
 
-  if (results.length === 0) {
+  if (totalResultLines === 0) {
     return textResult('No matches found.');
   }
 
-  return textResult(results.join('\n'));
+  return renderGrepResult(results, totalResultLines, [], false);
 }
 
 function walkFiles(

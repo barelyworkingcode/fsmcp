@@ -5,6 +5,7 @@ import { textResult, errorResult, scopeViolationResult, ToolContext } from '../t
 import { NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { LabelEntry } from '../types';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
+import { capLines, MAX_RESPONSE_BYTES } from '../limits';
 
 const MAX_ENTRIES = 5000;
 
@@ -220,14 +221,25 @@ export function registerList(registry: ToolRegistry): void {
         allLines.push(...result.lines);
       }
 
-      const truncated = allLines.length > MAX_ENTRIES;
-      const capped = allLines.slice(0, MAX_ENTRIES);
-      const suffix = truncated
-        ? `\n\n(showing ${MAX_ENTRIES} of ${allLines.length} entries)`
-        : '';
+      // Issue #19: 5000 entries was a cap on the COUNT and on nothing else,
+      // and an entry line carries a name, a type, a size and an mtime -- at
+      // PATH_MAX-length names that is over 5 MB, half of relay's frame cap,
+      // from a plain directory listing. capLines applies the shared byte
+      // budget alongside the entry cap and says which one it hit; the
+      // "(showing X of Y entries)" wording is unchanged, because a caller
+      // that already understands this tool's cap should not have to learn a
+      // second vocabulary for the same statement.
+      const capped = capLines(allLines, MAX_ENTRIES);
+      if (capped.total === 0) return textResult('(empty)');
+      if (!capped.capped) return textResult(capped.text);
 
-      if (capped.length === 0) return textResult('(empty)');
-      return textResult(capped.join('\n') + suffix);
+      const why =
+        capped.reason === 'bytes' ? `, cut at fs_list's ${MAX_RESPONSE_BYTES}-byte response limit` : '';
+      const result = textResult(
+        `${capped.text}\n\n(showing ${capped.shown} of ${capped.total} entries${why})`
+      );
+      result._meta = { truncated: true };
+      return result;
     }
   );
 }

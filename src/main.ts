@@ -3,6 +3,7 @@ import { ToolRegistry } from './registry';
 import { ToolContext, MCPCallResult } from './types';
 import { parseAllowedDirs, narrowAllowedDirs, sanitizeMetaAllowedDirs } from './security';
 import { stripLabels, assignLabels } from './vpath';
+import { MAX_FRAME_BYTES } from './limits';
 import { registerRead } from './tools/read';
 import { registerWrite } from './tools/write';
 import { registerEdit } from './tools/edit';
@@ -37,8 +38,45 @@ registerDelete(registry);
 // alongside whatever _meta supplies, when assigning this call's labels.
 const { hostPaths: cliAllowedDirs, labelByHostPath: cliLabels } = stripLabels(parseAllowedDirs());
 
+// Issue #19, the outermost bound: this is the ONE place fsmcp writes to
+// stdout, so it is the one place that can measure the thing relay's scanner
+// actually measures -- a whole line, envelope included, in bytes.
+//
+// ToolRegistry.call already bounds every tool RESULT (boundResultBytes), and
+// every tool that can produce a large one bounds and reports its own before
+// that. This layer exists because neither of those covers the whole line:
+// `tools/list` and `initialize` are serialised here without passing through
+// the registry at all, and `tools/call` appends its own advisory content
+// blocks (the dropped/malformed `_meta.allowed_dirs` reports below) AFTER the
+// registry has had its look -- and those are built from caller-supplied
+// strings, so "small in practice" is not the same as bounded.
+//
+// A JSON-RPC error, not a tool result: by this point the shape of what was
+// being sent is gone, and the only honest statement left is "this response
+// could not be represented". -32001 is in the implementation-defined server
+// error range. The replacement is a fixed short string, so this branch cannot
+// itself produce an over-long line.
 function respond(msg: unknown): void {
-  process.stdout.write(JSON.stringify(msg) + '\n');
+  const line = JSON.stringify(msg);
+  const size = Buffer.byteLength(line);
+  if (size > MAX_FRAME_BYTES) {
+    const id = (msg as { id?: unknown } | null)?.id ?? null;
+    process.stdout.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: -32001,
+          message:
+            `fsmcp: a ${size}-byte response exceeded the ${MAX_FRAME_BYTES}-byte frame limit and ` +
+            `was withheld rather than truncated. This is a bug in fsmcp -- every result is ` +
+            `supposed to be bounded before it reaches this point.`,
+        },
+      }) + '\n'
+    );
+    return;
+  }
+  process.stdout.write(line + '\n');
 }
 
 const rl = createInterface({ input: process.stdin, terminal: false });

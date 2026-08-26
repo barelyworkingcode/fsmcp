@@ -5,6 +5,7 @@ import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, 
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { canonicalizePath, validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
+import { capLines, MAX_RESPONSE_BYTES } from '../limits';
 import { grepBudgetMs } from './grep';
 
 const MAX_RESULTS = 1000;
@@ -319,42 +320,65 @@ export function registerGlob(registry: ToolRegistry): void {
       });
       withMtime.sort((a, b) => b.mtime - a.mtime);
 
-      const capped = withMtime.slice(0, MAX_RESULTS);
-      const timedOut = budget.expired();
       // Issue #7, outbound: every hit already passed validatePath above (the
-      // real, unmodified security check); hostToVirtualOrRedact only
-      // decides how to SHOW a path that check already accepted, and redacts
-      // rather than emits one it somehow can't map -- see vpath.ts. Issue
-      // #21's second half lives on the other side of this call: these hits
-      // are now spelled with the RESOLVED root, and `hostToVirtual` had only
-      // the operator's unresolved spelling to match against, so resolving
-      // the walk without teaching the map both spellings would have turned
-      // an empty answer into a page of redaction placeholders.
-      const result = capped.map((f) => hostToVirtualOrRedact(f.path, ctx.labels)).join('\n');
+      // real, unmodified security check); hostToVirtualOrRedact only decides
+      // how to SHOW a path that check already accepted, and redacts rather
+      // than emits one it somehow can't map -- see vpath.ts. Issue #21's
+      // second half lives on the other side of this call: these hits are now
+      // spelled with the RESOLVED root, and `hostToVirtual` had only the
+      // operator's unresolved spelling to match against, so resolving the
+      // walk without teaching the map both spellings would have turned an
+      // empty answer into a page of redaction placeholders.
+      //
+      // Rendered before the cap is applied, not after, so issue #19's byte
+      // budget measures the strings that will actually be sent rather than
+      // the host paths they were built from.
+      const rendered = withMtime
+        .slice(0, MAX_RESULTS)
+        .map((f) => hostToVirtualOrRedact(f.path, ctx.labels));
+
+      const timedOut = budget.expired();
+
+      // Issue #19: 1000 matches was a cap on the COUNT only, and a match is a
+      // whole path -- at PATH_MAX that is a megabyte of result from a bound
+      // that looks small. capLines adds the shared byte budget; the
+      // "(showing X of Y matches)" wording is unchanged.
+      const capped = capLines(rendered, MAX_RESULTS, allMatches.length);
 
       const notes: string[] = [];
-      if (allMatches.length > MAX_RESULTS) {
-        notes.push(`(showing ${MAX_RESULTS} of ${allMatches.length} matches)`);
+      if (capped.capped) {
+        const why =
+          capped.reason === 'bytes'
+            ? `, cut at fs_glob's ${MAX_RESPONSE_BYTES}-byte response limit`
+            : '';
+        notes.push(`(showing ${capped.shown} of ${capped.total} matches${why})`);
       }
       if (timedOut) {
         // Never a silent floor. An answer cut short that reads as a complete
-        // one is the same failure as the empty success in #21: correct as
-        // far as it goes, and indistinguishable from the truth.
+        // one is the same failure as the empty success in #21: correct as far
+        // as it goes, and indistinguishable from the truth.
         notes.push(
           `[fsmcp: the file walk was cut short after ${budgetMs}ms; these are the matches found ` +
             `before then, not every match in scope]`
         );
       }
 
-      if (capped.length === 0) {
+      if (capped.shown === 0) {
         // An empty answer says which KIND of empty it is, out loud. "Nothing
         // matched" and "the walk ran out of time before it could finish" are
-        // different facts about the filesystem, and a bare empty string is
-        // the one output that cannot tell them apart.
+        // different facts about the filesystem, and a bare empty string is the
+        // one output that cannot tell them apart.
         return textResult(timedOut ? notes.join('\n') : 'No matches found.');
       }
 
-      return textResult(notes.length > 0 ? `${result}\n\n${notes.join('\n')}` : result);
+      const result = textResult(
+        notes.length > 0 ? `${capped.text}\n\n${notes.join('\n')}` : capped.text
+      );
+      // `_meta.truncated` is for a caller that branches programmatically; the
+      // notes above are for a human reader. Both, never one -- issue #11's
+      // rule, applied to the two ways this result can be short of complete.
+      if (capped.capped || timedOut) result._meta = { truncated: true };
+      return result;
     }
   );
 }

@@ -321,7 +321,16 @@ test(
     const vol = makeSmallVolume(2);
     t.after(() => vol.cleanup());
 
-    const payloadSize = 1900000;
+    // Sized against fs_write's 1 MiB message limit (issue #19), not against
+    // the volume: `content` is plain ASCII here, so its wire size is its
+    // length, and anything over 1048576 is now refused for being an
+    // un-carryable request line rather than reaching the disk at all. That
+    // refusal is a different assertion from this test's, so the payload is
+    // kept comfortably inside it and the EXISTING file is made bigger
+    // instead -- the pin is "the two copies do not fit at once", and which
+    // of the two is the large one was never the point.
+    const payloadSize = 1000000;
+    const existingSize = 1500000;
 
     // Sanity half of the pin, run on the volume BEFORE `existing.txt` below
     // claims any of its space: this exact payload size fits when nothing
@@ -333,7 +342,7 @@ test(
     fs.unlinkSync(probe);
 
     const target = path.join(vol.root, 'existing.txt');
-    const before = Buffer.alloc(540000, 'A');
+    const before = Buffer.alloc(existingSize, 'A');
     fs.writeFileSync(target, before);
 
     const server = spawnServer(['--allowed-dir', vol.root]);

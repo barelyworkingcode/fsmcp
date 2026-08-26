@@ -7,10 +7,17 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 ### File System
 | Tool | Read-only | Description |
 |------|-----------|-------------|
+<<<<<<< HEAD
 | `fs_read` | yes | Read a file: a line-numbered UTF-8 text view (default), or exact bytes as base64 |
 | `fs_glob` | yes | Find files by glob pattern (relative patterns only -- see "A pattern is a pattern, not an address") |
 | `fs_grep` | yes | Search file contents with regex |
 | `fs_list` | yes | List one directory's immediate contents (non-recursive): type, size, mtime, name -- one escaped line per entry (see "`fs_list`'s line format" below) |
+=======
+| `fs_read` | yes | Read a file: a line-numbered UTF-8 text page (default), or exact bytes as base64 (whole file up to 256KiB, or a `byte_offset`/`byte_length` window of any file) |
+| `fs_glob` | yes | Find files by glob pattern |
+| `fs_grep` | yes | Search file contents with regex (bounded result: at most 1000 lines / 1MiB, and it says when it is bounded) |
+| `fs_list` | yes | List one directory's immediate contents (non-recursive): name, type, size, mtime |
+>>>>>>> fix-19-response-limit
 | `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) |
 | `fs_write` | no | Write or create files (UTF-8 text or exact bytes via base64) |
 | `fs_edit` | no | Find-and-replace string editing (literal, UTF-8 text only) |
@@ -91,16 +98,20 @@ whether the encoding you asked for can represent those bytes losslessly:
   file's exact bytes as a **bare base64 string -- no header, no trailing
   newline, no other text** (the byte count is in `_meta.bytes` instead, not
   in prose), with no line numbers, no truncation, and no decoding of any
-  kind -- `offset`/`limit` are meaningless against a byte dump and are
-  **refused**, not silently ignored, if you pass them alongside
-  `encoding: "base64"`. `fs_write`'s `"base64"` mode decodes `content` as
-  base64 and writes exactly those bytes, unmodified. This is the only way
-  to read or write a file whose content is not valid UTF-8 text -- a PNG, a
-  `.zip`, a UTF-16 file, anything. **A fidelity mode round-trips through
-  itself:** `fs_read`'s `"base64"` reply can be passed straight into
-  `fs_write`'s `content` with `encoding: "base64"`, unmodified, and that
-  composition is an identity on the file's bytes -- no stripping, no
-  reformatting, no pattern to reverse-engineer. (An earlier version of this
+  kind -- `offset`/`limit` are **line**-based and are meaningless against a
+  byte dump, so they are **refused**, not silently ignored, if you pass them
+  alongside `encoding: "base64"`. A byte range is selected with
+  `byte_offset`/`byte_length` instead: deliberately a *different pair of
+  names*, so a caller that switched encodings and left its arguments alone
+  cannot silently get byte 40 where it meant line 40. `fs_write`'s
+  `"base64"` mode decodes `content` as base64 and writes exactly those
+  bytes, unmodified. This is the only way to read or write a file whose
+  content is not valid UTF-8 text -- a PNG, a `.zip`, a UTF-16 file,
+  anything. **A fidelity mode round-trips through itself:** `fs_read`'s
+  whole-file `"base64"` reply can be passed straight into `fs_write`'s
+  `content` with `encoding: "base64"`, unmodified, and that composition is
+  an identity on the file's bytes -- no stripping, no reformatting, no
+  pattern to reverse-engineer. (An earlier version of this
   prefixed a human-readable `"[base64: N bytes]\n"` header, which broke
   exactly that: `fs_read`'s own reply was not valid input to `fs_write`'s
   own base64 decoder. It failed closed rather than corrupting anything, but
@@ -109,6 +120,8 @@ whether the encoding you asked for can represent those bytes losslessly:
   easily strip it wrong and silently corrupt the bytes -- the same failure
   this feature exists to prevent, one level up.) Text mode makes no such
   promise -- it is a documented view, not a fidelity path, and says so.
+  **A *windowed* base64 read makes no such promise either**, and the limits
+  section below says why.
 
 **Behaviour change:** earlier versions of `fs_read` auto-detected a fixed
 list of image extensions (`.png`, `.jpg`, `.gif`, …) and returned those as
@@ -208,9 +221,128 @@ during the write is roughly the old file's size plus the new one's, so a
 volume sized with no headroom to spare for its largest file can start
 seeing `ENOSPC` on writes that used to fit.
 
+<<<<<<< HEAD
 That temp file is what makes the grant root itself an invalid target for a
 write -- see "The grant root is not a writable target" below.
 
+=======
+## Response Limits: fsMCP Bounds the Message, Not the File
+
+Every result fsMCP returns is one line of JSON on stdout, and a host that
+reads that line has a maximum length for it. Relay -- the deployment fsMCP is
+built for -- reads a stdio MCP's stdout with a `bufio.Scanner` capped at
+`bridge.MaxMessageSize` = **10 MiB**, and treats an over-long line as
+**fatal**: the scanner returns `bufio.ErrTooLong`, the read loop exits, and
+nothing respawns the child. That is not one failed call. **Every later call,
+on every access profile, from every enrolled client, fails until an operator
+relaunches Relay.app by hand.**
+
+fsMCP used to bound the wrong things:
+
+- `fs_read` refused a file over 10 MiB *on disk* and then emitted up to 4/3
+  that size as base64. A perfectly ordinary 8 MB PDF produced a ~10.7 MB line
+  and took the transport down. fsMCP's own limit could never fire, because
+  the frame broke first.
+- `fs_grep` in `output_mode: "content"` bounded **nothing at all** -- not a
+  line count, not a byte count. A grep for a common word over a large granted
+  repository produced a result bounded only by how much matching text was in
+  the grant. Same permanent outage, reached without any unusual input. (The
+  two failures do not even look alike from outside: in the `fs_read` case
+  fsmcp died, in the grep case fsmcp stayed alive and relay's stdout reader
+  died.)
+
+So the rule now is a property of **every** result, not a check inside
+whichever tool was found to break first:
+
+| bound | default | what it protects |
+|---|---|---|
+| response bytes | **1 MiB** | the transport. ~10x under relay's 10 MiB frame cap. Applies to the encoded response, both encodings, and to `fs_write`'s inbound `content` -- a request line is a line too. |
+| base64 file ceiling | **256 KiB** | your context, not the transport. Base64 tokenizes at roughly 3 chars/token, so 1 MiB of file is ~460K tokens: more than twice a standard 200K window. 256 KiB is ~115K tokens -- an icon, a config blob, a certificate, a small PDF. |
+| `fs_read` allocation limit | **10 MiB** | the *process*. fsMCP is one synchronous loop; `readFileSync` of a huge file blocks and can kill the process every other caller is waiting on. Unchanged, and **not** made redundant by the two above: it answers a different question. |
+
+Measured, not estimated. Base64 inflates by exactly 4/3; text mode adds line
+numbers, a tab separator and truncation markers, and then **JSON escaping
+multiplies what is left by anything from 1x (ASCII) to 6x (a C0 control byte,
+which is valid UTF-8 and does appear in real files)**. 2000 lines of 2000
+control characters -- inside every limit fsMCP checked before -- was a ~24 MB
+line. Sizes are therefore computed with the same JSON encoder that will
+actually serialise the reply, per line, rather than with a multiplier someone
+guessed.
+
+### What each tool does when it hits the bound
+
+**Nothing is silently truncated.** A shortened result that looks complete is
+the failure this codebase exists to avoid. Every tool either refuses, or
+returns a bounded result that says so **twice** -- inline for a human,
+`_meta.truncated: true` for a program:
+
+- **`fs_read`, text mode: it pages.** The page ends at whichever comes first,
+  the line limit (2000) or the byte budget, and the reply carries
+  `[fsmcp: showing lines A-B of C ...; pass offset: D to continue reading]`
+  plus `_meta.truncated`. If bytes ended the page rather than the line limit,
+  the note says so, so a caller that asked for 2000 lines and got 700 can tell
+  that from end-of-file. This is pagination, not truncation: it names the
+  offset to resume from, and successive pages reassemble the file exactly.
+- **`fs_read`, base64 mode: it refuses.** A base64 payload has nowhere to put
+  a "there is more" marker without breaking the `fs_read` → `fs_write`
+  identity, so a silent prefix would be undetectable from the content itself.
+  A file over 256 KiB is refused whole and read with
+  `byte_offset`/`byte_length` instead.
+- **`fs_grep`, `fs_glob`, `fs_list`, `fs_find`: they cap and report.**
+  `(showing X of Y ...)` inline, `_meta.truncated` structurally, with the real
+  Y -- not the size of what survived. `fs_grep` content mode is capped at
+  1000 result lines (matching `fs_glob`'s existing cap) as well as by bytes.
+  Refusing is the wrong answer for a search: one that found too much has still
+  done useful work, and `fs_grep` has never claimed to be a fidelity path the
+  way `fs_read`'s base64 mode has.
+- **Anything else:** a last-resort backstop in the registry replaces any
+  result over the bound with an error naming the tool, and a second one at the
+  stdout write ensures no line ever leaves this process over the frame limit.
+  Reaching either is a bug in fsMCP, and the message says so.
+
+### Reading a large binary in pieces
+
+`byte_offset`/`byte_length` make the base64 ceiling honest -- without them, a
+lower ceiling would turn "kills the server" into "flatly impossible":
+
+```jsonc
+// _meta.total_bytes tells you when to stop.
+{"file_path": "/d0/scan.pdf", "encoding": "base64", "byte_offset": 0,      "byte_length": 262144}
+{"file_path": "/d0/scan.pdf", "encoding": "base64", "byte_offset": 262144, "byte_length": 262144}
+```
+
+Each window is exact bytes, bare base64, with `_meta.bytes`,
+`_meta.byte_offset` and `_meta.total_bytes`. Windowed reads work on a file of
+any size, because they use a positional read and allocate the window rather
+than the file.
+
+**Windows are for reading, not for copying.** `fs_write` has no matching byte
+offset and no append mode, so a windowed read cannot be reassembled into a
+file through fsMCP. That is deliberate, not an oversight: every `fs_write` is
+a single atomic replace (temp file + rename), and a file assembled across
+several calls is by construction not atomic, so adding a positional write
+would trade away the guarantee `fs_write` exists to make. Byte-exact
+*movement* of a large file is a copy operation, and belongs in a tool that
+never brings the bytes through fsMCP at all.
+
+### These are defaults, not facts
+
+None of the three numbers above is configurable yet. They are operator-side
+sizing, like `--allowed-dir`, and they are the right shape for the flags
+issue #16 proposes (`--max-read-bytes`, `--max-line-length`, `--max-lines`) --
+a `--max-response-bytes` and a `--max-base64-bytes` would sit **alongside**
+`--max-read-bytes`, never instead of it. Deliberately **not** exposed through
+`_meta`: a caller must not be able to raise its own ceiling, because the
+ceiling partly protects a transport shared with every other enrolment on the
+same relay, which is precisely not the calling client's to spend.
+
+fsMCP does not read relay's `MaxMessageSize` at runtime and does not pretend
+to: relay does not advertise it in the handshake, and fsMCP is a plain stdio
+MCP that also runs under other hosts with their own framing rules or none.
+What it does instead is pick a default an order of magnitude under the
+smallest cap it is known to run behind, and write the relationship down --
+here, and in `src/limits.ts`.
+>>>>>>> fix-19-response-limit
 
 ## Virtual Path Space
 
