@@ -40,6 +40,24 @@ printf '%-46s %s\n' "no file created by any of the above" \
   "$([ -e /tmp/pwned_search ] && echo "FAIL: /tmp/pwned_search exists" || echo PASS)"
 
 echo
+echo "── the search DIRECTORY cannot be a flag ──"
+# The caller supplies a path, and fs_mkdir will create a directory under any
+# name — so the argument is caller-controlled in a way the pattern is not.
+# These names are created here rather than by mkfixture.sh, because "an agent
+# can manufacture its own" is the half of the hazard worth showing.
+rm -f /tmp/pwned_pre
+t "mkdir a dir named --follow"   fs_mkdir '{"path":"--follow"}'
+t "grep with path=--follow"      fs_grep '{"pattern":"TOP SECRET","path":"--follow"}'
+t "glob with path=--follow"      fs_glob '{"pattern":"*","path":"--follow"}'
+"$HERE/call.sh" "$BIN" "$ROOT" fs_write \
+  '{"path":"_payload.txt","content":"touch /tmp/pwned_pre\n","if_sha256":null}' >/dev/null
+t "mkdir a dir named --pre=/bin/sh" fs_mkdir '{"path":"--pre=/bin/sh"}'
+t "grep with path=--pre=/bin/sh" fs_grep '{"pattern":"x","path":"--pre=/bin/sh"}'
+printf '%-46s %s\n' "rg executed nothing" \
+  "$([ -e /tmp/pwned_pre ] && echo "FAIL: /tmp/pwned_pre exists" || echo PASS)"
+rm -f /tmp/pwned_pre
+
+echo
 echo "── RIPGREP_CONFIG_PATH cannot smuggle in --follow ──"
 cat > /tmp/_rgcfg <<'EOF'
 --follow

@@ -63,10 +63,7 @@ func handleGlob(root *Root, rawArgs json.RawMessage) *proto.CallToolResult {
 		return failure
 	}
 
-	rgArgs := []string{"--files", "--null", "-g", args.Pattern}
-	if searchPath != "." {
-		rgArgs = append(rgArgs, searchPath)
-	}
+	rgArgs := appendSearchDir([]string{"--files", "--null", "-g", args.Pattern}, searchPath)
 
 	stdout, err := runRG(root, rgArgs)
 	if err != nil {

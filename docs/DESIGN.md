@@ -191,7 +191,7 @@ host-path leaks.
 ### ripgrep runs outside the boundary, so its invocation is part of it
 
 `rg` is a subprocess. `os.Root`'s openat resolution does not protect it, so
-three things about how it is invoked are load-bearing and must not be
+five things about how it is invoked are load-bearing and must not be
 simplified away:
 
 - **`--no-config`, on every invocation.** `RIPGREP_CONFIG_PATH` names a file of
@@ -202,10 +202,34 @@ simplified away:
   fsMCP's own argv defends against it.
 - **`-e <pattern>`, never a positional pattern.** A pattern beginning with `-`
   would otherwise be parsed as a flag.
+- **`--` before the search directory, always.** The same hazard as `-e`, from
+  the other end, and worse: the caller supplies a *path*, and `fs_mkdir` will
+  create a directory under any name, so the caller can manufacture an argument
+  that begins with `-`. Verified against a real binary: a directory named
+  `--follow` made `fs_grep` return the contents of a file outside the root
+  under a root-relative path, and one named `--pre=/bin/sh` made rg execute a
+  file `fs_write` had just written. fsMCP publishes no tool that runs anything;
+  without the `--` it lends ripgrep's.
+- **`--hidden` and `--no-ignore`, on every invocation.** rg's defaults skip
+  dotfiles and anything an ignore file excludes, and it reads ignore files from
+  *above* the root as well as inside it. Verified: a `.gitignore` outside the
+  root removed an in-root file from `fs_grep`'s results while `fs_list` still
+  showed it. That is `RIPGREP_CONFIG_PATH`'s hazard reached through a file
+  instead of an environment variable — something outside the boundary deciding
+  what may be seen inside it — and it is reported as a complete result, because
+  there is no `truncated` that can describe an omission the tool did not know
+  it made.
 - **argv array, never a shell string**, and **never `-L`/`--follow`.**
 
 The absence of `--follow` is what keeps the walk inside the root. `--no-config`
-is what stops the environment putting it back.
+is what stops the environment putting it back, and `--` is what stops the
+caller putting it back.
+
+`fs_glob` passes `-g <pattern>` on every call, and an explicit glob overrides
+rg's hidden/ignore filtering on its own — so `--hidden --no-ignore` changes
+nothing for it. They are stated as invariants of the invocation rather than of
+one tool precisely so that `fs_grep`, which has no mandatory `-g`, cannot drift
+away from `fs_glob` and `fs_list` about which files exist.
 
 ### `fs_grep` (read-only)
 `{pattern, path?, glob?, max_matches?}` → `{ok, matches: [{path, line, text}], truncated}`

@@ -33,10 +33,22 @@ path could reach a caller, so not wrapping is the whole defence. Use
 `fsapi.Fail(err, callerPath)`.
 
 **ripgrep runs outside the boundary.** It is a subprocess, so `os.Root` does
-not protect it. `--no-config` on every invocation (`RIPGREP_CONFIG_PATH` can
-inject `--follow`, which walks out of the root — verified), `-e` for the
-pattern so one starting with `-` is not read as a flag, argv array never a
-shell string, and never `-L`.
+not protect it. Every invocation carries `searchInvariants` (`--no-config`,
+`--hidden`, `--no-ignore`) and reaches its search directory through
+`appendSearchDir`; both live in `rg.go` and neither is a preference:
+
+- `--no-config` — `RIPGREP_CONFIG_PATH` can inject `--follow`, which walks out
+  of the root (verified).
+- `--hidden`, `--no-ignore` — rg's defaults skip dotfiles and honour ignore
+  files, **including ones above the root**, so without these something outside
+  the boundary decides what is visible inside it, and the omission is reported
+  as a complete result (verified).
+- `-e` for the pattern, and `--` before the search directory, so neither a
+  pattern nor a directory *name* beginning with `-` is read as a flag.
+  `fs_mkdir` will create a directory called `--follow` or `--pre=/bin/sh`, and
+  both were live escapes before the `--` (verified: content from outside the
+  root returned, and a written file executed).
+- argv array never a shell string, and never `-L`.
 
 **Every mutation states a precondition.** `if_sha256` distinguishes absent from
 explicit `null`; collapsing them loses the guarantee.

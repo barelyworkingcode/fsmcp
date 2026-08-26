@@ -181,3 +181,173 @@ func TestValidateSearchDirRoot(t *testing.T) {
 		t.Errorf("normalized = %q, want \".\"", normalized)
 	}
 }
+
+// --- the search directory is a path, never a flag ---
+
+// mkdirInRoot creates a directory under the root through the Root itself,
+// exactly as fs_mkdir would — which is the point: a caller can name a
+// directory anything, so the search tools must treat a name that looks like
+// an rg flag as the ordinary directory name it is.
+func mkdirInRoot(t *testing.T, root *Root, name string) {
+	t.Helper()
+	if _, err := mkdirAll(root, name); err != nil {
+		t.Fatalf("mkdirAll(%q): %v", name, err)
+	}
+}
+
+func TestAppendSearchDirEndsTheFlagsFirst(t *testing.T) {
+	got := appendSearchDir([]string{"--json", "-e", "x"}, "sub")
+	want := []string{"--json", "-e", "x", "--", "sub"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("argv = %v, want %v", got, want)
+	}
+	if only := appendSearchDir([]string{"--files"}, "."); strings.Join(only, " ") != "--files" {
+		t.Errorf("argv for the root = %v, want the flags unchanged", only)
+	}
+}
+
+// A directory named "--follow" must be searched, not obeyed. Without the "--"
+// that ends rg's flags, rg reads the name as its own --follow, drops back to
+// searching the whole root, and traverses the symlinks that leave it — so the
+// escape shows up as a match under a root-relative path and does not read as
+// an escape at all.
+func TestGrepSearchDirNamedLikeAFlagDoesNotLeaveTheRoot(t *testing.T) {
+	requireRG(t)
+	root, _ := newTestRoot(t)
+	mkdirInRoot(t, root, "--follow")
+
+	decoded := callGrep(t, root, grepArgs{Pattern: "secret", Path: "--follow"})
+	if decoded["ok"] != true {
+		t.Fatalf("ok = %v, want true (%v)", decoded["ok"], decoded)
+	}
+	if matches := grepMatches(t, decoded); len(matches) != 0 {
+		t.Errorf("matches = %v, want none — content from outside the root reached the caller", matches)
+	}
+}
+
+func TestGlobSearchDirNamedLikeAFlagDoesNotLeaveTheRoot(t *testing.T) {
+	requireRG(t)
+	root, _ := newTestRoot(t)
+	mkdirInRoot(t, root, "--follow")
+
+	decoded := callGlob(t, root, globArgs{Pattern: "*", Path: "--follow"})
+	if decoded["ok"] != true {
+		t.Fatalf("ok = %v, want true (%v)", decoded["ok"], decoded)
+	}
+	if paths := globPaths(t, decoded); len(paths) != 0 {
+		t.Errorf("paths = %v, want none — files outside the root were enumerated", paths)
+	}
+}
+
+// rg's --pre names a command rg runs over every file it searches, so a search
+// directory read as a flag is not only a containment escape but an execution
+// primitive: fsMCP publishes no tool that runs anything, and must not lend
+// ripgrep's.
+func TestGrepSearchDirCannotMakeRGRunACommand(t *testing.T) {
+	requireRG(t)
+	root, rootDir := newTestRoot(t)
+
+	sentinel := filepath.Join(t.TempDir(), "executed")
+	payload := "touch '" + sentinel + "'\n"
+	if err := os.WriteFile(filepath.Join(rootDir, "payload.txt"), []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mkdirInRoot(t, root, "--pre=/bin/sh")
+
+	callGrep(t, root, grepArgs{Pattern: "anything", Path: "--pre=/bin/sh"})
+
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("rg executed a file in the root: the search directory was parsed as --pre")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat sentinel: %v", err)
+	}
+}
+
+// --- what the search sees is the directory, not a VCS's opinion of it ---
+
+func TestSearchSeesHiddenFiles(t *testing.T) {
+	requireRG(t)
+	root, rootDir := newTestRoot(t)
+	if err := os.WriteFile(filepath.Join(rootDir, ".env"), []byte("api_key=live\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	matches := grepMatches(t, callGrep(t, root, grepArgs{Pattern: "api_key"}))
+	if len(matches) != 1 || matches[0]["path"] != ".env" {
+		t.Errorf("matches = %v, want the one in .env — a dotfile fs_list shows must not be invisible to fs_grep", matches)
+	}
+}
+
+func TestSearchIsNotFilteredByAnIgnoreFileInsideTheRoot(t *testing.T) {
+	requireRG(t)
+	root, rootDir := newTestRoot(t)
+	if err := os.WriteFile(filepath.Join(rootDir, "credentials.txt"), []byte("aws_key=AKIA\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, ".ignore"), []byte("credentials.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	matches := grepMatches(t, callGrep(t, root, grepArgs{Pattern: "aws_key"}))
+	if len(matches) != 1 || matches[0]["path"] != "credentials.txt" {
+		t.Errorf("matches = %v, want the one in credentials.txt — an ignore file is not an access control", matches)
+	}
+}
+
+// The sharpest form: the ignore file is OUTSIDE the root, so a document the
+// caller cannot see, cannot edit and was never shown decides what the search
+// reports about files that are inside it. This is the same hazard --no-config
+// closes for RIPGREP_CONFIG_PATH, reached through a file instead of an
+// environment variable.
+func TestSearchIsNotFilteredByAnIgnoreFileAboveTheRoot(t *testing.T) {
+	requireRG(t)
+	root, rootDir := newTestRoot(t)
+	if err := os.WriteFile(filepath.Join(rootDir, "credentials.txt"), []byte("aws_key=AKIA\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	above := filepath.Join(filepath.Dir(rootDir), ".ignore")
+	if err := os.WriteFile(above, []byte("credentials.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	matches := grepMatches(t, callGrep(t, root, grepArgs{Pattern: "aws_key"}))
+	if len(matches) != 1 || matches[0]["path"] != "credentials.txt" {
+		t.Errorf("matches = %v, want the one in credentials.txt — a file outside the root decided what is visible inside it", matches)
+	}
+}
+
+// DESIGN.md's "one way to do each thing" applied to the two tools that
+// enumerate: a file fs_list reports must not be missing from fs_glob, whose
+// result says "truncated": false and therefore claims to be complete.
+func TestGlobAndListAgreeOnWhichFilesExist(t *testing.T) {
+	requireRG(t)
+	root, rootDir := newTestRoot(t)
+	for name, body := range map[string]string{
+		".hidden.txt": "a\n",
+		"ignored.txt": "b\n",
+		".ignore":     "ignored.txt\n",
+		"plain.txt":   "c\n",
+	} {
+		if err := os.WriteFile(filepath.Join(rootDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	globbed := map[string]bool{}
+	for _, p := range globPaths(t, callGlob(t, root, globArgs{Pattern: "*"})) {
+		globbed[p] = true
+	}
+
+	listed, err := listDirectory(root, ".", root.MaxResponseBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range listed.Entries {
+		if e.Type != "file" {
+			continue
+		}
+		if !globbed[e.Name] {
+			t.Errorf("fs_list reports %q but fs_glob does not, while claiming a complete result", e.Name)
+		}
+	}
+}

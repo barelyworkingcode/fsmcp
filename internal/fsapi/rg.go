@@ -40,6 +40,41 @@ var errRGTimedOut = errors.New("rg timed out")
 // captured, since it writes "<path>: <reason>" and path is a host path.
 var errRGFailed = errors.New("rg failed")
 
+// searchInvariants are the flags every rg invocation carries, whatever the
+// tool asking for it. Each is deliberate, and none is a preference:
+//
+//   - --no-config: RIPGREP_CONFIG_PATH names a file of default arguments,
+//     and --follow in that file makes rg traverse symlinks out of the root.
+//     It is an environment variable, so nothing on the wire and nothing in
+//     fsMCP's own argv defends against it.
+//   - --hidden and --no-ignore: rg's defaults skip dotfiles and anything an
+//     ignore file excludes, and it reads ignore files from ABOVE the root as
+//     well as inside it. Without these, a .gitignore outside the boundary
+//     decides what a caller may see inside it, and fs_glob silently
+//     disagrees with fs_list about which files exist. An omission reported
+//     as a complete result is the failure mode here: there is no "truncated"
+//     that can describe it, so the caller cannot tell.
+var searchInvariants = []string{"--no-config", "--hidden", "--no-ignore"}
+
+// appendSearchDir appends the caller's search directory to args as a
+// POSITIONAL argument, behind the "--" that ends rg's flags.
+//
+// This is deliberate: the "--" is containment, not tidiness. rg parses any
+// argument beginning with "-" as a flag, and fs_mkdir will create a
+// directory under any name, so a caller can supply its own — "--follow"
+// makes the walk leave the root, and "--pre=<command>" makes rg execute
+// <command> on every file it searches. The same reasoning is what puts
+// fs_grep's pattern behind -e.
+//
+// "." is the root, which is already rg's cwd, so it is passed as no
+// argument at all rather than as a positional.
+func appendSearchDir(args []string, searchPath string) []string {
+	if searchPath == "." {
+		return args
+	}
+	return append(args, "--", searchPath)
+}
+
 // runRG runs rg with argv args, cwd at the root, and returns its stdout.
 // rg is never invoked through a shell and never passed -L: cwd being the
 // root plus rg's own default of not following symlinks during traversal is
@@ -54,11 +89,7 @@ func runRG(root *Root, args []string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), rgTimeout)
 	defer cancel()
 
-	// --no-config: this is deliberate. Without it, a RIPGREP_CONFIG_PATH
-	// left in the operator's environment could inject flags we never
-	// passed — including --follow, which would break the no-symlink-
-	// traversal invariant the containment argument above depends on.
-	fullArgs := append([]string{"--no-config"}, args...)
+	fullArgs := append(append([]string{}, searchInvariants...), args...)
 	cmd := exec.CommandContext(ctx, rgBinary, fullArgs...)
 	cmd.Dir = root.HostPath()
 	var stdout bytes.Buffer

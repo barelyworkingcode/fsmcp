@@ -154,6 +154,11 @@ both being refused.
 | F11 | a search that could not run at all | an error, never an empty success |
 | F12 | `rg` times out | an error naming the timeout, never a silent partial |
 | F13 | a file whose name contains a newline | one entry, intact — trivial now that results are JSON |
+| F14 | a search directory whose **name begins with `-`** (`--follow`, `-L`) | searched as the directory it is; never parsed as a flag, never leaves the root |
+| F15 | a search directory named `--pre=/bin/sh` | rg executes nothing; fsMCP lends no execution primitive it does not publish |
+| F16 | a dotfile (`.env`) `fs_list` reports | `fs_grep` searches it too |
+| F17 | an ignore file (`.gitignore`/`.ignore`) **inside** the root | does not filter the search; it is not an access control |
+| F18 | an ignore file **above** the root | does not filter the search — nothing outside the boundary decides what is visible inside it |
 
 ## G. Deletion
 

@@ -91,9 +91,7 @@ func handleGrep(root *Root, rawArgs json.RawMessage) *proto.CallToolResult {
 	// -e names the pattern explicitly, so a pattern that happens to start
 	// with '-' (e.g. "-h") is never mistaken for an rg flag.
 	rgArgs = append(rgArgs, "-e", args.Pattern)
-	if searchPath != "." {
-		rgArgs = append(rgArgs, searchPath)
-	}
+	rgArgs = appendSearchDir(rgArgs, searchPath)
 
 	stdout, err := runRG(root, rgArgs)
 	if err != nil {

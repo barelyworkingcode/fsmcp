@@ -102,6 +102,11 @@ numbered) is pinned by `TestAtomicReplaceBreaksHardLink`.
 | F11 | search that could not run → an error, never empty success | `TestGrepMissingPathIsError`, `TestGrepUnreadablePathIsError`, `TestGlobMissingPathIsError`, `TestGlobUnreadablePathIsError`, `TestGrepInvalidRegexIsRejected`, `TestRunRGBadPatternFails` | covered | covered |
 | F12 | `rg` timeout → error naming the timeout, never silent partial | `TestGrepTimeoutIsAnErrorNamingTheTimeout`, `TestRunRGTimesOut` | covered | covered |
 | F13 | filename containing a newline → one intact entry | `TestGrepHostileFilenameNewlineIsOneIntactEntry`, `TestGlobHostileFilenameNewlineIsOneIntactEntry` | covered | covered |
+| F14 | search dir named like a flag | `TestGrepSearchDirNamedLikeAFlagDoesNotLeaveTheRoot`, `TestGlobSearchDirNamedLikeAFlagDoesNotLeaveTheRoot`, `TestAppendSearchDirEndsTheFlagsFirst` | **missing** | covered |
+| F15 | search dir named `--pre=/bin/sh` | `TestGrepSearchDirCannotMakeRGRunACommand` | **missing** | covered |
+| F16 | dotfile visible to `fs_grep` | `TestSearchSeesHiddenFiles` | **missing** | covered |
+| F17 | ignore file inside the root | `TestSearchIsNotFilteredByAnIgnoreFileInsideTheRoot` | **missing** | covered |
+| F18 | ignore file above the root | `TestSearchIsNotFilteredByAnIgnoreFileAboveTheRoot` | **missing** | covered |
 
 ## G. Deletion
 
