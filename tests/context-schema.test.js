@@ -49,6 +49,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
 const { spawnServer } = require('./helpers');
 
 // The complete, intentional `allowed_dirs` declaration. Compared with a
@@ -93,9 +97,19 @@ const FORBIDDEN_SPELLINGS = [
   '',
 ];
 
-/** The parsed `initialize` result, from a freshly spawned real server. */
-async function initializeResult() {
-  const server = spawnServer([]);
+/**
+ * The parsed `initialize` result, from a freshly spawned real server.
+ *
+ * `args` and `opts` exist so a test can vary HOW the server was launched.
+ * Every assertion below reads a literal in `src/main.ts`, and a literal is
+ * only a literal until someone makes it conditional -- `cliDirs.length ? … : …`
+ * or `process.env.X || 'count'` are both edits a "make it configurable"
+ * refactor would produce, and both are invisible to a suite that only ever
+ * spawns with no argv and the ambient environment. Relay hands an MCP both:
+ * `relay mcp register` takes `--args` and `--env`.
+ */
+async function initializeResult(args = [], opts = {}) {
+  const server = spawnServer(args, opts);
   try {
     const resp = await server.request('initialize', {
       protocolVersion: '2024-11-05',
@@ -256,7 +270,7 @@ test('contextSchemaVersion reaches the wire as a JSON number, not a quoted strin
   assert.match(raw, /"contextSchemaVersion":2(?!\d)/);
   assert.ok(
     !raw.includes('"contextSchemaVersion":"2"'),
-    'contextSchemaVersion must not be quoted -- relay would fall back to v1 parsing'
+    'contextSchemaVersion must not be quoted -- relay discards the whole schema'
   );
 });
 
@@ -306,5 +320,36 @@ test('every published tool still declares both annotations as explicit booleans'
     assert.deepStrictEqual(bad, [], bad.join('; '));
   } finally {
     server.close();
+  }
+});
+
+test('the declaration does not vary with argv or the environment', async () => {
+  // A conditional disclose is the one mutation the rest of this file cannot
+  // see: every other assertion here spawns the server the same way, so a
+  // value that is "count" under `spawnServer([])` and something else under a
+  // real deployment's launch would pass all of them. Both inputs below are
+  // operator-reachable through relay's own registration CLI (`--args`,
+  // `--env`), and the argv form is the shape fsmcp's own README documents for
+  // a standalone install.
+  //
+  // The scope schema is a DECLARATION about what relay may disclose, not a
+  // setting: there is no launch under which the answer is legitimately
+  // different, which is exactly why nothing downstream would report it.
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-disclose-'));
+  try {
+    const launches = [
+      ['no arguments', [], {}],
+      ['--allowed-dir', ['--allowed-dir', sandbox], {}],
+      ['two --allowed-dir roots', ['--allowed-dir', sandbox, '--allowed-dir', os.tmpdir()], {}],
+      ['a hostile environment', [], { FSMCP_DISCLOSE: 'value', DISCLOSE: 'value', NODE_ENV: 'production' }],
+    ];
+    for (const [label, args, env] of launches) {
+      const result = await initializeResult(args, Object.keys(env).length ? { env } : {});
+      const field = result.serverInfo.contextSchema.allowed_dirs;
+      assert.strictEqual(field.disclose, 'count', `disclose changed when launched with ${label}`);
+      assert.strictEqual(result.serverInfo.contextSchemaVersion, 2, `contextSchemaVersion changed when launched with ${label}`);
+    }
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
   }
 });
