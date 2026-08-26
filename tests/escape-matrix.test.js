@@ -1194,3 +1194,270 @@ test('P4: a duplicate label fails every call closed, not just the ambiguous addr
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #24 -- the category the matrix above did not have.
+//
+// Every row up to here is an argument that points OUTSIDE the grant: a
+// lexical `../outside/`, a symlink whose target is elsewhere, a second root
+// smuggled in through `_meta`. This one points AT the boundary and escapes
+// through the implementation instead. `fs_write { file_path: "/d0" }` -- the
+// grant root itself -- passes containment, because a root is inside itself,
+// and then every write-side tool derives a SIBLING of its target:
+// `writeFileAtomic`'s temp file is `path.dirname(filePath) +
+// "/.<basename>.fsmcp-tmp-<random>"`, and fs_write's own
+// `fs.mkdirSync(path.dirname(resolvedPath), { recursive: true })` one line
+// above it is the same shape with no cleanup at all. For a root, that
+// dirname is the directory ABOVE the sandbox. Measured before the fix:
+// 5,000,000 bytes of caller-chosen content in the grant's parent, with only
+// the final rename failing (EISDIR) once the bytes were already on disk
+// there -- and `relay audit` recording a plain `tool_error` with no
+// `scope_violation`, so nothing told the operator a file had been created
+// outside the granted directory.
+//
+// The fixture here is deliberately NOT buildScopeFixture: these cases need a
+// grant whose PARENT is a directory the test owns and can make read-only,
+// which is what turns "the call failed" into "the file creation was
+// attempted in the parent" (see the read-only-parent test below). Layout:
+//
+//   <tmp>/parent/          <- outside the grant, watched and chmod'd
+//   <tmp>/parent/grant/    <- the only allowed_dir, label d0
+//   <tmp>/parent/grant/notes/note1.txt
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the issue #24 fixture and return `{ tmp, parent, grant }`.
+ * `existing: false` leaves the grant root (and its parent) uncreated -- the
+ * shape fs_mkdir's half of this bug needs, where `mkdirSync(root, {
+ * recursive: true })` creates missing ANCESTORS of the root, outside it.
+ */
+function buildRootFixture(existing = true) {
+  const tmp = mkTmpDir('fsmcp-root-');
+  const parent = path.join(tmp, 'parent');
+  const grant = path.join(parent, 'grant');
+  if (existing) {
+    fs.mkdirSync(path.join(grant, 'notes'), { recursive: true });
+    fs.writeFileSync(path.join(grant, 'notes', 'note1.txt'), 'a note\n');
+    fs.writeFileSync(path.join(grant, 'a.txt'), 'inside a.txt\n');
+    // A symlink that lives inside the grant and points back at the grant
+    // root: perfectly in scope by every check in this file, and still a
+    // path that RESOLVES to the root, which is the only thing the refusal
+    // is allowed to key off.
+    fs.symlinkSync(grant, path.join(grant, 'self'));
+  }
+  return { tmp, parent, grant };
+}
+
+/**
+ * Everything in `parent` that is not the grant itself. Empty is the only
+ * acceptable answer after a refused call: the grant's parent belongs to
+ * nobody this server is allowed to write for.
+ *
+ * A post-hoc check like this is necessary but NOT sufficient as evidence,
+ * and this file should not be read as claiming otherwise --
+ * `writeFileAtomic`'s best-effort `unlinkSync` removes the stray temp file
+ * on its way out, so on the broken build this assertion usually passes
+ * anyway and the breach is invisible to it. The read-only-parent test is
+ * the one that proves where the write was aimed.
+ */
+function strayInParent(parent) {
+  return fs.readdirSync(parent).filter((e) => e !== 'grant');
+}
+
+// The spellings that reach the same root. Only the first of them looks like
+// a root, which is the whole reason the refusal must be made on the RESOLVED
+// path rather than by comparing the argument against the label: the issue
+// confirms `/d0/notes/..` reaches it too, and `/d0/self` (a symlink inside
+// the grant pointing at the grant) reaches it without containing a single
+// suspicious character.
+const ROOT_SPELLINGS = ['/d0', '/d0/', '/d0/.', '/d0/notes/..', '/d0/self'];
+
+test('issue #24: every write-side tool refuses a target that resolves to the grant root, in every spelling', async (t) => {
+  const fx = buildRootFixture();
+  t.after(() => fs.rmSync(fx.tmp, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', fx.grant]);
+  t.after(() => server.close());
+
+  // Asserted on every case below, not just once: the refusal has to be the
+  // sandbox's own, with the audit flag relay reads, and it has to leave the
+  // parent directory alone.
+  function assertRefused(r, where) {
+    assert.equal(r.isError, true, `${where}: expected a refusal, got ${allText(r)}`);
+    assert.match(allText(r), /allowed_dir root/i, where);
+    assert.equal(
+      r._meta && r._meta.scope_violation,
+      true,
+      `${where}: a refusal that stops a write outside the grant must carry _meta.scope_violation, ` +
+        `or relay's audit records it as an ordinary tool_error and the operator never sees the boundary hold`
+    );
+    // The errno the broken build produced from three stack frames down.
+    // Named explicitly so a future change that goes back to letting the
+    // syscall answer fails here rather than passing on the message match.
+    assert.doesNotMatch(allText(r), /EISDIR|EACCES|ENOTEMPTY|illegal operation/i, where);
+    assert.deepEqual(strayInParent(fx.parent), [], `${where}: nothing may be created outside the grant`);
+    assert.ok(fs.statSync(fx.grant).isDirectory(), `${where}: the grant root must survive`);
+  }
+
+  for (const spelling of ROOT_SPELLINGS) {
+    await t.test(`fs_write ${spelling}`, async () => {
+      const r = await server.callTool('fs_write', { file_path: spelling, content: 'HELLO-OUTSIDE' });
+      assertRefused(r, `fs_write ${spelling}`);
+    });
+
+    await t.test(`fs_edit ${spelling}`, async () => {
+      const r = await server.callTool('fs_edit', {
+        file_path: spelling,
+        old_string: 'a',
+        new_string: 'b',
+      });
+      assertRefused(r, `fs_edit ${spelling}`);
+    });
+
+    await t.test(`fs_mkdir ${spelling}`, async () => {
+      const r = await server.callTool('fs_mkdir', { path: spelling });
+      assertRefused(r, `fs_mkdir ${spelling}`);
+    });
+
+    await t.test(`fs_move onto ${spelling}`, async () => {
+      const r = await server.callTool('fs_move', { source: '/d0/a.txt', destination: spelling });
+      assertRefused(r, `fs_move -> ${spelling}`);
+      assert.ok(fs.existsSync(path.join(fx.grant, 'a.txt')), 'the refused move must not have touched the source');
+    });
+
+    await t.test(`fs_move onto ${spelling} with overwrite: true`, async () => {
+      const r = await server.callTool('fs_move', {
+        source: '/d0/a.txt',
+        destination: spelling,
+        overwrite: true,
+      });
+      assertRefused(r, `fs_move (overwrite) -> ${spelling}`);
+      assert.ok(fs.existsSync(path.join(fx.grant, 'a.txt')), 'the refused move must not have touched the source');
+      assert.ok(
+        fs.existsSync(path.join(fx.grant, 'notes', 'note1.txt')),
+        'everything under the root must have survived, not just the root entry itself'
+      );
+    });
+  }
+
+  // fs_delete's half of the same rule, asserted here alongside the write
+  // half so the two are read together: same words in the message, and
+  // deliberately NOT a scope violation, because deleting the root would
+  // have removed something INSIDE the grant. That difference is the whole
+  // reason security.ts has two functions and not one.
+  await t.test('fs_delete at the root is refused with the same words, but is not a scope violation', async () => {
+    const r = await server.callTool('fs_delete', { path: '/d0', recursive: true });
+    assert.equal(r.isError, true);
+    assert.match(allText(r), /allowed_dir root/i);
+    assert.ok(
+      !r._meta || r._meta.scope_violation !== true,
+      'refusing to delete the root keeps everything inside the grant, so it is a tool error, not a scope refusal'
+    );
+    assert.ok(fs.statSync(fx.grant).isDirectory());
+  });
+});
+
+// The read-only-parent test from issue #24, and the one piece of evidence
+// that distinguishes "the call failed" from "the file was created outside
+// the grant and then cleaned up". On the broken build, with the parent at
+// 0555, the failure MOVES from the rename to the open --
+//
+//   EACCES: permission denied, open '[fsmcp: path outside the granted
+//   directories -- redacted]'
+//
+// -- which can only happen if the open was aimed at the parent, since the
+// grant itself is still perfectly writable (case C below proves that in the
+// same server, in the same state). The post-hoc readdir check in the test
+// above cannot see this at all: writeFileAtomic's catch unlinks the stray
+// temp file on the way out, so the artifact is transient in the happy path.
+// A transient breach is still a breach -- the cleanup does not run if the
+// process is killed, and the size is caller-chosen up to MAX_WRITE_BYTES --
+// but it is why this test, not that one, is the proof.
+test('issue #24: with the grant\'s parent read-only, a root-addressed write is refused by the sandbox, never attempted in the parent', async (t) => {
+  const fx = buildRootFixture();
+  // chmod back before the cleanup below, or rmSync cannot remove `grant`
+  // from inside a 0555 `parent`.
+  t.after(() => {
+    fs.chmodSync(fx.parent, 0o755);
+    fs.rmSync(fx.tmp, { recursive: true, force: true });
+  });
+  const server = spawnServer(['--allowed-dir', fx.grant]);
+  t.after(() => server.close());
+
+  fs.chmodSync(fx.parent, 0o555);
+
+  // B -- the isolating case. A refusal mentioning EACCES/open here means
+  // the write was aimed at the parent directory.
+  const atRoot = await server.callTool('fs_write', { file_path: '/d0', content: 'HELLO-OUTSIDE' });
+  assert.equal(atRoot.isError, true);
+  assert.doesNotMatch(
+    allText(atRoot),
+    /EACCES|permission denied|EISDIR/i,
+    'an errno from the parent directory means the write was attempted OUTSIDE the grant'
+  );
+  assert.match(allText(atRoot), /allowed_dir root/i);
+  assert.equal(atRoot._meta && atRoot._meta.scope_violation, true);
+
+  // C -- the control from the issue, in the same read-only-parent state:
+  // the parent's permissions are irrelevant to an ordinary write inside the
+  // grant, and must stay irrelevant. This is the assertion that a fix which
+  // over-refuses (say, one that also refused anything whose parent is not
+  // writable) would fail.
+  const inside = await server.callTool('fs_write', { file_path: '/d0/newfile.txt', content: 'HELLO-OUTSIDE' });
+  assert.equal(inside.isError, undefined, allText(inside));
+  assert.equal(fs.readFileSync(path.join(fx.grant, 'newfile.txt'), 'utf-8'), 'HELLO-OUTSIDE');
+
+  // And the same control for the other three write-side tools, so "the
+  // legitimate case still works" is pinned for each of them and not just
+  // for fs_write.
+  const edited = await server.callTool('fs_edit', {
+    file_path: '/d0/newfile.txt',
+    old_string: 'HELLO-OUTSIDE',
+    new_string: 'HELLO-INSIDE',
+  });
+  assert.equal(edited.isError, undefined, allText(edited));
+  assert.equal(fs.readFileSync(path.join(fx.grant, 'newfile.txt'), 'utf-8'), 'HELLO-INSIDE');
+
+  const made = await server.callTool('fs_mkdir', { path: '/d0/sub' });
+  assert.equal(made.isError, undefined, allText(made));
+  assert.ok(fs.statSync(path.join(fx.grant, 'sub')).isDirectory());
+
+  const moved = await server.callTool('fs_move', { source: '/d0/newfile.txt', destination: '/d0/sub/moved.txt' });
+  assert.equal(moved.isError, undefined, allText(moved));
+  assert.equal(fs.readFileSync(path.join(fx.grant, 'sub', 'moved.txt'), 'utf-8'), 'HELLO-INSIDE');
+
+  assert.deepEqual(strayInParent(fx.parent), [], 'nothing may be created outside the grant by any of the above');
+});
+
+// fs_mkdir's half of issue #24, which leaves DURABLE evidence rather than a
+// transient temp file: `fs.mkdirSync(dirPath, { recursive: true })` creates
+// every missing ancestor of its argument, so against a grant whose root
+// does not exist yet, `fs_mkdir { path: "/d0" }` created the grant's PARENT
+// -- a directory outside allowed_dirs, which stays there -- and answered
+// "Created directory: /d0" as though nothing else had happened. Nothing
+// cleans this one up, so the assertion below is direct evidence, not a
+// proxy for it.
+test('issue #24: fs_mkdir at a grant root that does not exist yet does not create the grant\'s parent', async (t) => {
+  const fx = buildRootFixture(false);
+  t.after(() => fs.rmSync(fx.tmp, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', fx.grant]);
+  t.after(() => server.close());
+
+  assert.equal(fs.existsSync(fx.parent), false, 'sanity: neither the grant nor its parent exists yet');
+
+  const r = await server.callTool('fs_mkdir', { path: '/d0' });
+
+  assert.equal(r.isError, true, `expected a refusal, got ${allText(r)}`);
+  assert.match(allText(r), /allowed_dir root/i);
+  assert.equal(r._meta && r._meta.scope_violation, true);
+  assert.equal(
+    fs.existsSync(fx.parent),
+    false,
+    "fs_mkdir must not create the grant's parent -- that is a directory outside allowed_dirs"
+  );
+
+  // The legitimate case in the same shape still works, and creating the
+  // missing root on the way to a path INSIDE it is not what this refuses.
+  const sub = await server.callTool('fs_mkdir', { path: '/d0/sub' });
+  assert.equal(sub.isError, undefined, allText(sub));
+  assert.ok(fs.statSync(path.join(fx.grant, 'sub')).isDirectory());
+});

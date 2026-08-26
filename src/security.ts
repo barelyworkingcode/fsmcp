@@ -314,7 +314,104 @@ export function checkPathNoFollowFinal(filePath: string, allowedDirs: string[]):
 }
 
 /**
+ * True when `targetPath` resolves to exactly one of `allowedDirs` -- i.e. it
+ * names a grant root itself rather than something inside one.
+ *
+ * The question is asked of the RESOLVED path, never of the string, because
+ * every one of `/d0`, `/d0/`, `/d0/.` and `/d0/notes/..` reaches the same
+ * root and only the first of them looks like it (issue #24 confirmed
+ * `/d0/notes/..` works). `canonicalizePath` already collapses `.` and
+ * applies `..` to what the path has resolved to so far, so routing both
+ * sides of the comparison through it is what makes the alias spellings one
+ * case instead of four, and makes an in-scope symlink pointing back at the
+ * root one case as well.
+ *
+ * An unresolvable `targetPath` (a symlink cycle) is not a root: the
+ * path-governed check upstream (checkPath / checkPathNoFollowFinal) already
+ * refused the call before either caller below would run, so there is no
+ * path left for them to protect.
+ */
+function resolvesToAllowedDirRoot(targetPath: string, allowedDirs: string[]): boolean {
+  const resolved = canonicalizePath(targetPath);
+  if (resolved === null) return false;
+  for (const dir of allowedDirs) {
+    if (canonicalizePath(dir) === resolved) return true;
+  }
+  return false;
+}
+
+/**
+ * ONE rule, two halves: **a path that resolves to a grant root is not a
+ * valid target for a tool that removes it (`refuseAllowedDirRoot`, below)
+ * and not a valid target for a tool that writes, creates or replaces
+ * something at it (`refuseAllowedDirRootWrite`, here).** They live next to
+ * each other, share `resolvesToAllowedDirRoot`, and word their refusal
+ * identically -- `refusing to <action> an allowed_dir root: <path>` -- so a
+ * reader (or an operator reading an audit log) sees one rule with two
+ * halves rather than two unrelated accidents that happen to rhyme.
+ *
+ * The write half is issue #24. `checkPath(<allowed_dir root>)` passes,
+ * because a root is inside itself, and then every tool that writes derives
+ * a *sibling* path from the target and lands it one level up:
+ *
+ *   - `writeFileAtomic` (fs_write, fs_edit) builds its temp file at
+ *     `path.dirname(filePath)` -- for a root, the directory ABOVE the
+ *     sandbox. Reproduced: `fs_write { file_path: "/d0", content: <5MB> }`
+ *     left `.grant.fsmcp-tmp-0d851bf52ab9`, 5,000,000 bytes of
+ *     caller-chosen content, in the grant's PARENT. Only the `rename` at
+ *     the end failed (EISDIR), and only after the bytes were already on
+ *     disk outside the grant; with the parent chmod'd 0555 the failure
+ *     moves to the `open`, which is what proves the creation was attempted
+ *     there rather than merely that the call failed.
+ *   - `fs_write`'s `fs.mkdirSync(path.dirname(resolvedPath), { recursive:
+ *     true })`, one line earlier, has the same shape and no cleanup at all.
+ *   - `fs_mkdir`'s own `fs.mkdirSync(dirPath, { recursive: true })` creates
+ *     every missing ancestor of the root, outside it. Reproduced against a
+ *     grant whose root did not exist yet: `fs_mkdir { path: "/d0" }`
+ *     answered "Created directory: /d0" and created the grant's parent on
+ *     the way.
+ *
+ * "The temp file is unlinked in `writeFileAtomic`'s catch" is not a
+ * defence: cleanup is best-effort, it does not run if the process is
+ * killed, and a transient file of caller-chosen size and caller-influenced
+ * name in `~/Documents` is still a write outside the grant. The whole claim
+ * of this server is that `allowed_dirs` is the complete answer to what a
+ * client can reach.
+ *
+ * **The write half is a `scopeViolationResult`; the delete half is a plain
+ * `errorResult`. That difference is deliberate, and it is the reason these
+ * two are not literally the same function.** `_meta.scope_violation` means
+ * "you asked for something outside your scope" and must be set on nothing
+ * else (types.ts). Servicing `fs_write` at a root really would have put
+ * bytes outside `allowed_dirs`, so refusing it is the sandbox holding, and
+ * relay's audit has to record it as such -- before this, the operator saw a
+ * bare `tool_error` carrying an `EISDIR` from three stack frames down, with
+ * nothing anywhere in the log saying a file had been created outside the
+ * granted directory. Servicing `fs_delete` at a root, by contrast, would
+ * have removed only something INSIDE the grant (the root itself); that is
+ * refused because the sandbox must survive its occupant, not because
+ * anything out of scope was addressed, so it stays an ordinary tool error.
+ *
+ * The caller-side refusal is the fix. `writeFileAtomic` asserting that
+ * `path.dirname(filePath)` is in scope is worth having as defence in depth
+ * and is deliberately NOT done here (it belongs to that file, which is
+ * being rewritten on another branch for a different issue) -- so today this
+ * function is the only thing standing between a root-addressed write and
+ * the parent directory. Do not remove a call to it without adding that
+ * assert first.
+ */
+export function refuseAllowedDirRootWrite(
+  targetPath: string,
+  allowedDirs: string[],
+  action: string
+): MCPCallResult | null {
+  if (!resolvesToAllowedDirRoot(targetPath, allowedDirs)) return null;
+  return scopeViolationResult(`refusing to ${action} an allowed_dir root: ${targetPath}`);
+}
+
+/**
  * Refuse an operation that is about to remove an allowed_dir root outright.
+ * The delete-side half of the rule above -- read that comment first.
  *
  * Originally this check lived only inside fs_delete: "the sandbox root must
  * survive its occupant." It was not actually a delete-shaped rule, though --
@@ -333,25 +430,14 @@ export function checkPathNoFollowFinal(filePath: string, allowedDirs: string[]):
  * whose syscall removes a path checks the same thing the same way, instead
  * of each mutating tool having to remember, on its own, that this is a rule
  * it also needs.
- *
- * An unresolvable `targetPath` (e.g. a symlink cycle) is not guarded here --
- * `canonicalizePath` returning null means the path-governed check upstream
- * (checkPath / checkPathNoFollowFinal) already refused the call before this
- * function would ever run, so there is no path left for this to protect.
  */
 export function refuseAllowedDirRoot(
   targetPath: string,
   allowedDirs: string[],
   action: string
 ): MCPCallResult | null {
-  const resolved = canonicalizePath(targetPath);
-  if (resolved === null) return null;
-  for (const dir of allowedDirs) {
-    if (canonicalizePath(dir) === resolved) {
-      return errorResult(`refusing to ${action} an allowed_dir root: ${targetPath}`);
-    }
-  }
-  return null;
+  if (!resolvesToAllowedDirRoot(targetPath, allowedDirs)) return null;
+  return errorResult(`refusing to ${action} an allowed_dir root: ${targetPath}`);
 }
 
 /** The result of combining CLI and _meta allowed dirs: see narrowAllowedDirs. */

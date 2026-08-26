@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, enumProp, requireStringArg, optionalStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPathV, decodeInboundPath, translateResult } from '../vpath';
+import { checkPathV, decodeInboundPath, refuseAllowedDirRootWriteV, translateResult } from '../vpath';
 import { hasLoneSurrogate, isValidBase64 } from '../encoding';
 import { writeFileAtomic } from '../atomicWrite';
 import { canonicalizePath } from '../security';
@@ -73,6 +73,25 @@ export function registerWrite(registry: ToolRegistry): void {
 
       const pathErr = checkPathV(filePath, ctx.allowedDirs, ctx.labels);
       if (pathErr) return pathErr;
+
+      // Issue #24: a path that resolves to a grant root is not a valid
+      // target for a write, and `checkPathV` above cannot say so -- a root
+      // is inside itself, so containment passes. Everything below this
+      // point then derives a SIBLING of the target and lands it one level
+      // up: `fs.mkdirSync(path.dirname(resolvedPath))` a few lines down,
+      // and `writeFileAtomic`'s `.${basename}.fsmcp-tmp-${random}` temp
+      // file after it, both of which resolve to the directory ABOVE the
+      // sandbox when the target IS the sandbox. Measured: 5,000,000 bytes
+      // of caller-chosen content written into the grant's parent, with
+      // only the final rename failing (EISDIR) once the bytes were already
+      // there. Refused here, up front, as a scope violation rather than as
+      // an incidental errno from three frames down -- see
+      // security.ts's refuseAllowedDirRootWrite for the whole rule
+      // (including why this half sets `_meta.scope_violation` and
+      // fs_delete's half does not). Checked on the RESOLVED path, so
+      // `/d0`, `/d0/`, `/d0/.` and `/d0/notes/..` are one case, not four.
+      const rootErr = refuseAllowedDirRootWriteV(filePath, ctx.allowedDirs, 'write to', ctx.labels);
+      if (rootErr) return rootErr;
 
       let bytes: Buffer;
       if (encoding === 'base64') {
