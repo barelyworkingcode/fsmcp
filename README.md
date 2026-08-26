@@ -7,12 +7,12 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 ### File System
 | Tool | Read-only | Description |
 |------|-----------|-------------|
-| `fs_read` | yes | Read file contents with line numbers |
+| `fs_read` | yes | Read a file: a line-numbered UTF-8 text view (default), or exact bytes as base64 |
 | `fs_glob` | yes | Find files by glob pattern |
 | `fs_grep` | yes | Search file contents with regex |
 | `fs_list` | yes | List one directory's immediate contents (non-recursive): name, type, size, mtime |
 | `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) |
-| `fs_write` | no | Write or create files |
+| `fs_write` | no | Write or create files (UTF-8 text or exact bytes via base64) |
 | `fs_edit` | no | Find-and-replace string editing |
 | `fs_mkdir` | no | Create a directory (recursive by default) |
 | `fs_move` | no | Move or rename a file or directory |
@@ -67,6 +67,64 @@ When fsmcp is run with `--allowed-dir` **and** a caller supplies `_meta.allowed_
 | absent | absent | empty, i.e. deny all |
 
 `--allowed-dir /` combined with a caller-supplied `_meta.allowed_dirs: ["/"]` therefore stays confined to whatever narrower scope was actually intersected in -- `_meta` cannot use a `/` (or any other directory outside the CLI grant) to escape it.
+
+## File Encoding: `fs_read`/`fs_write` Are a Pass-Through, Not a Guesser
+
+`fs_read` and `fs_write` take an `encoding` argument, `"text"` (default) or
+`"base64"`. fsMCP does not decide what a file's bytes *mean* -- it decides
+whether the encoding you asked for can represent those bytes losslessly:
+
+- **`encoding: "text"`** decodes the file as UTF-8 and returns a
+  line-numbered view (`cat -n` format, `offset`/`limit` line selection,
+  lines over 2000 characters truncated with a marker). This view is **not
+  byte-faithful**, even for a file that is perfectly clean UTF-8 -- it is
+  decoded, line-split and possibly truncated before it reaches you. If the
+  file's bytes are **not** valid UTF-8, `fs_read` refuses outright rather
+  than silently substituting U+FFFD for the bad bytes (the bug this
+  behaviour replaces: substituting U+FFFD is lossy and irreversible, and
+  writing the substituted text back corrupts the file with no warning).
+  `fs_write`'s `"text"` mode writes the UTF-8 encoding of `content`
+  verbatim -- no normalisation, no newline translation, and no
+  second-guessing of the content: if `content` itself contains U+FFFD,
+  that is written as-is, because it may be exactly what you mean.
+- **`encoding: "base64"`** is the byte-exact path: `fs_read` returns the
+  file's exact bytes as a **bare base64 string -- no header, no trailing
+  newline, no other text** (the byte count is in `_meta.bytes` instead, not
+  in prose), with no line numbers, no truncation, and no decoding of any
+  kind -- `offset`/`limit` are meaningless against a byte dump and are
+  **refused**, not silently ignored, if you pass them alongside
+  `encoding: "base64"`. `fs_write`'s `"base64"` mode decodes `content` as
+  base64 and writes exactly those bytes, unmodified. This is the only way
+  to read or write a file whose content is not valid UTF-8 text -- a PNG, a
+  `.zip`, a UTF-16 file, anything. **A fidelity mode round-trips through
+  itself:** `fs_read`'s `"base64"` reply can be passed straight into
+  `fs_write`'s `content` with `encoding: "base64"`, unmodified, and that
+  composition is an identity on the file's bytes -- no stripping, no
+  reformatting, no pattern to reverse-engineer. (An earlier version of this
+  prefixed a human-readable `"[base64: N bytes]\n"` header, which broke
+  exactly that: `fs_read`'s own reply was not valid input to `fs_write`'s
+  own base64 decoder. It failed closed rather than corrupting anything, but
+  the obvious composition of the two calls simply didn't work, and a caller
+  that "fixed" it by guessing at how to strip the header could just as
+  easily strip it wrong and silently corrupt the bytes -- the same failure
+  this feature exists to prevent, one level up.) Text mode makes no such
+  promise -- it is a documented view, not a fidelity path, and says so.
+
+**Behaviour change:** earlier versions of `fs_read` auto-detected a fixed
+list of image extensions (`.png`, `.jpg`, `.gif`, …) and returned those as
+base64 automatically. That has been removed. Deciding a file is "an image"
+from its **name** is exactly the kind of content judgement this tool no
+longer makes -- two files with identical bytes and different extensions
+must behave identically, and every other binary format (anything not on
+that fixed list) still took the lossy text path under the old behaviour.
+Read an image (or any other binary file) with `encoding: "base64"`
+explicitly instead.
+
+`fs_edit` remains text-only: it is defined over UTF-8 text (find a literal
+string, replace it), so it refuses to operate on a file whose bytes are not
+valid UTF-8 at all, rather than rewriting it as corrupted UTF-8. There is no
+base64 mode for `fs_edit` -- a byte-level splice is not a string
+replacement.
 
 ## Virtual Path Space
 
