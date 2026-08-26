@@ -233,8 +233,17 @@ see its own limits behaves worse, not better.
 by fsmcp, and `disclose` is a request. A relay older than relay#33 ignores the
 keyword entirely and renders the value -- fsmcp cannot detect which relay it is
 speaking to, cannot fail closed on the answer, and does not claim to. The
-guarantee fsmcp keeps unconditionally is the one it can: **no host path in
-anything fsmcp itself emits.** Whether the description relay writes carries one
+guarantee fsmcp keeps is the one it can: **no host path in any tool result,
+error, or search hit fsmcp emits.**
+
+That guarantee has one documented exception, and it predates this change: when
+a call's `_meta.allowed_dirs` contains an entry that is not inside any
+`--allowed-dir` root, fsmcp appends a report naming the dropped entries as raw
+host paths, on a SUCCESS result, outside the virtual path space. It is
+reachable in a relay deployment whose registration carries `--allowed-dir`
+args *and* whose profile grants a directory outside them — the two disagree,
+and the client is told which entry was discarded. `disclose` does not reach
+that surface; see the note in CLAUDE.md. Whether the description relay writes carries one
 is a property of the relay in front of it, and is worth checking with
 `relayremote list --schema` on the deployment you actually run (plain
 `list` truncates the description, which is where the note lives).
