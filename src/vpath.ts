@@ -636,7 +636,13 @@ const PATH_BOUNDARY = "(?=[/\\s:,;'\"`)\\]}>|]|$)";
  */
 export function redactLeakedHostPaths(result: MCPCallResult, labels: LabelEntry[]): MCPCallResult {
   if (!result.isError || labels.length === 0) return result;
-  const spellings = new Set(labels.flatMap(({ hostDir, realHostDir }) => [hostDir, realHostDir]));
+  // `realHostDir` is absent on a LabelEntry built by hand (a unit test, or
+  // any caller predating issue #21). Filter rather than assume: a missing
+  // spelling must cost this alarm nothing, and `escapeRegExp(undefined)`
+  // would throw from inside the one function whose job is to fail safe.
+  const spellings = new Set(
+    labels.flatMap(({ hostDir, realHostDir }) => [hostDir, realHostDir]).filter(Boolean)
+  );
   const leaked = [...spellings].some((dir) => {
     const re = new RegExp(`${escapeRegExp(dir)}${PATH_BOUNDARY}`);
     return result.content.some((item) => re.test(item.text));
