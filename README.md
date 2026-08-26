@@ -126,13 +126,60 @@ valid UTF-8 at all, rather than rewriting it as corrupted UTF-8. There is no
 base64 mode for `fs_edit` -- a byte-level splice is not a string
 replacement.
 
+### Atomic replace: what it costs and what it carries
+
 `fs_write` and `fs_edit` replace a file by writing the new content to a
 temp file in the same directory and renaming it into place, so a write that
 fails partway (a full disk, the process being killed) leaves the *original*
-file intact instead of truncated -- the tradeoff is that peak disk usage
-during the write is roughly the old file's size plus the new one's, so a
-volume sized with no headroom to spare for its largest file can start
-seeing `ENOSPC` on writes that used to fit.
+file intact instead of truncated. Two consequences follow from that, and
+both are deliberate.
+
+**Peak disk usage during the write is roughly the old file's size plus the
+new one's**, so a volume sized with no headroom to spare for its largest
+file can start seeing `ENOSPC` on writes that used to fit. On macOS the
+replace also copies the old file's bytes once more, to seed the temp file
+with the metadata described below; peak usage is unchanged by that, but the
+I/O is.
+
+**The replaced file is a new inode**, so everything the old inode carried is
+lost unless fsMCP puts it back deliberately. It does put back:
+
+- the **permission bits**, exactly -- including the ones a `umask` would
+  strip, which is why this goes through `chmod(2)` and not through the mode
+  argument of the `open(2)` that creates the temp file;
+- **extended attributes** (macOS): Finder tags and comments, Spotlight
+  metadata, `com.apple.quarantine`, and any application state hung off the
+  file;
+- the **ACL** (macOS).
+
+It does not put back, each for a reason:
+
+- **Hard links are broken.** `rename(2)` swings the name you wrote to at a
+  new inode; a second name for the old inode still points at the old inode,
+  holding the old content. This is what atomic replace *is* -- keeping the
+  link would mean writing through the shared inode, which is the
+  truncate-then-write that loses the file when it fails partway. If two
+  names for one file matter to you, fsMCP is not the tool to edit it with.
+- **setuid, setgid and the sticky bit are dropped.** Preserving an execute
+  bit across an edit does not imply preserving setuid across a rewrite;
+  fsMCP cannot produce a setuid file at all.
+- **BSD file flags** (`uchg`, `hidden`, ...) are not carried.
+- **Ownership and the old timestamps** are not restored. The replacement is
+  owned by whoever runs fsMCP, with the mtime of the write that just
+  happened -- which is correct: the file really was modified.
+
+**On platforms other than macOS, the extended-attribute and ACL half of that
+list is not implemented and those attributes are still lost.** The mechanism
+is BSD `cp -p`'s documented guarantee to carry EAs and ACLs; GNU coreutils'
+`cp -p` means something narrower and the Linux ACL model is a different
+mechanism again, so rather than ship an argv that cannot be verified on the
+platform it targets, non-macOS keeps the previous behaviour. The permission
+bit fix is portable and applies everywhere.
+
+If the target's attributes cannot be read at all (a file fsMCP can write but
+not read), the write is **refused** rather than performed -- replacing it
+would destroy metadata fsMCP cannot even enumerate, and the original is left
+untouched.
 
 ## Virtual Path Space
 
