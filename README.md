@@ -15,7 +15,7 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 | `fs_write` | no | Write or create files (UTF-8 text or exact bytes via base64) |
 | `fs_edit` | no | Find-and-replace string editing |
 | `fs_mkdir` | no | Create a directory (recursive by default) |
-| `fs_move` | no | Move or rename a file or directory |
+| `fs_move` | no | Move or rename a file or directory (renames only -- it deletes nothing) |
 | `fs_delete` | no | Delete a file, symlink, or directory |
 
 An `access: read` grant in relay admits only the five `readOnlyHint: true` tools above; `access: write` admits all ten.
@@ -285,6 +285,102 @@ fsMCP also cannot *create* a symlink: its entire mutating syscall surface is
 `tests/no-link-primitive.test.js` asserts against the source tree. A client
 therefore cannot plant its own escape hatch and then walk through it --
 every hop of which would have been correctly validated on the way out.
+
+## `fs_move` Renames. It Does Not Delete.
+
+`fs_move` makes exactly one mutating syscall, `rename(2)`, and no removal
+syscall at all. That is a guarantee about the tool, not a description of the
+common case, and it is worth stating plainly because the tool used to work
+the other way and destroyed people's files doing it.
+
+`overwrite: true` was once implemented as "unlink the destination, then
+rename onto the hole". Deleting before knowing what is being deleted produced
+three separate ways to lose data:
+
+- **A case-only rename destroyed the file.** macOS ships APFS
+  **case-insensitive** by default, so `meeting.md` and `Meeting.md` are one
+  directory entry. The unlink took the source's own bytes and the rename then
+  failed `ENOENT` with nothing left to move. Worse, fsMCP instructed the
+  caller into it: the first attempt refused with *"destination already exists
+  (pass overwrite: true to replace it)"*, and following that sentence was the
+  call that lost the file. The audit line read `tool_error` -- which tells an
+  operator the move failed, not that a file was destroyed. The same shape fired
+  on a literal self-move, on a `.`-component alias of one path, and
+  recursively when both names were the same directory.
+- **`mv file dir/` erased the directory.** The POSIX idiom every agent knows
+  was read as *replace* that directory, and a recursive delete obliged --
+  logging `ok`.
+- **A rename that failed after the unlink left the destination gone.** Most
+  visibly across two filesystems, where `rename(2)` returns `EXDEV`: the
+  destination file had already been deleted, and the caller got an error
+  message for it.
+
+### What it does now
+
+**A case-only rename simply works, with no flag.** `meeting.md` ->
+`Meeting.md` succeeds on the first call. Before any decision is made, the two
+endpoints are compared on `{dev, ino}` -- the filesystem's own answer to "are
+these one entry?" -- rather than by comparing the resolved path strings, which
+cannot know the volume is case-insensitive and never will. One inode
+comparison settles the case-only rename, the self-move and the `.`-alias at
+once, and a rename of one entry never touches `overwrite` at all. When the two
+names also resolve to the same string the reply says `nothing to move` rather
+than claiming a move that did not happen.
+
+**An existing directory destination is refused, and `overwrite: true` is not
+a way around it.** The refusal names the call you almost certainly meant:
+
+```
+$ fs_move {"source":"/d0/notes/todo.txt","destination":"/d0/projects","overwrite":true}
+destination is an existing directory: /d0/projects (3 entries). fs_move does not
+replace a directory, and overwrite: true does not either. To move
+/d0/notes/todo.txt INTO this directory, name the full destination path:
+/d0/projects/todo.txt. To replace the directory itself, delete it with fs_delete
+first.
+```
+
+The POSIX reading -- silently move *into* the directory -- was considered and
+rejected. It would make the meaning of `destination` depend on the state of the
+filesystem at the moment of the call: "the new name" usually, "the parent of
+the new name" when something happens to be a directory there. The audit log
+would then record an argument that is not where the data went, and
+`overwrite: true` would govern a path the caller never named. Refusing costs
+one corrected call, and the message writes that call out.
+
+No `replace_directory` flag was added either, mirroring `fs_delete`'s
+`recursive`. Destroying a directory tree is `fs_delete`'s job: it already
+requires the explicit `recursive: true`, already caps a recursive delete at
+10,000 entries, and already reports the act as a deletion. Spelling the
+destruction as a delete is what makes the audit log say *deleted* when
+something was deleted, instead of a line that says only "Moved". It is also
+why `fs_delete`'s entry cap has no counterpart in `fs_move`: a cap bounds a
+recursive walk about to be removed, and `fs_move` has no recursive delete to
+bound. It removes zero directory entries and creates one. The single directory
+destination it will accept is an **empty** one being replaced by another
+directory, which `rename(2)` does atomically and which destroys nothing.
+
+**A move that fails leaves both endpoints exactly as they were.** `rename(2)`
+replaces an existing file atomically all by itself, so the old unlink bought
+nothing it did not also break.
+
+**There is no copy-and-delete fallback across filesystems.** A grant can span
+two volumes, and `rename(2)` cannot cross that boundary; `fs_move` names the
+`EXDEV` case explicitly and says that nothing was changed:
+
+```
+cannot move /d0/f.txt to /d1/g.txt: they are on different filesystems, and
+fs_move only renames -- it has no copy-and-delete fallback, so nothing was
+changed. Copy the bytes with fs_read (encoding: "base64") and fs_write
+(encoding: "base64"), then remove the original with fs_delete.
+```
+
+A fallback would be a different operation wearing rename's name: not atomic,
+unable to preserve for free what a rename preserves (inode, hard links,
+extended attributes, permissions), liable to leave a half-copied file behind
+when it fails partway -- and it would put a delete back inside `fs_move`,
+which is the thing this whole section exists to rule out. The composition that
+does work is spelled out in the message, and every step of it is audited on
+its own.
 
 ## Configuration
 
