@@ -76,6 +76,32 @@ message must not say it is. One message covers both honestly:
 > traverses an absolute symlink, which is refused even when the target is
 > inside
 
+### A search directory is a directory, never a symlink to one
+
+`fs_grep` and `fs_glob` refuse a `path` that names a symlink with `not_a_dir`,
+**including a relative one that resolves inside the root** — the shape A8a
+otherwise says is reachable. The other tools do not: `fs_list` on that same
+symlink lists the target's entries and `fs_read` through one returns the
+target's bytes, so this is an asymmetry between the search tools and the rest
+of the surface, and it is stated here rather than left for a caller to discover.
+
+It is a usability cost, not a containment one. Containment does not rest on
+this refusal: `os.Root` resolves the search path before rg is ever spawned and
+refuses a symlink that leaves the root on its own. What the refusal buys is
+that ripgrep is never handed a symlink at all — rg follows one given as an
+explicit path argument even without `--follow`, so its resolution would
+otherwise have to be trusted to agree with `os.Root`'s, and "two resolvers that
+must agree" is the shape this design exists to avoid.
+
+**The refusal costs a signal, and that is the part worth knowing.** A symlink
+that escapes the root, used as a search `path`, is reported `not_a_dir` — not
+`outside_root` — because it fails the directory test before anything examines
+where it leads. So it carries no `_meta.scope_violation` marker, and relay's
+audit records an ordinary tool failure rather than a containment event. Every
+other route out of the root still reports `outside_root` and still marks it;
+this one does not. An operator reading `relay audit` for boundary probes will
+not see this one.
+
 ### A `not_found` for an absolute-looking path says why
 
 Stripping the leading `/` means `/etc/passwd` becomes `etc/passwd` and comes

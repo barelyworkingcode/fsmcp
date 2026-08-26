@@ -25,8 +25,10 @@ these must be refused, and no refusal may contain the root's host path.
 | A5 | same, target is a **directory** (`/etc`) |
 | A6 | symlink **cycle** — refused, does not hang |
 | A7 | NUL byte in a path — refused by name, never reaches a syscall |
-| A8a | a **relative** symlink that stays inside the root still works (not over-refused) |
+| A8a | a **relative** symlink that stays inside the root still works (not over-refused) — `fs_list` lists through it, `fs_read` reads through it |
 | A8b | an **absolute** symlink, even one pointing inside the root, is refused |
+| A8c | the same symlink as a **search directory** (`fs_grep`/`fs_glob` `path`) is refused `not_a_dir` — deliberate, and the one place A8a does not hold |
+| A8d | an **escaping** symlink as a search directory reports `not_a_dir`, so unlike every other escape it carries no `scope_violation` marker |
 | A9 | the root itself is addressable as `.` and as `""` |
 
 A8b is a deliberate limitation, not a bug, and is pinned as a test so it stays

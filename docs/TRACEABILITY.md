@@ -23,6 +23,8 @@ nothing covers it. Every row below is the state *after* this pass; the
 | A7 | NUL byte in path | `TestNormalizePath`, `TestReadNulByteRefused`, `TestStatNulByteRefused`, `TestMkdirNulByteRefused`, `TestGrepPatternNulByteRefused`, `TestGlobNulByteInPatternRefused` | covered | covered |
 | A8a | relative symlink staying inside works | `TestRootFollowsRelativeSymlinkInsideRoot` | **missing** — worse, the existing `link-in` fixture (docstring: "a symlink pointing inside the root") is itself absolute, so no test could have shown A8a passing | covered |
 | A8b | absolute symlink, even pointing inside, refused | `TestRootRefusesAbsoluteSymlinkEvenPointingInside` | **missing** (only `Lstat` on `link-in` was ever exercised, which never follows it) | covered |
+| A8c | symlink as a search directory refused | `TestSearchDirRefusesASymlinkThatResolvesInsideTheRoot` | **missing** | covered |
+| A8d | escaping symlink as a search dir carries no `scope_violation` | `TestSearchDirEscapingSymlinkReportsNotADir` | **missing** | covered |
 | A9 | root addressable as `.` and `""` | `TestStatRootItself`, `TestListRootDirectory`, `TestMkdirRootIsANoOpSuccess`, `TestNormalizePath` | covered | covered |
 | A10 | leak test — every tool, no root path in any output | `TestNoRootPathLeakAllTools` (new; runs all 10 registered tools through several failure modes each), `TestNoRootPathLeak` (fs_stat only) | **partial** — the only existing test (`TestNoRootPathLeak`) drove `fs_stat` and one unregistered-tool-name case; it never called `fs_write`, `fs_replace`, `fs_move`, `fs_delete`, `fs_glob`, `fs_grep`, `fs_mkdir`, `fs_list`, `fs_read` at all | covered |
 

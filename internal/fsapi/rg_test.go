@@ -1,6 +1,7 @@
 package fsapi
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -350,4 +351,86 @@ func TestGlobAndListAgreeOnWhichFilesExist(t *testing.T) {
 			t.Errorf("fs_list reports %q but fs_glob does not, while claiming a complete result", e.Name)
 		}
 	}
+}
+
+// --- a search directory is a directory, never a symlink to one (A8c/A8d) ---
+
+// A relative symlink resolving inside the root is reachable everywhere else on
+// the surface — A8a, and newTestRoot's "rel-link-in" proves it for the Root
+// itself — but not as a search directory. Pinned because it is the one place
+// A8a does not hold, and because the reason is worth keeping: rg follows a
+// symlink handed to it as an explicit path argument even without --follow, so
+// refusing here is what keeps rg's resolution from having to agree with
+// os.Root's. Containment does not depend on it; A8d covers what it costs.
+func TestSearchDirRefusesASymlinkThatResolvesInsideTheRoot(t *testing.T) {
+	requireRG(t)
+	root, rootDir := newTestRoot(t)
+	if err := os.WriteFile(filepath.Join(rootDir, "sub", "in.txt"), []byte("inside-data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("sub", filepath.Join(rootDir, "rel-dir-in")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reachable through the tools that address a path...
+	listed, err := listDirectory(root, "rel-dir-in", root.MaxResponseBytes())
+	if err != nil {
+		t.Fatalf("fs_list through an in-root relative symlink failed: %v", err)
+	}
+	if len(listed.Entries) != 1 || listed.Entries[0].Name != "in.txt" {
+		t.Errorf("fs_list entries = %v, want the symlink target's contents", listed.Entries)
+	}
+
+	// ...and refused as a search directory, by both search tools.
+	for name, decoded := range map[string]map[string]any{
+		"fs_grep": callGrep(t, root, grepArgs{Pattern: "inside", Path: "rel-dir-in"}),
+		"fs_glob": callGlob(t, root, globArgs{Pattern: "*", Path: "rel-dir-in"}),
+	} {
+		if decoded["ok"] != false {
+			t.Errorf("%s accepted a symlink as its search directory: %v", name, decoded)
+			continue
+		}
+		if code := decoded["error"].(map[string]any)["code"]; code != "not_a_dir" {
+			t.Errorf("%s error code = %v, want not_a_dir", name, code)
+		}
+	}
+}
+
+// What the refusal costs: an escaping symlink used as a search directory fails
+// the directory test before anything asks where it leads, so it reports
+// not_a_dir rather than outside_root and carries no scope_violation marker.
+// Every other route out of the root marks it. Pinned so the gap in relay's
+// audit view is a stated property rather than a surprise to whoever goes
+// looking for boundary probes and finds one route missing.
+func TestSearchDirEscapingSymlinkReportsNotADir(t *testing.T) {
+	requireRG(t)
+	root, _ := newTestRoot(t)
+
+	// newTestRoot plants "escape" (absolute) and "rel-link-out-dir" (relative),
+	// both naming the out-of-root directory holding secret.txt.
+	for _, link := range []string{"escape", "rel-link-out-dir"} {
+		result := handleGrep(root, mustJSON(t, grepArgs{Pattern: "secret", Path: link}))
+		if !result.IsError {
+			t.Fatalf("%s: an escaping symlink was accepted as a search directory", link)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if code := decoded["error"].(map[string]any)["code"]; code != "not_a_dir" {
+			t.Errorf("%s error code = %v, want not_a_dir (DESIGN.md: a search dir fails the directory test first)", link, code)
+		}
+		if result.Meta != nil {
+			t.Errorf("%s carries _meta %v; this route is documented as carrying no scope_violation marker", link, result.Meta)
+		}
+	}
+}
+
+func mustJSON(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
