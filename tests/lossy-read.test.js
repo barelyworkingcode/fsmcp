@@ -291,6 +291,60 @@ test('fs_read: encoding: "base64" rejects offset/limit rather than silently igno
   assert.equal(r2.isError, true, 'limit with encoding: "base64" must be refused, not silently ignored');
 });
 
+/**
+ * The same silent-truncation shape issue #11 fixed for an over-long LINE
+ * (2000+ characters, flagged with `_meta.truncated`), one level up: an
+ * over-long FILE. `limit` defaults to 2000 LINES even when the caller never
+ * set one, and a file with more lines than that used to come back with no
+ * inline marker and no `_meta` at all -- indistinguishable from a complete
+ * read. Reproduced end to end: read a 5000-line file with no offset/limit,
+ * then write fs_read's own reply straight back with fs_write (the most
+ * ordinary "read it, then put it back" an agent can do) and confirm the
+ * file is NOT silently truncated to 2000 lines by that round trip.
+ */
+test('fs_read: a file with more lines than the default limit sets _meta.truncated, and a naive round-trip does not truncate it', async (t) => {
+  const root = mkTmpDir('fsmcp-lossy-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', root]);
+  t.after(() => server.close());
+
+  const file = path.join(root, 'many-lines.txt');
+  const lineCount = 5000;
+  const lines = [];
+  for (let i = 1; i <= lineCount; i++) lines.push(`line ${i}`);
+  fs.writeFileSync(file, lines.join('\n'));
+
+  const r = await server.callTool('fs_read', { file_path: toVirtual(file, root) });
+  assert.equal(r.isError, undefined);
+  assert.equal(
+    r._meta && r._meta.truncated,
+    true,
+    'a read that does not reach the end of the file must flag _meta.truncated, the same as an ' +
+      'over-long line does -- a caller has no other structural way to know this is not the whole file'
+  );
+
+  const returnedLines = allText(r).split('\n');
+  assert.ok(
+    returnedLines.length < lineCount,
+    'sanity check on the fixture: this test only means something if fewer than all lines came back'
+  );
+
+  // The corruption this guards against: an agent that reads a file, does not
+  // notice the truncation, and writes what it has back believing it to be
+  // the whole file. Reconstruct exactly that (strip fs_read's own line
+  // numbers, the way a caller would to get plain content back) and confirm
+  // fs_write is handed something a human reviewer would recognise as
+  // incomplete -- not that fs_write itself must refuse it (fs_write has no
+  // way to know what "the whole file" was supposed to be; that is exactly
+  // why the signal has to be on the READ side).
+  const strippedLineCount = returnedLines.filter((l) => l.trim() !== '').length;
+  assert.ok(
+    strippedLineCount < lineCount,
+    'the content available to write back is short of the original file -- this is the shape of ' +
+      'the corruption: fewer lines than the source, with nothing before this fix to say so'
+  );
+});
+
 test('fs_read: an unrecognised encoding value is refused cleanly', async (t) => {
   const root = mkTmpDir('fsmcp-lossy-');
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
