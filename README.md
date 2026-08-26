@@ -792,11 +792,17 @@ containment event.
 
 `fs_glob`'s `pattern` describes **names underneath** the directory being
 searched. It cannot name the directory. A pattern that begins at the
-filesystem root, or that contains a `..` component -- including one hidden
-inside a brace alternative, like `{sub,..}/*` -- is refused as a scope
-violation before anything touches the disk. The directory to search is the
-`path` argument, which is a virtual address (`/d0/…`) and is validated like
-every other path in this server.
+filesystem root, or that contains a `..` component -- in any spelling, and
+including one hidden inside a brace alternative, like `{sub,..}/*` or
+`{[.][.],sub}/*` -- is refused as a scope violation before anything touches
+the disk. The directory to search is the `path` argument, which is a virtual
+address (`/d0/…`) and is validated like every other path in this server.
+
+Separately, and this is the part that does not depend on recognising the
+pattern at all: **the walk itself cannot leave the granted directories.**
+fsMCP prunes the search as it descends, refusing to enter any directory that
+is not inside the grant. A pattern nobody anticipated does not get a walk of
+the host and a filtered result; it gets no walk.
 
 **Why the refusal, rather than filtering the results.** The results were
 already filtered: every hit has always been re-checked against the grant, so
@@ -810,20 +816,36 @@ not supposed to be able to confirm a host path it guessed. **Filtering the
 output cannot close an oracle whose signal is the empty output.** The check
 has to be on the way in.
 
+**Why the pruned walk as well, rather than only the refusal.** The first
+version of this refusal was a pattern-text rule, and it was escaped: `../*`
+was refused while `[.][.]/*` and `\.\./*` -- which mean exactly the same
+thing to the glob library -- were not, so the search really did walk the
+filesystem above the granted folder, for as long as that took, on one call
+from one client, with every other client of the same server waiting behind
+it. Nothing escaped: the per-hit filter held, and the measured result was a
+traversal and a denial of service rather than a disclosure. But a rule that
+lists the ways a pattern can be written is a rule that will be escaped again,
+so containment stopped being a property of the rule and became a property of
+the walk. The refusal stayed, because *"you may not look there"* is a better
+answer than a silent empty one, and because a pattern that climbs out of the
+grant and back into it is invisible to the walk while remaining perfectly
+visible to the parser.
+
 Two more things follow from the same rule. Naming somewhere outside the grant
-is now a refusal carrying `_meta.scope_violation`, like every other tool's --
-it used to be an empty success, which quietly reported "you may not look
-there" and "there is nothing there" as the same answer. And the refusal never
+is a refusal carrying `_meta.scope_violation`, like every other tool's -- it
+used to be an empty success, which quietly reported "you may not look there"
+and "there is nothing there" as the same answer. And the refusal never
 echoes the pattern back, because a refusal that changes with its input is the
 same oracle one level up.
 
-A `..` that would have stayed inside the grant (`sub/../top.txt`) is refused
-too. That is deliberate: a path *argument* containing `..` is resolved and
-checked, but a pattern with a wildcard in front of the `..` does not resolve
-to any single path, so there is nothing to check. Rather than resolve some
-patterns and not others -- and leave a boundary between the two rules for a
-caller to probe -- every `..` in a pattern is refused, and every directory in
-scope stays reachable by naming it with `path`.
+A `..` that survives into the search is refused even when it would have
+stayed inside the grant. One that does not survive is not: `sub/../top.txt`
+is reduced to `top.txt` by the glob library itself, before any searching
+happens, so there is nothing left that could climb. Which of the two a given
+pattern is depends only on how the pattern is written, never on what is on
+disk -- `sub/../top.txt` and `nosuchdir/../top.txt` give the identical
+answer -- so this is not a way to learn anything about the host. Every
+directory in scope stays reachable by naming it with `path`.
 
 **The walk is also bounded in wall-clock time**, sharing the search budget
 `fs_grep` and `fs_find` already use. The 1000-result cap limits what is
@@ -832,9 +854,11 @@ directory it was pointed at and then report nothing, having done all the work
 anyway. fsMCP is a single synchronous process and relay drives one shared
 child, so one long walk stalls every other client of that server -- measured
 at 18 seconds for one call, with an unrelated client's trivial read blocked
-for 16 of them. A walk that runs out of budget returns what it found and
-**says that it was cut short**; it never returns a short answer that reads
-like a complete one.
+for 16 of them, and later at 44 seconds against a 30-second budget when the
+work that runs *after* the walk turned out not to be under the budget at all.
+Both the walk and the checking that follows it are under one deadline now. A
+search that runs out of budget returns what it found and **says that it was
+cut short**; it never returns a short answer that reads like a complete one.
 
 ### A granted directory has more than one name
 

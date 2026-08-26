@@ -39,6 +39,23 @@ const { spawnServer } = require('./helpers');
  *    whole duration. There is a wall-clock budget now, and -- the part that
  *    matters as much as the bound -- a walk cut short says so instead of
  *    returning a shorter list that reads as complete.
+ *
+ * Issue #36: **#25's rule was right and its enforcement was not.** The two
+ * checks were regexes over the RAW pattern text, and glob does not walk the
+ * raw text -- it walks the component list minimatch produces from it.
+ * `[.][.]/*` and `\.\./*` parse to exactly the same components as `../*` and
+ * neither regex saw a `..` in either. So the tests below come in two
+ * families now, and the second one is the point:
+ *
+ *  - the SPELLING family (`../*`, `[.][.]/*`, `\.\./*`, `{[.][.],sub}/*`)
+ *    must all get the identical refusal, because a rule that enumerates
+ *    spellings is a rule that will be escaped again;
+ *  - the WALK family asserts a property that does not mention the pattern at
+ *    all: a pattern aimed above the grant does not walk what is up there, and
+ *    cannot, whatever it is spelled like.
+ *
+ * A test that only checked the new spellings would be the same mistake one
+ * layer along -- it would pass against a third regex.
  */
 
 function textOf(result) {
@@ -154,21 +171,53 @@ test('a ".." component in a pattern is refused, including inside a brace alterna
   }
 });
 
-test('a ".." that would have stayed inside the grant is refused too -- deliberately', async (t) => {
+test('a ".." glob itself has already removed is not refused; one it keeps is (#36)', async (t) => {
   const fx = buildFixture();
   t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
 
-  // `sub/../top.txt` resolves inside the grant, and a path ARGUMENT spelled
-  // that way is accepted (canonicalizePath resolves it and the containment
-  // check passes). A PATTERN is not resolved to one path -- a pattern with a
-  // wildcard before the ".." does not have a single answer to resolve -- so
-  // there is nothing to hand the containment check, and this is refused
-  // rather than guessed at. Pinned here so the over-refusal reads as the
-  // decision it is rather than as an oversight someone later "fixes" by
-  // resolving patterns.
-  const result = await glob(fx.grant, 'sub/../top.txt');
-  assert.ok(result.isError);
-  assert.strictEqual(result._meta && result._meta.scope_violation, true);
+  // **This assertion was reversed by issue #36, and the reasoning it used to
+  // carry was reversed with it.** #25 refused `sub/../top.txt` as well, on
+  // the grounds that "a pattern is not resolved to one path -- a pattern
+  // with a wildcard before the '..' does not have a single answer to
+  // resolve -- so there is nothing to hand the containment check", and that
+  // resolving some patterns and not others would leave a boundary a caller
+  // could probe.
+  //
+  // The premise was true of a REGEX over the pattern text. It is not true of
+  // glob's own parser, which is what decides this now: minimatch collapses
+  // `<literal>/..` itself, before the walk, so the components glob is handed
+  // for `sub/../top.txt` are literally `['top.txt']`. There is no `..` left
+  // to contain, no path arithmetic happens, and refusing it would be
+  // refusing a pattern that provably cannot climb. Where the collapse does
+  // NOT happen -- a magic component next to the `..`, or a globstar before
+  // it -- the `..` survives into the component list and is refused.
+  //
+  // The boundary #25 worried about is real and is not probeable: it is drawn
+  // by the pattern text alone, never by what is on disk. `sub/../top.txt`
+  // and `nosuchdir/../top.txt` are both walked as `top.txt` and give the
+  // identical answer, so nothing about the host is visible across it.
+  const collapsed = await glob(fx.grant, 'sub/../top.txt');
+  assert.ok(!collapsed.isError, `expected a success, got: ${textOf(collapsed)}`);
+  assert.deepStrictEqual(textOf(collapsed).split('\n').filter(Boolean), ['/d0/top.txt']);
+
+  const missing = await glob(fx.grant, 'nosuchdir/../top.txt');
+  assert.strictEqual(textOf(missing), textOf(collapsed),
+    'a pattern naming a directory that exists is distinguishable from one that does not');
+
+  // ...and every shape where the `..` survives the parse is still refused.
+  // Note the first one: minimatch's collapse runs on the raw string parts,
+  // before a one-member character class is normalised to that member, so
+  // `sub/[.][.]/top.txt` keeps its `..` where `sub/../top.txt` loses it.
+  // Two spellings of one pattern, answered differently -- reported rather
+  // than smoothed over, because smoothing it over means predicting the
+  // parser again, and it costs nothing: both answers are decided by the
+  // pattern text alone, both are the same on every host, and the refusal is
+  // the conservative side of the pair.
+  for (const pattern of ['sub/[.][.]/top.txt', '**/../top.txt', 'sub/../../*', '*/../../top.txt']) {
+    const result = await glob(fx.grant, pattern);
+    assert.ok(result.isError, `${pattern}: expected a refusal, got: ${textOf(result)}`);
+    assert.strictEqual(result._meta && result._meta.scope_violation, true);
+  }
 });
 
 test('the refusal never echoes the pattern back', async (t) => {
@@ -286,4 +335,189 @@ test('an absolute pattern naming the RESOLVED form of a symlinked grant is refus
   // which is #21's fix.
   const ok = textOf(await glob(link, '**/*.txt')).split('\n').filter(Boolean);
   assert.deepStrictEqual(ok, ['/d0/sub/file.txt']);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #36 -- the ".." refusal was bypassable, and the walk left the grant
+// ---------------------------------------------------------------------------
+
+/**
+ * Every way of writing a `..` path component that this repository knows
+ * about, plus the shapes that combine one with brace expansion.
+ *
+ * They are listed as data rather than folded into one clever pattern on
+ * purpose: `../*` was the only one #25 refused, and the other five reached
+ * the filesystem. What matters is not that this list is complete -- it is
+ * not, and cannot be, which is the whole reason the containment moved into
+ * the walk -- but that every entry gets the SAME answer, which is the
+ * property a list-based rule cannot have.
+ */
+const DOTDOT_SPELLINGS = [
+  '../*',            // the literal, the only one #25 caught
+  '[.][.]/*',        // a character class per dot -- minimatch normalises it to '..'
+  '\\.\\./*',        // escaped dots -- same
+  '.[.]/*',          // one of each
+  '[.]./*',          // the other way round
+  '{[.][.],sub}/*',  // hidden in a brace alternative, first
+  '{sub,[.][.]}/*',  // hidden in a brace alternative, second
+  '[.][.]/[.][.]/*', // twice
+  '[.][.]/[.][.]/[.][.]/**/*', // three times, with a globstar under it
+];
+
+test('every spelling of a ".." component gets the identical refusal (#36)', async (t) => {
+  const fx = buildFixture();
+  t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
+
+  // Measured on the merged #25 build, against this exact fixture shape:
+  // `../*` was refused and `[.][.]/*`, `\.\./*`, `[.][.]/[.][.]/*` all came
+  // back `ok`, `{[.][.],sub}/*` came back `ok` with the in-grant hit, and
+  // `[.][.]/[.][.]/[.][.]/**/*` walked the tree above the grant.
+  const literal = await glob(fx.grant, '../*');
+  assert.ok(literal.isError);
+
+  for (const pattern of DOTDOT_SPELLINGS) {
+    const result = await glob(fx.grant, pattern);
+    assert.ok(result.isError, `${pattern}: expected a refusal, got: ${textOf(result)}`);
+    assert.strictEqual(result._meta && result._meta.scope_violation, true,
+      `${pattern}: must carry _meta.scope_violation: ${JSON.stringify(result)}`);
+    assert.strictEqual(textOf(result), textOf(literal),
+      `${pattern}: refused with different words than "../*" -- a caller can tell the spellings apart`);
+    assert.ok(!textOf(result).includes('secret.txt'), `${pattern}: hits leaked: ${textOf(result)}`);
+    assert.ok(!textOf(result).includes(pattern), `${pattern}: the refusal echoed the pattern`);
+  }
+});
+
+test('a ".." spelling cannot be used to confirm a host directory name (#36)', async (t) => {
+  const fx = buildFixture();
+  t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
+
+  // This is #25's oracle, reached through the spelling #25 did not refuse.
+  // On the merged build these three answered, in order: "/d0/top.txt",
+  // "No matches found.", "/d0/top.txt" -- so a caller could climb out of the
+  // grant, guess the grant's own directory name a character at a time, and
+  // read the answer off whether the reply was empty. It is also the case a
+  // pruned walk cannot close on its own: a correct guess climbs out and
+  // comes straight back IN, so no candidate outside the grant is ever
+  // offered to the walk's own containment hook. That is why the refusal is
+  // derived from glob's parser and not only from the walk.
+  const name = path.basename(fx.grant);
+  const correct = await glob(fx.grant, `[.][.]/${name}/*`);
+  const wrong = await glob(fx.grant, `[.][.]/${name.slice(0, -1)}X/*`);
+  const narrowing = await glob(fx.grant, `[.][.]/[a-r]${name.slice(1)}/*`);
+
+  assert.strictEqual(textOf(correct), textOf(wrong),
+    'a correct host-directory guess is distinguishable from a wrong one');
+  assert.strictEqual(textOf(correct), textOf(narrowing));
+  assert.ok(correct.isError && wrong.isError && narrowing.isError);
+  assert.ok(!textOf(correct).includes('top.txt'), `hits leaked: ${textOf(correct)}`);
+});
+
+/**
+ * A grant with a large tree living OUTSIDE it, one level up.
+ *
+ * `dirs` is what costs the walk time -- glob descends per directory -- so
+ * this is sized for a walk that is comfortably longer than the noise floor
+ * while still building in well under a second.
+ */
+function buildAboveGrantFixture(dirs = 6000) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-glob36-')));
+  const grant = path.join(root, 'grant');
+  fs.mkdirSync(grant, { recursive: true });
+  fs.writeFileSync(path.join(grant, 'top.txt'), 'in scope\n');
+  const outside = path.join(root, 'outside');
+  for (let i = 0; i < dirs; i++) {
+    const d = path.join(outside, `d${i}`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'f.txt'), 'OUT-OF-SCOPE-36\n');
+  }
+  return { root, grant, outside };
+}
+
+async function timedGlob(root, pattern, opts = {}) {
+  const server = spawnServer([], opts.env ? { env: opts.env } : {});
+  try {
+    await server.request('initialize', {});
+    const started = Date.now();
+    const result = await server.callTool('fs_glob', { pattern }, { allowed_dirs: [root] });
+    return { result, ms: Date.now() - started };
+  } finally {
+    server.close();
+  }
+}
+
+test('a pattern aimed above the grant does not walk what is up there, and never reaches the budget (#36)', async (t) => {
+  const fx = buildAboveGrantFixture();
+  t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
+
+  // Self-calibrating rather than a fixed millisecond threshold: the same
+  // tree is walked twice, once by a call that is ALLOWED to walk it (the
+  // whole fixture root is the grant) and once by a call that is pointed at
+  // it from below with a `..`. The first measures what walking it costs on
+  // whatever machine is running this; the second must not pay that cost,
+  // because it must not walk. A wall-clock constant here would either be
+  // flaky on a loaded machine or so loose it proved nothing.
+  const allowed = await timedGlob(fx.root, 'outside/**/*');
+  assert.ok(!allowed.result.isError, `calibration walk failed: ${textOf(allowed.result)}`);
+  assert.ok(allowed.ms > 120,
+    `calibration walk was too fast (${allowed.ms}ms) for this comparison to mean anything; grow the fixture`);
+
+  // The budget is deliberately set BELOW what walking that tree costs, which
+  // is what separates the two things this has to distinguish. Issue #36
+  // measured a walk running 44.08s against a 30s budget, so "it finishes
+  // eventually" is not the property to pin. A build that merely bounds the
+  // walk returns AT the budget; a build that cannot walk out of the grant at
+  // all returns in the noise, long before it.
+  const budgetMs = Math.max(50, Math.floor(allowed.ms / 2));
+  const aimedUp = await timedGlob(fx.grant, '[.][.]/outside/**/*', {
+    env: { FSMCP_GREP_TIMEOUT_MS: String(budgetMs) },
+  });
+
+  // The containment claim.
+  assert.ok(aimedUp.result.isError, `expected a refusal, got: ${textOf(aimedUp.result)}`);
+  assert.strictEqual(aimedUp.result._meta && aimedUp.result._meta.scope_violation, true);
+  assert.ok(!textOf(aimedUp.result).includes('OUT-OF-SCOPE-36'));
+  assert.ok(!/cut short/.test(textOf(aimedUp.result)),
+    'a pattern that may not walk should be refused, not reported as a truncated walk');
+
+  // The bound. On the merged #25 build this call took as long as the
+  // calibration walk (measured on this fixture: 86ms against an 89ms walk of
+  // the same tree; on a 24,000-file tree, 723-818ms against 49ms in-grant)
+  // and returned `ok`.
+  assert.ok(aimedUp.ms < budgetMs,
+    `took ${aimedUp.ms}ms of a ${budgetMs}ms budget for a pattern that must not walk at all`);
+  assert.ok(aimedUp.ms < allowed.ms / 4,
+    `a pattern aimed above the grant took ${aimedUp.ms}ms against a ${allowed.ms}ms walk of the same tree -- it walked it`);
+});
+
+test('an in-grant walk over a symlink that escapes is still a success, not a scope violation (#36)', async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-glob36-link-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const grant = path.join(root, 'grant');
+  const outside = path.join(root, 'outside');
+  fs.mkdirSync(grant, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  fs.writeFileSync(path.join(grant, 'in.txt'), 'in scope\n');
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'OUT-OF-SCOPE-36\n');
+  fs.symlinkSync(outside, path.join(grant, 'linkdir'));
+
+  // The walk's containment hook and the "the walk left the grant" refusal
+  // are deliberately NOT the same test. A symlink inside a grant pointing
+  // out of it is an ordinary thing to find in an ordinary tree, and the
+  // long-standing behaviour -- drop the hits, answer normally -- must not
+  // become a refusal now that the walk asks the containment question itself.
+  // What the refusal means is "the WALK left the grant", not "something out
+  // of scope was noticed".
+  for (const pattern of ['*/*', '**/*', 'linkdir/*']) {
+    const result = await glob(grant, pattern);
+    assert.ok(!result.isError, `${pattern}: expected a success, got: ${textOf(result)}`);
+    assert.ok(!textOf(result).includes('secret.txt'),
+      `${pattern}: a name from outside the grant reached the caller: ${textOf(result)}`);
+  }
+
+  // ...and the in-grant file is still found, so the pruning did not just
+  // turn the whole walk off.
+  assert.deepStrictEqual(
+    textOf(await glob(grant, '**/*')).split('\n').filter(Boolean),
+    ['/d0/in.txt']
+  );
 });
