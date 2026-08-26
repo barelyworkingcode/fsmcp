@@ -8,7 +8,7 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 | Tool | Read-only | Description |
 |------|-----------|-------------|
 | `fs_read` | yes | Read a file: a line-numbered UTF-8 text view (default), or exact bytes as base64 |
-| `fs_glob` | yes | Find files by glob pattern |
+| `fs_glob` | yes | Find files by glob pattern (relative patterns only -- see "A pattern is a pattern, not an address") |
 | `fs_grep` | yes | Search file contents with regex |
 | `fs_list` | yes | List one directory's immediate contents (non-recursive): name, type, size, mtime |
 | `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) |
@@ -293,6 +293,54 @@ fsMCP also cannot *create* a symlink: its entire mutating syscall surface is
 `tests/no-link-primitive.test.js` asserts against the source tree. A client
 therefore cannot plant its own escape hatch and then walk through it --
 every hop of which would have been correctly validated on the way out.
+
+### A pattern is a pattern, not an address
+
+`fs_glob`'s `pattern` describes **names underneath** the directory being
+searched. It cannot name the directory. A pattern that begins at the
+filesystem root, or that contains a `..` component -- including one hidden
+inside a brace alternative, like `{sub,..}/*` -- is refused as a scope
+violation before anything touches the disk. The directory to search is the
+`path` argument, which is a virtual address (`/d0/…`) and is validated like
+every other path in this server.
+
+**Why the refusal, rather than filtering the results.** The results were
+already filtered: every hit has always been re-checked against the grant, so
+no filename and no byte from outside it was ever returned. What leaked was
+not data, it was *answers*. An absolute pattern naming the sandbox's own real
+location came back with files; the same pattern with one character changed
+came back empty. With `?`, `*` and `[a-r]` available, that difference is a
+character-by-character search of the host's directory layout -- which is the
+exact capability the virtual path space exists to remove, since a client is
+not supposed to be able to confirm a host path it guessed. **Filtering the
+output cannot close an oracle whose signal is the empty output.** The check
+has to be on the way in.
+
+Two more things follow from the same rule. Naming somewhere outside the grant
+is now a refusal carrying `_meta.scope_violation`, like every other tool's --
+it used to be an empty success, which quietly reported "you may not look
+there" and "there is nothing there" as the same answer. And the refusal never
+echoes the pattern back, because a refusal that changes with its input is the
+same oracle one level up.
+
+A `..` that would have stayed inside the grant (`sub/../top.txt`) is refused
+too. That is deliberate: a path *argument* containing `..` is resolved and
+checked, but a pattern with a wildcard in front of the `..` does not resolve
+to any single path, so there is nothing to check. Rather than resolve some
+patterns and not others -- and leave a boundary between the two rules for a
+caller to probe -- every `..` in a pattern is refused, and every directory in
+scope stays reachable by naming it with `path`.
+
+**The walk is also bounded in wall-clock time**, sharing the search budget
+`fs_grep` and `fs_find` already use. The 1000-result cap limits what is
+returned, not what is walked: a pattern matching nothing used to walk every
+directory it was pointed at and then report nothing, having done all the work
+anyway. fsMCP is a single synchronous process and relay drives one shared
+child, so one long walk stalls every other client of that server -- measured
+at 18 seconds for one call, with an unrelated client's trivial read blocked
+for 16 of them. A walk that runs out of budget returns what it found and
+**says that it was cut short**; it never returns a short answer that reads
+like a complete one.
 
 ### A granted root that is itself a symlink
 
