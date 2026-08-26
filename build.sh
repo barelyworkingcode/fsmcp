@@ -3,40 +3,25 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/bin"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY="${1:-fsmcp}"
 
-echo "Installing dependencies..."
-npm ci
-
-echo "Building fsMCP..."
-npx tsc
-
-# Resolve node path at build time (GUI apps like Relay don't have nvm in PATH)
-NODE_BIN="$(command -v node)"
-if [ -z "$NODE_BIN" ]; then
-    echo "Error: node not found in PATH" >&2
+if ! command -v rg >/dev/null; then
+    echo "Error: ripgrep (rg) not found on PATH. fsMCP requires it and refuses to start without it." >&2
     exit 1
 fi
 
-# Create launcher script
-mkdir -p "$INSTALL_DIR"
-cat > "$INSTALL_DIR/fsmcp" << SCRIPT
-#!/bin/bash
-exec "$NODE_BIN" "$SCRIPT_DIR/dist/main.js" "\$@"
-SCRIPT
-chmod +x "$INSTALL_DIR/fsmcp"
-echo "Installed: $INSTALL_DIR/fsmcp"
+echo "Building fsMCP..."
+cd "$SCRIPT_DIR"
+go build -trimpath -o "$INSTALL_DIR/$BINARY" .
 
-# No codesign step: fsMCP runs as `node dist/main.js` via the launcher above.
-# The Mach-O process is node itself, not anything we ship, so codesign has
-# nothing meaningful to attach to. TCC will key any file-access prompts off
-# whatever cdhash your node binary happens to have (re-prompts on node upgrade);
-# bundling fsMCP into its own .app would be the only way to fix that.
+# A single static binary, so unlike the Node launcher this replaced there is a
+# real Mach-O to sign. Ad-hoc is enough to give TCC a stable identity across
+# rebuilds; without it a rebuild can re-prompt for Files & Folders access.
+codesign --force --sign - "$INSTALL_DIR/$BINARY"
 
-# Register with Relay (best-effort, relay may not be installed)
-RELAY="/Applications/Relay.app/Contents/MacOS/relay"
-if [ -x "$RELAY" ]; then
-    "$RELAY" mcp register --name fsMCP --command "$INSTALL_DIR/fsmcp"
-    echo "Registered with Relay"
-else
-    echo "Relay not found at $RELAY, skipping registration"
-fi
+echo "Installed: $INSTALL_DIR/$BINARY"
+echo
+echo "Register with Relay as one MCP per granted directory, e.g."
+echo "  command: $INSTALL_DIR/$BINARY"
+echo "  args:    [\"--root\", \"/path/to/folder\"]"
+echo "Add --read-only to publish only the five read tools."
