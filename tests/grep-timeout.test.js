@@ -174,6 +174,49 @@ test('the fallback bound is wired through a real server, not just callable', asy
   }
 });
 
+// --- issue #7: the Node fallback must not leak the host path either --------
+
+// Every other search/list tool (fs_glob, fs_find, the ripgrep path of
+// fs_grep) translates its own output through hostToVirtualOrRedact before
+// it reaches the caller. grepFallback -- the path every host without
+// ripgrep on PATH takes for fs_grep -- did not: it built each result line
+// directly from the host path it walked, on the documented assumption that
+// ToolRegistry.call's generic outbound pass (redactLeakedHostPaths) would
+// catch it. That pass is scoped to `isError` results only (PR #10 review:
+// scoping it wider is what let a whole-result rewrite corrupt fs_read's own
+// file content), and an ordinary successful search is never an error
+// result -- so the sandbox's real absolute path came back in full, in every
+// output mode, on exactly the backend issue #7 exists to cover for hosts
+// without ripgrep installed.
+test('fs_grep fallback (no ripgrep on PATH) never emits the host path, in any output mode', async (t) => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fsmcp-fallback-leak-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'needle one\nneedle two\n');
+  fs.writeFileSync(path.join(dir, 'b.txt'), 'needle three\n');
+
+  // A stand-in `rg` whose --version probe fails, so fsmcp takes the Node
+  // fallback deterministically whether or not this host has ripgrep.
+  const { bin, log } = makeFakeRg(dir, { versionExitCode: 1 });
+  const server = spawnServer(['--allowed-dir', dir], {
+    env: { PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_RG_LOG: log },
+  });
+  t.after(() => server.close());
+
+  for (const output_mode of ['files_with_matches', 'count', 'content']) {
+    const res = await server.callTool('fs_grep', { pattern: 'needle', output_mode });
+    const text = res.content[0].text;
+    assert.ok(
+      !text.includes(dir),
+      `output_mode "${output_mode}" leaked the real host directory: ${text}`
+    );
+    assert.match(
+      text,
+      /\/d0\//,
+      `output_mode "${output_mode}" should address results by their /d0/... virtual label: ${text}`
+    );
+  }
+});
+
 // --- the ripgrep path's own timeout ----------------------------------------
 
 test('a ripgrep timeout is an error naming the timeout, not a silent partial', async () => {

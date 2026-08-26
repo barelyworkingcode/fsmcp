@@ -130,7 +130,7 @@ export function registerGrep(registry: ToolRegistry): void {
       }
       return grepFallback(
         pattern, searchPaths, globFilter, typeFilter,
-        outputMode, contextLines, headLimit, grepBudgetMs(), ctx.allowedDirs
+        outputMode, contextLines, headLimit, grepBudgetMs(), ctx.allowedDirs, ctx.labels
       );
     }
   );
@@ -432,6 +432,27 @@ function grepWithRg(
  * are testing. The real call site in fs_grep's handler always passes
  * `ctx.allowedDirs`.
  *
+ * `labels` is the same kind of test seam, for the same reason, for issue #7:
+ * this function used to build every one of its own output lines directly
+ * from `file` (a host path), on the documented assumption that
+ * `ToolRegistry.call`'s generic outbound pass would translate it -- but that
+ * pass (`redactLeakedHostPaths`) was scoped to `isError` results only, in
+ * the same PR #10 review that removed the whole-result rewrite, and a
+ * SUCCESS result (an ordinary search that found matches) is exactly the
+ * case that backstop cannot touch. Confirmed: with ripgrep absent from
+ * PATH, `fs_grep` returned the sandbox's real absolute path in every output
+ * mode (`files_with_matches`, `count`, and `content`'s path column) --
+ * precisely the disclosure issue #7 exists to close, surviving intact on
+ * this one backend. `labels` is `undefined` by default so the ReDoS-budget
+ * tests below, which construct a bare tmp directory with no concept of
+ * `allowed_dirs` or labels at all, keep asserting against the exact host
+ * path they created (translating with an empty label set would REDACT it
+ * instead, which is not what those tests are about); the real call site in
+ * fs_grep's handler always passes `ctx.labels`. Only the PATH column is
+ * translated -- `lines[idx]` in content mode is the file's own matched
+ * text, which must reach the caller byte for byte the same way
+ * `formatRgJson`'s `lines.text` does.
+ *
  * Exported so a test can hand it a small budget directly.
  */
 export function grepFallback(
@@ -444,7 +465,14 @@ export function grepFallback(
   headLimit: number | undefined,
   budgetMs: number = grepBudgetMs(),
   allowedDirsForRevalidation?: string[],
+  labels?: LabelEntry[],
 ) {
+  // See this function's doc: translate only when a real call site supplied
+  // labels at all. `hostToVirtualOrRedact` would otherwise treat "no labels
+  // passed" the same as "labels is genuinely empty" and redact every path,
+  // which is right for a real empty-scope call but wrong for the unit tests
+  // below that never had a concept of labels to begin with.
+  const displayPath = (f: string): string => (labels === undefined ? f : hostToVirtualOrRedact(f, labels));
   const deadline = Date.now() + budgetMs;
   const expired = () => Date.now() >= deadline;
 
@@ -502,11 +530,11 @@ export function grepFallback(
     if (matchingLines.length > 0) {
       switch (outputMode) {
         case 'files_with_matches':
-          results.push(file);
+          results.push(displayPath(file));
           resultCount++;
           break;
         case 'count':
-          results.push(`${file}:${matchingLines.length}`);
+          results.push(`${displayPath(file)}:${matchingLines.length}`);
           resultCount++;
           break;
         case 'content': {
@@ -518,8 +546,13 @@ export function grepFallback(
             }
           }
           const sortedLines = [...shown].sort((a, b) => a - b);
+          // lines[idx] is the file's own matched text -- never translated,
+          // same rule formatRgJson's lines.text and fs_read's own bytes
+          // follow (PR #10: a whole-result rewrite used to corrupt exactly
+          // this kind of content).
+          const shownPath = displayPath(file);
           for (const idx of sortedLines) {
-            results.push(`${file}:${idx + 1}:${lines[idx]}`);
+            results.push(`${shownPath}:${idx + 1}:${lines[idx]}`);
           }
           resultCount += matchingLines.length;
           break;
