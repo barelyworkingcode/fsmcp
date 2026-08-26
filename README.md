@@ -1,6 +1,6 @@
 # fsMCP
 
-MCP server providing file system tools via stdio. Gives LLMs the ability to read, write, edit, create, move, delete, list and search the local file system -- all confined to a set of allowed directories, with no path out of the sandbox and no shell.
+MCP server providing file system tools via stdio. Gives LLMs the ability to read, write, edit, create, move, delete, list and search the local file system -- all confined to a set of allowed directories, with no path out of the sandbox and no shell. A client addresses files in a virtual path space (`/d0/…`) rooted at its own grant; it never sees, and cannot supply, the real host path underneath (see "Virtual Path Space" below).
 
 ## Tools
 
@@ -67,6 +67,76 @@ When fsmcp is run with `--allowed-dir` **and** a caller supplies `_meta.allowed_
 | absent | absent | empty, i.e. deny all |
 
 `--allowed-dir /` combined with a caller-supplied `_meta.allowed_dirs: ["/"]` therefore stays confined to whatever narrower scope was actually intersected in -- `_meta` cannot use a `/` (or any other directory outside the CLI grant) to escape it.
+
+## Virtual Path Space
+
+A client never sees a host path, in either direction. It addresses files in a
+virtual space rooted at its own grant:
+
+```
+    client says            fsmcp acts on
+    /d0/notes/a.txt   ->   /Users/admin/projects/myapp/notes/a.txt
+    /proj/README.md   ->   /Users/admin/projects/myapp/README.md   (explicit label)
+    /d1/README.md     ->   /Volumes/Work/docs/README.md
+```
+
+**Why.** Before this, `fs_list`, `fs_glob`/`fs_find`/`fs_grep`, every success
+message ("Wrote 2 bytes to /Users/admin/…") and every raw syscall error
+("`ENOTEMPTY: directory not empty, rmdir '/Users/…'`") handed a client the
+absolute host path of its own sandbox -- which discloses the account name and
+the host's directory layout above the root to a client that, in the
+deployment this was found in, sits on a different machine and cannot even
+reach that path. It was never a containment hole (`allowed_dirs` held either
+way), but it was free reconnaissance a client had no reason to be given.
+
+**Labels.** Every allowed directory gets a label, and a path is always
+`/<label>/…` -- including when there is only one root, so that adding a
+second one later never silently reshapes every path a client has already
+learned or stored. Two ways a directory gets its label:
+
+1. An `allowed_dirs` entry (a `--allowed-dir` flag, or an entry of relay's
+   per-token `_meta.allowed_dirs`) written `label=/abs/path` uses `label`
+   explicitly. This is still a plain string, so it needs no schema change on
+   either the CLI or relay's `_meta` side.
+2. Otherwise, the label is `d<N>` by position in that call's *effective*
+   scope (after CLI/`_meta` narrowing, C1) -- `d0`, `d1`, ... Positional
+   labels move if an operator reorders `allowed_dirs` or a per-call `_meta`
+   narrows it into a different order, which renames a client's paths.
+   **Use an explicit label for anything a client is expected to remember
+   across calls or sessions.**
+
+**Inbound and outbound are asymmetric, on purpose.** A path argument
+(`file_path`, `path`, `source`, `destination`) must be `/<label>/…` --
+fsmcp does **not** also accept an absolute host path as a convenience
+alongside the virtual form, because that would hand back exactly the probe
+oracle this feature exists to close: a client that can guess a host path
+could otherwise use fsmcp to confirm it. Decoding a virtual address is a
+*translation* layer on top of the existing containment check, never a
+replacement for it -- the decoded host path still runs through the same
+`validatePath`/`validatePathNoFollowFinal` every argument has always run
+through (symlinks, `..`, dangling links, canonicalisation, all unchanged).
+Outbound, every path in every result and every error is translated back to
+its virtual form; a host path that cannot be mapped back to any granted
+label is **redacted, not emitted** -- that case means something reached the
+client from outside the grant, which would be a bug, and a redacted string
+is the right output for a bug of that shape, not the raw path.
+
+**Deliberately unchanged.** `--allowed-dir` and `_meta.allowed_dirs`
+themselves keep taking absolute **host** paths -- those are operator/relay
+side, and the operator (or whatever configured relay) knows where its own
+disk is. Relay's audit log also keeps absolute host paths: it is relay's
+ground truth, read by the operator, not the client, and redacting it would
+undermine the very thing an operator uses it to verify.
+
+**The other half of this lives in relay.** Relay currently appends the raw
+`allowed_dirs` value into every governed tool's *description* text at
+`tools/list` time (`router.go:840`), so a client that never sees a host path
+from a fsmcp *result* can still read one out of the tool *description* handed
+to it before it ever calls anything. That is filed as **barelyworkingcode/relay#33**
+(see **[Relay](../relay)**) -- the two halves are independently useful and
+independently shippable (this one still removes every path fsmcp itself
+emits), but the disclosure this issue describes is not fully closed until
+both have landed.
 
 ### A symlink out of the sandbox is refused, even one a human placed
 
