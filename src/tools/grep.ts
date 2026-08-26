@@ -5,6 +5,7 @@ import { ToolRegistry, schema, stringProp, intProp, enumProp, requireStringArg, 
 import { textResult, errorResult, scopeViolationResult, ToolContext, LabelEntry } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact } from '../vpath';
+import { decodeUtf8Strict } from '../encoding';
 
 // Detect ripgrep at load time.
 //
@@ -506,7 +507,20 @@ export function grepFallback(
 
     let content: string;
     try {
-      content = fs.readFileSync(file, 'utf-8');
+      // Issue #11: `fs.readFileSync(file, 'utf-8')` silently substitutes
+      // U+FFFD for any byte that is not valid UTF-8, so a match against
+      // (or reported line of) the substituted string is not what is
+      // actually on disk -- exactly the corruption fs_read now refuses
+      // outright. This tool only reports, it never writes, so there is no
+      // write-back to corrupt, but reporting a lossily-decoded line is
+      // still handing the caller text that does not match the file, with
+      // no way to tell. Skipped the same way an unreadable file already is
+      // (the catch below), so fs_grep agrees with fs_read about what it
+      // declines to decode: read as raw bytes first, decode strictly, and
+      // treat a decode failure as "cannot search this file's content" --
+      // not as "found nothing", which is why `filesSearched` is only
+      // incremented once a file's content is actually usable.
+      content = decodeUtf8Strict(fs.readFileSync(file));
     } catch {
       continue;
     }
