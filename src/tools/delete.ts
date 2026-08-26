@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPathNoFollowFinal, canonicalizePath } from '../security';
+import { checkPathNoFollowFinal, refuseAllowedDirRoot } from '../security';
 
 // C3: cap total entries a single recursive delete may remove, so a runaway
 // (or a caller-supplied path several directories too high) is a loud
@@ -93,15 +93,13 @@ export function registerDelete(registry: ToolRegistry): void {
       // recursive delete of the allowed_dir root removes the very directory
       // allowed_dirs points at, and every call after it refuses with "path
       // is outside allowed directories" for a root that no longer exists to
-      // be inside of -- the tool would have deleted its own floor.
-      const resolvedTarget = canonicalizePath(targetPath);
-      if (resolvedTarget !== null) {
-        for (const dir of ctx.allowedDirs) {
-          if (canonicalizePath(dir) === resolvedTarget) {
-            return errorResult(`refusing to delete an allowed_dir root: ${targetPath}`);
-          }
-        }
-      }
+      // be inside of -- the tool would have deleted its own floor. Shared
+      // with fs_move (security.ts's refuseAllowedDirRoot): this is a rule
+      // about the `fs.rmSync(recursive: true)` syscall, not a rule specific
+      // to this tool's name, and fs_move makes that same call in its
+      // `overwrite: true` branch.
+      const rootErr = refuseAllowedDirRoot(targetPath, ctx.allowedDirs, 'delete');
+      if (rootErr) return rootErr;
 
       // A symlink is unlinked directly, whether or not `recursive` was
       // passed and regardless of what it points at -- following it, even to

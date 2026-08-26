@@ -598,6 +598,43 @@ test('fs_move refuses to move a directory into itself', async (t) => {
   assert.equal(fs.existsSync(destination), false);
 });
 
+// fs_move's `overwrite: true` branch is a recursive delete
+// (`fs.rmSync(destination, { recursive: true, force: true })`) wearing this
+// tool's name -- and fs_delete's "refusing to delete an allowed_dir root"
+// guard was never mirrored here. checkPath(destination) passes for the
+// allowed_dir root itself, because a root is inside itself, so moving
+// anything onto the root with overwrite: true reached that rmSync
+// unguarded and erased the entire sandbox root -- the tool call itself then
+// reported a plain "move failed: ENOENT" (rename onto a destination that
+// rmSync had just deleted out from under it), giving no hint that the
+// actual damage was the loss of the root directory. Fixed by hoisting
+// fs_delete's guard into security.ts's refuseAllowedDirRoot and applying it
+// to fs_move's overwrite branch too.
+test('fs_move with overwrite:true onto the allowed_dir root does not erase the root', async (t) => {
+  const fx = buildScopeFixture();
+  t.after(() => removeFixture(fx));
+  const server = spawnServer(['--allowed-dir', fx.root]);
+  t.after(() => server.close());
+
+  const source = path.join(fx.root, 'a.txt');
+  assert.ok(fs.existsSync(source), 'sanity: the file this test moves must exist beforehand');
+
+  const r = await server.callTool('fs_move', {
+    source,
+    destination: fx.root,
+    overwrite: true,
+  });
+
+  assert.equal(r.isError, true, 'moving onto the allowed_dir root with overwrite must be refused');
+  assert.match(allText(r), /allowed_dir root/i);
+  assert.ok(fs.statSync(fx.root).isDirectory(), 'the sandbox root must still exist');
+  assert.ok(fs.existsSync(source), 'the refused move must not have touched the source file either');
+  assert.ok(
+    fs.existsSync(path.join(fx.root, 'notes', 'note1.txt')),
+    'everything else that lived under the root must have survived, not just the root entry itself'
+  );
+});
+
 // C3's entry cap: a runaway (or a caller-supplied path several directories
 // too high) must be a loud refusal, not "however long it takes to remove
 // everything under it" -- and, just as importantly, not a PARTIAL delete

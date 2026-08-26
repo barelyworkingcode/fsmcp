@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { checkPath, canonicalizePath } from '../security';
+import { checkPath, canonicalizePath, refuseAllowedDirRoot } from '../security';
 
 export function registerMove(registry: ToolRegistry): void {
   registry.register(
@@ -67,6 +67,19 @@ export function registerMove(registry: ToolRegistry): void {
         return errorResult(
           `destination already exists: ${destination} (pass overwrite: true to replace it)`
         );
+      }
+
+      // `overwrite: true` on an existing destination is a recursive delete
+      // wearing this tool's name (see the rmSync call just below) -- and
+      // checkPath(destination) above passes for an allowed_dir root itself,
+      // because a root is inside itself. Without this, `fs_move { source:
+      // "<root>/a.txt", destination: "<root>", overwrite: true }` reached
+      // that rmSync with nothing guarding it and erased the sandbox root.
+      // Same guard fs_delete uses (security.ts's refuseAllowedDirRoot),
+      // applied here because this is the other place that syscall happens.
+      if (destExists) {
+        const rootErr = refuseAllowedDirRoot(destination, ctx.allowedDirs, 'overwrite');
+        if (rootErr) return rootErr;
       }
 
       try {

@@ -313,6 +313,47 @@ export function checkPathNoFollowFinal(filePath: string, allowedDirs: string[]):
   return isScopeViolationMessage(message) ? scopeViolationResult(message) : errorResult(message);
 }
 
+/**
+ * Refuse an operation that is about to remove an allowed_dir root outright.
+ *
+ * Originally this check lived only inside fs_delete: "the sandbox root must
+ * survive its occupant." It was not actually a delete-shaped rule, though --
+ * it is a rule about the syscall `fs.rmSync(recursive: true)`, and fs_delete
+ * is not the only tool that makes that call. fs_move's `overwrite: true`
+ * branch runs exactly the same `fs.rmSync(destination, { recursive: true,
+ * force: true })` to clear the destination before renaming onto it, with no
+ * guard of its own -- a recursive delete wearing fs_move's name rather than
+ * fs_delete's. `checkPath(<allowed_dir root>)` passes, because a root is
+ * inside itself, so
+ *
+ *     fs_move { source: "<root>/a.txt", destination: "<root>", overwrite: true }
+ *
+ * reached that rmSync with nothing standing between the caller and the
+ * sandbox root, and erased it. Hoisting the guard here means every tool
+ * whose syscall removes a path checks the same thing the same way, instead
+ * of each mutating tool having to remember, on its own, that this is a rule
+ * it also needs.
+ *
+ * An unresolvable `targetPath` (e.g. a symlink cycle) is not guarded here --
+ * `canonicalizePath` returning null means the path-governed check upstream
+ * (checkPath / checkPathNoFollowFinal) already refused the call before this
+ * function would ever run, so there is no path left for this to protect.
+ */
+export function refuseAllowedDirRoot(
+  targetPath: string,
+  allowedDirs: string[],
+  action: string
+): MCPCallResult | null {
+  const resolved = canonicalizePath(targetPath);
+  if (resolved === null) return null;
+  for (const dir of allowedDirs) {
+    if (canonicalizePath(dir) === resolved) {
+      return errorResult(`refusing to ${action} an allowed_dir root: ${targetPath}`);
+    }
+  }
+  return null;
+}
+
 /** The result of combining CLI and _meta allowed dirs: see narrowAllowedDirs. */
 export interface NarrowedDirs {
   allowedDirs: string[];
