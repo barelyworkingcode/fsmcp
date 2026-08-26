@@ -5,7 +5,7 @@ import { textResult, errorResult, ToolContext } from '../types';
 import { checkPathV, decodeInboundPath, refuseAllowedDirRootWriteV, translateResult } from '../vpath';
 import { hasLoneSurrogate, isValidBase64 } from '../encoding';
 import { writeFileAtomic } from '../atomicWrite';
-import { canonicalizePath } from '../security';
+import { canonicalizePath, refuseMissingAllowedDirRoot } from '../security';
 
 // C5 ("max bytes on fs_read and fs_write"), same reasoning as fs_read's
 // MAX_READ_BYTES: an unbounded write is an unbounded synchronous allocation
@@ -92,6 +92,25 @@ export function registerWrite(registry: ToolRegistry): void {
       // `/d0`, `/d0/`, `/d0/.` and `/d0/notes/..` are one case, not four.
       const rootErr = refuseAllowedDirRootWriteV(filePath, ctx.allowedDirs, 'write to', ctx.labels);
       if (rootErr) return rootErr;
+
+      // Issue #33: the same rule one step wider. `fs.mkdirSync(dir, {
+      // recursive: true })` below walks UP until it finds a directory that
+      // exists, and it has no idea where the grant is -- if the grant root
+      // itself does not exist, the root is just another missing component on
+      // the way and every ancestor above it gets created too. Measured: a
+      // grant at `<R>/level1/level2/level3/grant` with only `<R>` on disk,
+      // one `fs_write { file_path: "/d0/sub/file.txt" }`, and three new
+      // directories OUTSIDE the boundary, reported as `Wrote 31 bytes`.
+      // `checkPathV` passes it because the path really is inside the grant;
+      // this is not a scope violation and is deliberately not flagged as
+      // one (see security.ts). Refusing here, before mkdirSync, is what
+      // bounds the recursive create at the grant root -- with the root
+      // present, every directory the walk can create is a strict descendant
+      // of it, which is fs_write's documented job and is unaffected.
+      // Translated against ctx.allowedDirs, not [filePath]: this refusal
+      // names the GRANT, not the caller's path.
+      const grantErr = refuseMissingAllowedDirRoot(filePath, ctx.allowedDirs, 'write');
+      if (grantErr) return translateResult(grantErr, ctx.allowedDirs, ctx.labels);
 
       let bytes: Buffer;
       if (encoding === 'base64') {

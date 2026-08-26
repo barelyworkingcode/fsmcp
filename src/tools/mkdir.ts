@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import { ToolRegistry, schema, stringProp, boolProp, parseBoolArg, requireStringArg, virtualPathDescription } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
+import { refuseMissingAllowedDirRoot } from '../security';
 import { checkPathV, decodeInboundPath, describeError, refuseAllowedDirRootWriteV, translateResult } from '../vpath';
 
 export function registerMkdir(registry: ToolRegistry): void {
@@ -58,6 +59,22 @@ export function registerMkdir(registry: ToolRegistry): void {
       // fs_write's is -- servicing it puts a directory outside the grant.
       const rootErr = refuseAllowedDirRootWriteV(dirPath, ctx.allowedDirs, 'create', ctx.labels);
       if (rootErr) return rootErr;
+
+      // Issue #33: #24's rule covered `path` BEING the root. This covers an
+      // ordinary path inside the grant whose ancestors -- including the
+      // grant root -- are not there. `fs.mkdirSync(dirPath, { recursive:
+      // true })` below walks up until it finds something that exists, so
+      // against a grant at `<R>/level1/level2/level3/grant` where only `<R>`
+      // exists, `fs_mkdir { path: "/d0/sub" }` creates three directories
+      // above the boundary and answers "Created directory: /d0/sub".
+      // Checked whether or not `recursive` is set: with `recursive: false`
+      // the syscall would fail ENOENT and create nothing, but "no such file
+      // or directory" is the answer that makes a client retry, and the
+      // whole point of the refusal is to say something the client can act
+      // on by stopping. Not a scope violation -- the caller addressed its
+      // own grant; the grant is what points at nothing (see security.ts).
+      const grantErr = refuseMissingAllowedDirRoot(dirPath, ctx.allowedDirs, 'create');
+      if (grantErr) return translateResult(grantErr, ctx.allowedDirs, ctx.labels);
 
       let existed = false;
       try {

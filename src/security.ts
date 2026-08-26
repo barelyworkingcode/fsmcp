@@ -202,13 +202,28 @@ export function validatePath(filePath: string, allowedDirs: string[]): string | 
 }
 
 /**
- * True if `resolved` -- already canonicalized -- sits inside (or is exactly)
- * one of `allowedDirs`. Shared between validatePath (which canonicalizes the
- * whole path) and validatePathNoFollowFinal (which canonicalizes only the
- * dirname), so the two agree on what "inside" means and differ only in what
- * they canonicalize before asking.
+ * Every allowed directory that contains -- or is exactly -- `resolved`,
+ * which must already have been through `canonicalizePath`. The entries come
+ * back MOST SPECIFIC FIRST (longest resolved directory), matching
+ * `hostToVirtual`'s rule for choosing between nested grants, so a caller
+ * that wants only one gets the same grant the client sees the path
+ * addressed through.
+ *
+ * This is the single definition of what "inside" means. `isWithinAnyDir`
+ * (validatePath, validatePathNoFollowFinal) and `refuseMissingAllowedDirRoot`
+ * (issue #33) both go through it rather than each writing a containment loop
+ * of its own: two loops asking "is this in scope" and "which grant is it in"
+ * separately would be free to drift, and the second one would then be
+ * deciding, on its own authority, which grant a path belongs to.
+ *
+ * It does not short-circuit on the first hit, unlike the loop it replaces.
+ * `allowedDirs` is an operator's grant list -- one entry in the deployment
+ * this server exists for, a handful at worst -- so the extra
+ * `canonicalizePath` calls cost less than a second, subtly different loop
+ * would.
  */
-function isWithinAnyDir(resolved: string, allowedDirs: string[]): boolean {
+function containingAllowedDirs(resolved: string, allowedDirs: string[]): string[] {
+  const hits: { dir: string; resolvedDir: string }[] = [];
   for (const dir of allowedDirs) {
     const resolvedDir = canonicalizePath(dir);
     // A directory that will not resolve cannot contain anything; skip it
@@ -219,10 +234,22 @@ function isWithinAnyDir(resolved: string, allowedDirs: string[]): boolean {
     // /foobar.
     const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
     if (resolved === resolvedDir || resolved.startsWith(prefix)) {
-      return true; // within this allowed dir
+      hits.push({ dir, resolvedDir }); // within this allowed dir
     }
   }
-  return false;
+  hits.sort((a, b) => b.resolvedDir.length - a.resolvedDir.length);
+  return hits.map((h) => h.dir);
+}
+
+/**
+ * True if `resolved` -- already canonicalized -- sits inside (or is exactly)
+ * one of `allowedDirs`. Shared between validatePath (which canonicalizes the
+ * whole path) and validatePathNoFollowFinal (which canonicalizes only the
+ * dirname), so the two agree on what "inside" means and differ only in what
+ * they canonicalize before asking.
+ */
+function isWithinAnyDir(resolved: string, allowedDirs: string[]): boolean {
+  return containingAllowedDirs(resolved, allowedDirs).length > 0;
 }
 
 /**
@@ -438,6 +465,145 @@ export function refuseAllowedDirRoot(
 ): MCPCallResult | null {
   if (!resolvesToAllowedDirRoot(targetPath, allowedDirs)) return null;
   return errorResult(`refusing to ${action} an allowed_dir root: ${targetPath}`);
+}
+
+/**
+ * Why `dir` is not usable as a grant root right now, phrased to slot into
+ * the sentence `refuseMissingAllowedDirRoot` builds, or null if it is fine.
+ *
+ * `fs.statSync`, not `lstatSync`: a grant that IS a symlink to a real
+ * directory is a perfectly ordinary configuration and must pass, while a
+ * DANGLING symlink (the shape a removed volume or a deleted target leaves
+ * behind) must not -- following the link is what tells those two apart.
+ * Anything that throws is reported as "does not exist": EACCES on the way
+ * down is not literally absence, but from this process's position it is the
+ * same fact -- fsmcp cannot see a directory there, and it must not create
+ * one on the strength of not being able to look.
+ */
+function grantRootProblem(dir: string): string | null {
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(dir);
+  } catch {
+    return 'does not exist on the host';
+  }
+  return st.isDirectory() ? null : 'exists on the host but is not a directory';
+}
+
+/**
+ * Issue #33: **refuse a call that would create directories inside a grant
+ * whose root is not there.** The wider half of the rule above -- #24 closed
+ * the grant root ADDRESSED AS THE TARGET, this closes an ordinary,
+ * entirely legitimate target whose ancestors do not exist.
+ *
+ * `fs_write` runs `fs.mkdirSync(path.dirname(resolvedPath), { recursive:
+ * true })` and `fs_mkdir` runs `fs.mkdirSync(dirPath, { recursive: true })`.
+ * `recursive: true` walks up until it finds a directory that exists, and
+ * nothing in it knows where the grant is: the grant root is just another
+ * missing component on the way. Reproduced with a grant at
+ * `<R>/level1/level2/level3/grant` where only `<R>` existed -- one
+ * `fs_write { file_path: "/d0/sub/file.txt" }` created `level1`,
+ * `level2` and `level3`, three directories ABOVE the boundary, and reported
+ * `Wrote 31 bytes`.
+ *
+ * **The grant root existing IS the bound.** That is the whole reason this
+ * check is sufficient and a per-component mkdir walk (considered, and not
+ * written) is not needed: `checkPath` has already established that the
+ * canonicalized target sits at or under a grant root, so every directory
+ * `recursive: true` would create is a strict descendant of that root -- as
+ * long as the root itself is already there for the walk to stop at. Make
+ * the root's existence a precondition and the recursive create can no
+ * longer reach past it, with the tool's actual job (creating intermediate
+ * directories INSIDE the grant, which is documented behaviour) untouched.
+ *
+ * **Refusing, rather than creating the root and stopping there.** Creating
+ * the root cannot be done without creating its missing parents, which are
+ * outside the grant by definition, so the "weaker alternative" is not
+ * actually available in the case that matters -- it only helps when exactly
+ * one component is missing. And an operator's grant that does not describe
+ * anything on the host is a configuration mistake that wants to be visible:
+ * a typo (`~/Documnets/project`) leaves the agent working productively in a
+ * folder nobody will ever look in, and an unmounted volume is worse --
+ * granting `/Volumes/Work/project` with the drive unplugged creates
+ * `/Volumes/Work/project` on the BOOT DISK, which then shadows the mount
+ * point, so macOS mounts the real volume as `/Volumes/Work 1` when it
+ * appears. Two directories with confusingly similar names, the agent's work
+ * in the wrong one, and no error at any point. `isWithinAnyDir` already
+ * treats a granted directory that will not resolve as a real condition and
+ * skips it rather than letting it widen the scope; this is the same
+ * condition reached by a different route, and it gets the same answer
+ * instead of the opposite one.
+ *
+ * **A plain `errorResult`, NOT `scopeViolationResult`, and that is the
+ * considered choice.** `_meta.scope_violation` means "the client addressed
+ * something outside its scope" and must keep meaning only that (types.ts).
+ * Here the client addressed something squarely INSIDE its scope; the scope
+ * itself points at nothing. Flagging it would tell an operator reading
+ * `relay audit` that the sandbox caught a client reaching out of bounds,
+ * which is false, and would put a configuration error in the same column as
+ * a real containment event -- devaluing the one signal that column exists to
+ * carry. The unhelpful consequence is that relay currently renders this as a
+ * generic `tool_error`; the right fix for that is a distinct operator-facing
+ * signal in relay (a `grant_unavailable` field, say), not borrowing this
+ * one. Recommended in the issue, deliberately not built here.
+ *
+ * The message names the GRANT, not the caller's path, and says the retry is
+ * pointless. An agent told "no such file or directory" for
+ * `/d0/sub/file.txt` concludes it typed something wrong and tries again,
+ * possibly forever; it has to be told the failure is in the server's
+ * configuration -- something it cannot fix from the client side -- so that
+ * it stops and surfaces the problem instead of looping.
+ *
+ * Callers pass the ALREADY-DECODED host path and wrap the result in
+ * `translateResult(result, ctx.allowedDirs, ctx.labels)`. That is why there
+ * is no `...V` wrapper in vpath.ts next to `refuseAllowedDirRootWriteV`: the
+ * wrappers there translate the TARGET path, and the path embedded here is
+ * the granted directory instead, so the host path to rename is the grant,
+ * not the argument. Wrapping matters -- an untranslated grant path in an
+ * error result trips `redactLeakedHostPaths` and the caller gets the
+ * internal-error backstop instead of the explanation.
+ *
+ * Returns null for a target outside every grant (`checkPath`'s refusal is
+ * the right one and comes first anyway) and for an unresolvable one, on the
+ * same reasoning as `resolvesToAllowedDirRoot`.
+ */
+export function refuseMissingAllowedDirRoot(
+  targetPath: string,
+  allowedDirs: string[],
+  action: string
+): MCPCallResult | null {
+  const resolved = canonicalizePath(targetPath);
+  if (resolved === null) return null;
+
+  const containing = containingAllowedDirs(resolved, allowedDirs);
+  if (containing.length === 0) return null;
+
+  // Most specific first. A single usable root anywhere in the list is
+  // enough: the recursive create stops at whichever ancestor exists, and if
+  // that ancestor is itself a granted directory then nothing was created
+  // outside the operator's grant, which is the only thing being protected
+  // here. Only when EVERY grant containing this path is missing is the
+  // creation unbounded.
+  let problem: string | null = null;
+  let offender = containing[0];
+  for (const dir of containing) {
+    const dirProblem = grantRootProblem(dir);
+    if (dirProblem === null) return null;
+    if (problem === null) {
+      problem = dirProblem;
+      offender = dir;
+    }
+  }
+
+  return errorResult(
+    `the granted directory ${offender} ${problem}, so fsmcp will not ${action} anything inside ` +
+      `it. This is a problem with this server's configuration, not with the path you asked for: ` +
+      `the path is inside the grant and is not the reason this failed. Retrying, or trying a ` +
+      `different path, will not help -- every write into that grant fails until an operator fixes ` +
+      `it, usually a typo in the granted path or a volume that is not mounted. fsmcp will not ` +
+      `create the granted directory itself: the only way to create it is to create its missing ` +
+      `parent directories too, and those are outside the grant.`
+  );
 }
 
 /** The result of combining CLI and _meta allowed dirs: see narrowAllowedDirs. */

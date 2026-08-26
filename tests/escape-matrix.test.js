@@ -1455,9 +1455,28 @@ test('issue #24: fs_mkdir at a grant root that does not exist yet does not creat
     "fs_mkdir must not create the grant's parent -- that is a directory outside allowed_dirs"
   );
 
-  // The legitimate case in the same shape still works, and creating the
-  // missing root on the way to a path INSIDE it is not what this refuses.
+  // This assertion used to read "the legitimate case in the same shape
+  // still works": `fs_mkdir { path: "/d0/sub" }` against this same
+  // not-yet-created grant succeeded, and #24 recorded that as correct on
+  // the grounds that creating the missing root on the way to a path INSIDE
+  // it is not what the root rule refuses. It was not correct -- it is issue
+  // #33. `mkdirSync(..., { recursive: true })` walks up until it finds a
+  // directory that exists, so the call that "worked" created `parent` too,
+  // outside the grant, exactly like the refused `/d0` call above; the only
+  // difference was that nothing refused it. The behaviour now expected here
+  // is refusal, and the reason it is refused is the grant, not the
+  // argument. Full coverage lives in tests/missing-grant-root.test.js; kept
+  // here so the two halves of the same defect are read together.
   const sub = await server.callTool('fs_mkdir', { path: '/d0/sub' });
-  assert.equal(sub.isError, undefined, allText(sub));
-  assert.ok(fs.statSync(path.join(fx.grant, 'sub')).isDirectory());
+  assert.equal(sub.isError, true, allText(sub));
+  assert.match(allText(sub), /granted directory .* does not exist on the host/i);
+  assert.ok(
+    !sub._meta || sub._meta.scope_violation !== true,
+    'a grant that points at nothing is an operator configuration error, not the client addressing something out of scope'
+  );
+  assert.equal(
+    fs.existsSync(fx.parent),
+    false,
+    "a path INSIDE a grant whose root is missing must not create the grant's ancestors either"
+  );
 });
