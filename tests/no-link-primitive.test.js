@@ -99,7 +99,7 @@ test('no tool can create a symlink or a hard link', () => {
   );
 });
 
-test('the mutating syscall surface is exactly the five calls we have argued about', () => {
+test('the mutating syscall surface is exactly the six calls we have argued about', () => {
   const src = path.join(__dirname, '..', 'src');
   const found = new Set();
 
@@ -144,12 +144,70 @@ test('the mutating syscall surface is exactly the five calls we have argued abou
 
   assert.deepStrictEqual(
     [...found].sort(),
-    ['mkdirSync', 'renameSync', 'rmSync', 'unlinkSync', 'writeFileSync'],
+    ['chmodSync', 'mkdirSync', 'renameSync', 'rmSync', 'unlinkSync', 'writeFileSync'],
     'the set of ways fsmcp can change the filesystem has changed. Each of ' +
-      'these five has a containment argument attached to it somewhere in ' +
-      'src/; a sixth needs one written before it ships. openSync in ' +
+      'these has a containment argument attached to it somewhere in src/; ' +
+      'a new one needs one written before it ships. openSync in ' +
       'particular would be the right way to fix TOCTOU (O_NOFOLLOW) and the ' +
       'wrong way to do anything else.'
+  );
+});
+
+/**
+ * chmodSync is the sixth, added for issue #20, and this is the argument the
+ * assertion above demands before a call joins that list.
+ *
+ * It is here because the fifth-call budget produced a wrong answer. The
+ * permission-bit preservation in atomicWrite.ts used to route the mode
+ * through fs.writeFileSync's own `mode` option specifically to avoid a
+ * sixth call -- and writeFileSync's `mode` is open(2)'s `mode`, which the
+ * process umask masks. Under the macOS default `umask 022` a 0664 file came
+ * back 0644 and a 0777 file came back 0755: the function did not preserve
+ * the thing its own doc comment said it went out of its way to preserve.
+ * chmod(2) does not consult the umask. So the choice was a sixth syscall or
+ * a fix that does not work, and this test is the thing that makes spending
+ * it deliberate rather than incidental.
+ *
+ * What contains it:
+ *
+ *   - It is called on exactly one path expression, `tmpPath`, in exactly
+ *     one function. `tmpPath` is built inside writeFileAtomic from
+ *     path.dirname of the target plus six random bytes; no client argument
+ *     reaches it, and nothing outside that function can name it.
+ *   - It runs between the writeFileSync that creates that temp file and the
+ *     renameSync that consumes it, so the file it chmods is one fsmcp
+ *     created microseconds earlier and is about to replace with itself.
+ *   - The mode it sets is `st_mode & 0o777` of the file being replaced, so
+ *     it can only restore a bit the target already had. It cannot grant a
+ *     new one, and the mask means fsmcp still cannot produce a setuid,
+ *     setgid or sticky file -- which matters more now than it did before,
+ *     since the `cp -p` seeding step DOES carry setuid onto the temp file
+ *     and this chmod is what takes it back off.
+ *   - It is not a general chmod capability: there is no fs_chmod tool, and
+ *     nothing in tools/ can reach this call with a path of its own choosing.
+ *
+ * This test pins all of that, so "chmodSync moved somewhere else" fails
+ * here rather than passing quietly on the strength of the name alone.
+ */
+test('chmodSync exists in exactly one place, on exactly one path, and cannot set setuid', () => {
+  const src = path.join(__dirname, '..', 'src');
+  const sites = [];
+
+  for (const file of sourceFiles(src)) {
+    const code = stripComments(fs.readFileSync(file, 'utf-8'));
+    for (const m of code.matchAll(/fs\.chmodSync\(([^)]*)\)/g)) {
+      sites.push({ file: path.relative(src, file), args: m[1].trim() });
+    }
+  }
+
+  assert.deepStrictEqual(
+    sites,
+    [{ file: 'atomicWrite.ts', args: 'tmpPath, mode & 0o777' }],
+    'fsmcp may change a file mode in exactly one place: atomicWrite.ts, on its own temp ' +
+      'file, to the masked mode of the file being replaced. A second call site, a different ' +
+      'path expression, or a mode that is not masked to 0o777 is a new capability and needs ' +
+      'its own argument -- a chmod that can take a caller-supplied path is an fs_chmod tool ' +
+      'that nobody declared.'
   );
 });
 
@@ -282,4 +340,89 @@ test('fs_list names a symlink but never its target', async () => {
     server.close();
     fs.rmSync(base, { recursive: true, force: true });
   }
+});
+
+/**
+ * The same question as the mutating-syscall surface above, asked of the
+ * other way this process can change something: subprocesses.
+ *
+ * Until issue #20, every spawn in this tree was ripgrep, and ripgrep only
+ * reads. atomicWrite.ts now spawns `/bin/cp`, because rename(2) lands the
+ * new content on a fresh inode and Node has no binding that can carry the
+ * old inode's extended attributes or its ACL across -- no listxattr, no
+ * getxattr, no ACL API, no FFI. macOS's copyfile(3) does it in one call and
+ * `cp -p` is that call with a command line in front of it. fs.copyFileSync
+ * was measured first and preserves neither, so widening LINK_PRIMITIVES
+ * would have bought a forbidden call that does not even work.
+ *
+ * That makes `cp` the first subprocess fsmcp runs that WRITES, which is
+ * exactly the kind of thing the surface test above exists to stop happening
+ * by accident. The argument for it lives in atomicWrite.ts; this pins the
+ * shape of it so the argument cannot quietly stop matching the code:
+ *
+ *   - the program is a string literal, never a variable, so no argument and
+ *     no environment lookup can decide what fsmcp executes;
+ *   - `cp` is spelled `/bin/cp`, absolutely. `rg` is resolved through PATH
+ *     because it is an optional third-party binary with a Node fallback;
+ *     `cp` has neither property, and a PATH-resolved `cp` would let anything
+ *     that can prepend to PATH decide what happens to a granted file;
+ *   - the argv is a literal array, so there is no shell, no quoting and no
+ *     command string anywhere -- the same rule fs_grep has held since the
+ *     shell-injection fix, now stated for the whole tree rather than for
+ *     ripgrep alone;
+ *   - the only spawn that writes lives in atomicWrite.ts and nowhere else.
+ */
+test('the subprocess surface is ripgrep, plus exactly one writing spawn in atomicWrite.ts', () => {
+  const src = path.join(__dirname, '..', 'src');
+  const spawns = [];
+  const shellApis = [];
+
+  for (const file of sourceFiles(src)) {
+    const code = stripComments(fs.readFileSync(file, 'utf-8'));
+    const rel = path.relative(src, file);
+    for (const m of code.matchAll(/execFileSync\(\s*([^,]+),/g)) {
+      spawns.push({ file: rel, program: m[1].trim() });
+    }
+    // execSync/spawnSync-with-shell/exec take a COMMAND STRING, which is a
+    // shell. None of them has ever appeared in this tree and none may.
+    for (const m of code.matchAll(/\b(execSync|spawnSync|exec|spawn|fork)\s*\(/g)) {
+      if (m[1] === 'exec' || m[1] === 'spawn') {
+        // `execFileSync(` already matched above; only flag a bare exec/spawn.
+        continue;
+      }
+      shellApis.push(`${rel}: ${m[1]}`);
+    }
+  }
+
+  assert.deepStrictEqual(shellApis, [], 'the only way this process may spawn anything is execFileSync with an argv array');
+
+  // Resolve the two program identifiers this tree uses to their literal
+  // values, so a rename of the constant cannot smuggle a different binary
+  // past this assertion.
+  const atomic = stripComments(fs.readFileSync(path.join(src, 'atomicWrite.ts'), 'utf-8'));
+  assert.match(atomic, /const CP = '\/bin\/cp';/, 'CP must be the absolute path /bin/cp, not a PATH lookup');
+  assert.match(
+    atomic,
+    /execFileSync\(CP, \['-pN', '--', from, to\], \{ stdio: 'pipe' \}\)/,
+    "atomicWrite's spawn must stay a literal argv array of exactly two operands, both of which " +
+      'writeFileAtomic owns: `to` is its own temp path and `from` is the target every caller has ' +
+      'already validated. No -R (cannot descend), no -l/-s (cannot create a link), `--` before ' +
+      'the operands.'
+  );
+
+  assert.deepStrictEqual(
+    spawns.sort((a, b) => (a.file + a.program).localeCompare(b.file + b.program)),
+    [
+      { file: 'atomicWrite.ts', program: 'CP' },
+      { file: 'tools/find.ts', program: "'rg'" },
+      { file: 'tools/find.ts', program: "'rg'" },
+      { file: 'tools/grep.ts', program: "'rg'" },
+      { file: 'tools/grep.ts', program: "'rg'" },
+    ],
+    'a new subprocess appeared, or an existing one moved. Every spawn in this tree must name ' +
+      'its program as a literal, and the only one that may WRITE anything is atomicWrite.ts\'s ' +
+      'cp -- which is contained by the fact that both of its operands are paths writeFileAtomic ' +
+      'itself owns. A spawn that takes a program name, or a path, from anywhere else needs its ' +
+      'own containment argument first.'
+  );
 });
