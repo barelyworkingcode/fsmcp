@@ -35,10 +35,12 @@ export function registerRead(registry: ToolRegistry): void {
         '"offset"/"limit" select a line range. That view is NOT byte-faithful, even for a file ' +
         'that is clean UTF-8: it is decoded, truncated, and line-split before it reaches you. ' +
         'Text mode refuses a file whose bytes are not valid UTF-8 rather than guessing at a lossy ' +
-        'decoding. encoding: "base64" is the byte-exact path: the file\'s exact bytes, unmodified, ' +
-        'with no line numbers, no truncation, and no offset/limit (those are rejected in base64 ' +
-        'mode, not silently ignored). Refuses files over 10MB either way -- use fs_grep to search ' +
-        'a larger one instead.',
+        'decoding. encoding: "base64" is the byte-exact path: the returned text is ONLY the ' +
+        'base64 payload (no header, no trailing newline, no line numbers, no truncation, and no ' +
+        'offset/limit -- those are rejected in base64 mode, not silently ignored); the byte count ' +
+        'is in _meta.bytes. That payload can be passed verbatim, unmodified, as fs_write\'s ' +
+        '"content" with encoding: "base64" to round-trip the file\'s exact bytes. Refuses files ' +
+        'over 10MB either way -- use fs_grep to search a larger one instead.',
       inputSchema: schema(
         {
           file_path: stringProp(virtualPathDescription()),
@@ -46,7 +48,9 @@ export function registerRead(registry: ToolRegistry): void {
           limit: intProp('Maximum number of lines to read (default: 2000). Text mode only.'),
           encoding: enumProp(
             '"text" (default): decode as UTF-8, line-numbered view, refuses non-UTF-8 content. ' +
-              '"base64": exact bytes on disk, no decoding, no view formatting, works on any file.',
+              '"base64": exact bytes on disk as a bare base64 string (byte count in _meta.bytes), ' +
+              'no decoding, no view formatting, works on any file, safe to pass straight into ' +
+              'fs_write\'s encoding: "base64".',
             ['text', 'base64']
           ),
         },
@@ -131,7 +135,32 @@ export function registerRead(registry: ToolRegistry): void {
         // that there is no extension-keyed auto-base64 special case; the
         // caller declares the encoding instead of fsMCP guessing it from a
         // filename.
-        return textResult(`[base64: ${buf.length} bytes]\n${buf.toString('base64')}`);
+        //
+        // The payload text is ONLY the base64 -- no "[base64: N bytes]"
+        // header, no trailing newline, nothing else in the content string.
+        //
+        // General rule: a mode that exists for fidelity must round-trip
+        // through itself. fs_read(base64) piped straight into
+        // fs_write(base64), with no editing step in between, has to be an
+        // identity for the file's bytes -- the same guarantee text mode
+        // explicitly does NOT make (it is a documented view: line-numbered,
+        // truncated, and says so).
+        //
+        // An earlier version of this prefixed a human-readable
+        // "[base64: N bytes]\n" header. That broke the rule: fs_read's own
+        // reply was not valid input to fs_write's own base64 decoder (PR
+        // #13 review) -- isValidBase64 correctly refused the header line,
+        // so nothing was corrupted, but the obvious, undocumented
+        // composition of the two calls simply did not work. A caller who
+        // "fixed" that by stripping the header via a pattern nothing
+        // specifies could just as easily strip it WRONG and silently
+        // corrupt the bytes -- the exact failure this whole issue exists to
+        // close, just moved one level up and disguised as a caller bug
+        // instead of a design one. The byte count is still available, just
+        // structurally, in `_meta.bytes` -- the same idea as `_meta.truncated`
+        // below, for the same reason: something a caller branches on, not
+        // prose it has to parse out of the payload it is about to decode.
+        return { content: [{ type: 'text', text: buf.toString('base64') }], _meta: { bytes: buf.length } };
       }
 
       let content: string;

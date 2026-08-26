@@ -62,11 +62,19 @@ function stripCatN(text) {
     .join('\n');
 }
 
-/** Pull the base64 payload out of fs_read's `[base64: N bytes]\n<data>` reply. */
-function extractBase64(text) {
-  const nl = text.indexOf('\n');
-  assert.ok(nl >= 0, `expected a "[base64: ...]\\n<data>" reply, got: ${text}`);
-  return text.slice(nl + 1);
+/**
+ * fs_read's encoding: "base64" reply is the bare base64 payload -- no
+ * header, no trailing newline, nothing else -- specifically so it can be
+ * passed straight into fs_write's encoding: "base64" `content` with no
+ * transformation of any kind (PR #13 review: an earlier version prefixed a
+ * human-readable "[base64: N bytes]\n" header, which made fs_read's own
+ * reply invalid input to fs_write's own base64 decoder -- the fidelity
+ * path's output was not valid input to the fidelity path). This helper
+ * exists only to name that assumption at each call site, not to transform
+ * anything.
+ */
+function base64Payload(result) {
+  return allText(result);
 }
 
 test('round-trip matrix (issue #11): every case round-trips byte-identically in some encoding, or is refused', async (t) => {
@@ -139,7 +147,7 @@ test('round-trip matrix (issue #11): every case round-trips byte-identically in 
     const out = path.join(root, 'long-line-out.txt');
     const w = await server.callTool('fs_write', {
       file_path: v(out),
-      content: extractBase64(allText(rb64)),
+      content: base64Payload(rb64),
       encoding: 'base64',
     });
     assert.equal(w.isError, undefined, allText(w));
@@ -175,7 +183,7 @@ test('round-trip matrix (issue #11): every case round-trips byte-identically in 
       const out = path.join(root, `binary-case-${i}-out${c.ext}`);
       const w = await server.callTool('fs_write', {
         file_path: v(out),
-        content: extractBase64(allText(rb64)),
+        content: base64Payload(rb64),
         encoding: 'base64',
       });
       assert.equal(w.isError, undefined, allText(w));
@@ -206,12 +214,56 @@ test('round-trip matrix (issue #11): every case round-trips byte-identically in 
     const out = path.join(root, 'pixel-out.png');
     const w = await server.callTool('fs_write', {
       file_path: v(out),
-      content: extractBase64(allText(rb64)),
+      content: base64Payload(rb64),
       encoding: 'base64',
     });
     assert.equal(w.isError, undefined, allText(w));
     assert.deepEqual(fs.readFileSync(out), png, 'the PNG must round-trip byte-identical via base64');
   });
+});
+
+test('encoding: "base64" round-trips through itself with zero transformation: fs_read\'s reply is valid fs_write input, verbatim', async (t) => {
+  // This is the composition PR #13 review found broken: an earlier version
+  // of fs_read's base64 reply carried a human-readable "[base64: N bytes]"
+  // header, which meant fs_read's own output was not valid input to
+  // fs_write's own base64 decoder -- the fidelity path's output was not
+  // valid input to the fidelity path. The failure mode when a caller
+  // "fixed" that by stripping the header via some unspecified pattern is a
+  // byte-level corruption of exactly the kind this whole issue exists to
+  // prevent. The general rule: a mode that exists for fidelity must
+  // round-trip through itself, with no editing step of any kind in
+  // between -- this test asserts exactly that, passing fs_read's content
+  // array straight into fs_write with nothing stripped, rewritten, or
+  // reinterpreted.
+  const root = mkTmpDir('fsmcp-lossy-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', root]);
+  t.after(() => server.close());
+
+  const original = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x0d, 0x0a, 0x1a, 0x0a, 0x41, 0x42, 0x43]);
+  const file = path.join(root, 'a.bin');
+  fs.writeFileSync(file, original);
+
+  const r = await server.callTool('fs_read', { file_path: toVirtual(file, root), encoding: 'base64' });
+  assert.equal(r.isError, undefined, allText(r));
+
+  // Structural checks on the shape of the reply itself, independent of the
+  // round trip below: no header, no trailing newline, byte count in _meta.
+  assert.equal(r.content.length, 1, 'expected exactly one content item');
+  assert.match(r.content[0].text, /^[A-Za-z0-9+/]*={0,2}$/, 'the payload must be bare base64 -- no header, no trailing newline, no other text');
+  assert.equal(r._meta && r._meta.bytes, original.length, '_meta.bytes must carry the byte count structurally, not in prose');
+
+  // The composition: fs_read's reply, VERBATIM (r.content[0].text, read
+  // directly off the result -- no helper, no trim, no slice), straight
+  // into fs_write's content argument.
+  const out = path.join(root, 'a-out.bin');
+  const w = await server.callTool('fs_write', {
+    file_path: toVirtual(out, root),
+    content: r.content[0].text,
+    encoding: 'base64',
+  });
+  assert.equal(w.isError, undefined, `fs_read's own base64 reply must be valid fs_write input unmodified: ${allText(w)}`);
+  assert.deepEqual(fs.readFileSync(out), original, 'the composition must be an identity on the file\'s bytes');
 });
 
 test('fs_read: encoding: "base64" rejects offset/limit rather than silently ignoring them', async (t) => {

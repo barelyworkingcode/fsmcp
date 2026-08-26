@@ -88,13 +88,27 @@ whether the encoding you asked for can represent those bytes losslessly:
   second-guessing of the content: if `content` itself contains U+FFFD,
   that is written as-is, because it may be exactly what you mean.
 - **`encoding: "base64"`** is the byte-exact path: `fs_read` returns the
-  file's exact bytes, base64-encoded, with no line numbers, no truncation,
-  and no decoding of any kind -- `offset`/`limit` are meaningless against a
-  byte dump and are **refused**, not silently ignored, if you pass them
-  alongside `encoding: "base64"`. `fs_write`'s `"base64"` mode decodes
-  `content` as base64 and writes exactly those bytes, unmodified. This is
-  the only way to read or write a file whose content is not valid UTF-8
-  text -- a PNG, a `.zip`, a UTF-16 file, anything.
+  file's exact bytes as a **bare base64 string -- no header, no trailing
+  newline, no other text** (the byte count is in `_meta.bytes` instead, not
+  in prose), with no line numbers, no truncation, and no decoding of any
+  kind -- `offset`/`limit` are meaningless against a byte dump and are
+  **refused**, not silently ignored, if you pass them alongside
+  `encoding: "base64"`. `fs_write`'s `"base64"` mode decodes `content` as
+  base64 and writes exactly those bytes, unmodified. This is the only way
+  to read or write a file whose content is not valid UTF-8 text -- a PNG, a
+  `.zip`, a UTF-16 file, anything. **A fidelity mode round-trips through
+  itself:** `fs_read`'s `"base64"` reply can be passed straight into
+  `fs_write`'s `content` with `encoding: "base64"`, unmodified, and that
+  composition is an identity on the file's bytes -- no stripping, no
+  reformatting, no pattern to reverse-engineer. (An earlier version of this
+  prefixed a human-readable `"[base64: N bytes]\n"` header, which broke
+  exactly that: `fs_read`'s own reply was not valid input to `fs_write`'s
+  own base64 decoder. It failed closed rather than corrupting anything, but
+  the obvious composition of the two calls simply didn't work, and a caller
+  that "fixed" it by guessing at how to strip the header could just as
+  easily strip it wrong and silently corrupt the bytes -- the same failure
+  this feature exists to prevent, one level up.) Text mode makes no such
+  promise -- it is a documented view, not a fidelity path, and says so.
 
 **Behaviour change:** earlier versions of `fs_read` auto-detected a fixed
 list of image extensions (`.png`, `.jpg`, `.gif`, …) and returned those as
