@@ -18,7 +18,7 @@ export function registerWrite(registry: ToolRegistry): void {
     {
       name: 'fs_write',
       description:
-        'Write content to a file. Creates the file and parent directories if they do not exist. Overwrites existing files.',
+        'Write content to a file. Creates the file and parent directories if they do not exist. Overwrites existing files. Refuses content over 10MB.',
       inputSchema: schema(
         {
           file_path: stringProp('Absolute path to the file'),

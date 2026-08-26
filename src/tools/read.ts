@@ -28,7 +28,7 @@ export function registerRead(registry: ToolRegistry): void {
     {
       name: 'fs_read',
       description:
-        'Read file contents with line numbers (cat -n format). Supports offset and limit for partial reads. Lines longer than 2000 characters are truncated.',
+        'Read file contents with line numbers (cat -n format). Supports offset and limit for partial reads. Lines longer than 2000 characters are truncated. Refuses files over 10MB -- use fs_grep to search a larger one instead.',
       inputSchema: schema(
         {
           file_path: stringProp('Absolute path to the file'),
