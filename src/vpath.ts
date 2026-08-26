@@ -114,12 +114,65 @@ function stripTrailingSep(p: string): string {
  * root would mean the day a second directory is added, every path a client
  * has already learned or stored silently changes shape. That is worse than
  * the four extra characters (issue #7).
+ *
+ * Returns an `MCPCallResult` refusal, not `LabelEntry[]`, when two DIFFERENT
+ * directories in this call's effective scope would land on the same label
+ * -- both from two explicit `label=`s, or from an explicit `label=` that
+ * happens to match another entry's auto-assigned `d<N>` (reachable from a
+ * shape like `--allowed-dir d1=/x --allowed-dir /y --allowed-dir /z`, where
+ * `/z` is position 2 but `/y` is position 1 and so would be `d1` -- a
+ * collision no operator would predict just by reading their own flags in
+ * order). `virtualToHost` resolves a label with `Array.prototype.find`,
+ * which silently returns the FIRST match, so a collision left unrefused
+ * does not error -- it quietly makes the second directory unaddressable and,
+ * worse, makes `fs_glob`/`fs_find`/`fs_grep` report the identical virtual
+ * path for two genuinely different files, with `fs_read` of that path
+ * always resolving to the first-registered directory: a caller believing it
+ * addressed the second gets the first one's bytes instead, and a write
+ * clobbers the first while the caller may believe it is addressing the
+ * second. This codebase already refuses exactly this SHAPE of ambiguity
+ * rather than picking a winner -- `fs_edit` refuses a non-unique
+ * `old_string` instead of replacing the first match, `validatePath` refuses
+ * an empty scope instead of reading it as "everything" -- and an
+ * unspecified collision policy is the argument for refusing here too, not
+ * for leaving the ambiguity to resolve itself silently to whichever entry
+ * happens to be enumerated first.
+ *
+ * Naming both colliding directories in the refusal is safe: this function
+ * only ever sees `allowedDirs`, which by construction contains either plain
+ * CLI directories (operator-side, already exempt from translation -- see
+ * this file's own top-of-file doc) or `_meta` entries that already
+ * canonicalize inside a CLI directory and were therefore supplied verbatim
+ * by whoever is about to read this message. There is no path through
+ * `narrowAllowedDirs` that lets this function see a THIRD PARTY's directory
+ * neither the operator nor this call's own `_meta` already named.
  */
-export function assignLabels(allowedDirs: string[], labelByHostPath: Map<string, string>): LabelEntry[] {
-  return allowedDirs.map((hostDir, i) => {
-    const bare = stripTrailingSep(hostDir);
-    return { label: labelByHostPath.get(hostDir) ?? `d${i}`, hostDir: bare };
-  });
+export function assignLabels(
+  allowedDirs: string[],
+  labelByHostPath: Map<string, string>
+): LabelEntry[] | MCPCallResult {
+  const hostDirByLabel = new Map<string, string>();
+  const entries: LabelEntry[] = [];
+  for (let i = 0; i < allowedDirs.length; i++) {
+    const bare = stripTrailingSep(allowedDirs[i]);
+    const label = labelByHostPath.get(allowedDirs[i]) ?? `d${i}`;
+    const claimedBy = hostDirByLabel.get(label);
+    // The same directory landing on the same label twice (a literal
+    // duplicate --allowed-dir entry) is redundant, not ambiguous -- both
+    // instances already mean the same host path, so there is nothing for a
+    // client to confuse. Only a DIFFERENT directory claiming an
+    // already-used label is the failure this refuses.
+    if (claimedBy !== undefined && claimedBy !== bare) {
+      return errorResult(
+        `fsmcp: label "${label}" is claimed by two different allowed directories (${claimedBy} and ` +
+          `${bare}). Refusing every call under this configuration rather than silently resolving ` +
+          `the ambiguity to one of them -- give each directory a distinct label.`
+      );
+    }
+    hostDirByLabel.set(label, bare);
+    entries.push({ label, hostDir: bare });
+  }
+  return entries;
 }
 
 /**

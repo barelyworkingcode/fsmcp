@@ -1075,3 +1075,109 @@ test('P3: caller-echoed text is never touched, but a real syscall error path sti
     assert.match(allText(r), /\/d0\/already-here/, "the syscall error's own path must still be translated to its virtual form");
   });
 });
+
+// ===========================================================================
+// P4: a duplicate label refuses the whole call, rather than silently
+// resolving the ambiguity to one of the colliding directories.
+// ===========================================================================
+
+// virtualToHost resolves a label with Array.prototype.find, which returns
+// the FIRST match -- so two directories sharing a label do not error on
+// their own, they silently make the second one unaddressable and make
+// fs_glob/fs_find/fs_grep report the identical virtual path for two
+// genuinely different files. This codebase already refuses this SHAPE of
+// ambiguity elsewhere rather than picking a winner (fs_edit on a
+// non-unique old_string, validatePath on an empty scope), so
+// assignLabels (vpath.ts) refuses too: every tool call under a
+// colliding configuration fails closed, naming both directories, instead
+// of half-working.
+test('P4: a duplicate label fails every call closed, not just the ambiguous address', async (t) => {
+  await t.test('two explicit label= entries claiming the same label', async () => {
+    const dirA = mkTmpDir('fsmcp-duplabelA-');
+    const dirB = mkTmpDir('fsmcp-duplabelB-');
+    t.after(() => {
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    });
+    fs.writeFileSync(path.join(dirA, 'notes.txt'), 'FROM-A');
+    fs.writeFileSync(path.join(dirB, 'notes.txt'), 'FROM-B');
+
+    const server = spawnServer(['--allowed-dir', `z=${dirA}`, '--allowed-dir', `z=${dirB}`]);
+    try {
+      // Every tool fails, not just an fs_read of the ambiguous address --
+      // the whole label space for this call is unusable, so nothing ever
+      // reaches a tool handler.
+      const glob = await server.callTool('fs_glob', { pattern: '**/*' });
+      assert.equal(glob.isError, true);
+      assert.match(allText(glob), /label "z" is claimed by two different allowed directories/);
+
+      const read = await server.callTool('fs_read', { file_path: '/z/notes.txt' });
+      assert.equal(read.isError, true);
+      assert.match(allText(read), /label "z" is claimed by two different allowed directories/);
+
+      // Both colliding directories are named -- safe to reveal here because
+      // both came from this call's own _meta/CLI configuration (never a
+      // third party's path); naming them is what lets an operator actually
+      // fix the collision instead of guessing which two of N directories
+      // clashed.
+      assert.ok(allText(glob).includes(dirA) && allText(glob).includes(dirB));
+    } finally {
+      server.close();
+    }
+  });
+
+  await t.test('an explicit label= collides with another entry\'s auto-assigned d<N>', async () => {
+    // --allowed-dir d1=/x --allowed-dir /y --allowed-dir /z: /y sits at
+    // position 1 in the effective scope, so it auto-assigns "d1" -- the
+    // exact label /x explicitly claimed. No operator reading their own
+    // three flags in order would predict this from position alone.
+    const dirX = mkTmpDir('fsmcp-duplabelX-');
+    const dirY = mkTmpDir('fsmcp-duplabelY-');
+    const dirZ = mkTmpDir('fsmcp-duplabelZ-');
+    t.after(() => {
+      fs.rmSync(dirX, { recursive: true, force: true });
+      fs.rmSync(dirY, { recursive: true, force: true });
+      fs.rmSync(dirZ, { recursive: true, force: true });
+    });
+
+    const server = spawnServer(['--allowed-dir', `d1=${dirX}`, '--allowed-dir', dirY, '--allowed-dir', dirZ]);
+    try {
+      const list = await server.callTool('fs_list', {});
+      assert.equal(list.isError, true);
+      assert.match(allText(list), /label "d1" is claimed by two different allowed directories/);
+      assert.ok(allText(list).includes(dirX) && allText(list).includes(dirY));
+    } finally {
+      server.close();
+    }
+  });
+
+  await t.test('the same directory under the same label twice is redundant, not ambiguous, and must not refuse', async () => {
+    const dirA = mkTmpDir('fsmcp-duplabelSame-');
+    t.after(() => fs.rmSync(dirA, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dirA, 'ok.txt'), 'fine');
+
+    const server = spawnServer(['--allowed-dir', `q=${dirA}`, '--allowed-dir', `q=${dirA}`]);
+    try {
+      const list = await server.callTool('fs_list', { path: '/q' });
+      assert.equal(list.isError, undefined, allText(list));
+      assert.match(allText(list), /\/q\/ok\.txt/);
+    } finally {
+      server.close();
+    }
+  });
+
+  await t.test('non-colliding labels in the same config are unaffected', async () => {
+    const dirA = mkTmpDir('fsmcp-nodupe-');
+    t.after(() => fs.rmSync(dirA, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dirA, 'ok.txt'), 'fine');
+
+    const server = spawnServer(['--allowed-dir', dirA]);
+    try {
+      const list = await server.callTool('fs_list', {});
+      assert.equal(list.isError, undefined, allText(list));
+      assert.match(allText(list), /\/d0\/ok\.txt/);
+    } finally {
+      server.close();
+    }
+  });
+});

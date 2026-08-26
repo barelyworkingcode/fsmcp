@@ -1,6 +1,6 @@
 import { createInterface } from 'readline';
 import { ToolRegistry } from './registry';
-import { ToolContext } from './types';
+import { ToolContext, MCPCallResult } from './types';
 import { parseAllowedDirs, narrowAllowedDirs, sanitizeMetaAllowedDirs } from './security';
 import { stripLabels, assignLabels } from './vpath';
 import { registerRead } from './tools/read';
@@ -173,13 +173,22 @@ rl.on('line', (line: string) => {
       // written against, then d<N> by position in the EFFECTIVE (already
       // narrowed) scope -- see vpath.ts's assignLabels for why position is
       // taken there and not in the operator's original CLI/_meta ordering.
-      const labels = assignLabels(
+      const labelsResult = assignLabels(
         allowedDirs,
         new Map([...cliLabels, ...(strippedMeta?.labelByHostPath ?? [])])
       );
-      const ctx: ToolContext = { allowedDirs, labels };
-
-      const result = registry.call(name, args, ctx);
+      // A duplicate label (two directories claiming the same `/<label>/...`
+      // address) makes the whole virtual address space for this call
+      // ambiguous, not just one path in it -- vpath.ts's assignLabels
+      // refuses outright rather than resolving it to whichever directory
+      // happens to be enumerated first, the same "refuse the ambiguity"
+      // stance fs_edit already takes for a non-unique old_string. That
+      // refusal stands in for the tool's own result: nothing here can be
+      // decoded against a label space that does not have a single meaning,
+      // so no tool handler ever runs for this call.
+      const result: MCPCallResult = Array.isArray(labelsResult)
+        ? registry.call(name, args, { allowedDirs, labels: labelsResult })
+        : labelsResult;
 
       // A dropped _meta dir is reported on the result, not swallowed: an
       // operator (or an agent reading the reply) should be able to see that
