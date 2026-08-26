@@ -96,6 +96,24 @@ rl.on('line', (line: string) => {
           //    natural bound. Relay falls back to a plain text field.
           //  - No `ui` key -- relay's v2 parsing ignores it, and it was
           //    stale even under v1.
+          //  - `disclose: "count"` (relay#33, fsmcp#15) is the other half of
+          //    the virtual path space. Relay appends a scope note built from
+          //    this field into every governed tool's DESCRIPTION, so a client
+          //    that never sees a host path in any fsmcp result could still
+          //    read one out of its own tool list: a live Hermes run told
+          //    its operator "/d0 maps to /private/tmp/.../sandbox_root". It
+          //    is "count" and not "none" because an agent that cannot see its
+          //    own limits behaves WORSE -- relay's docs/access-profiles.md
+          //    records one concluding a mailbox was "accessible through every
+          //    tool" having been refused every time. The note then reads
+          //    "confined to N values", which is the boundary without the
+          //    coordinates.
+          //    The spelling is load-bearing in BOTH directions and neither
+          //    direction announces itself: `"Count"` is a case near-miss that
+          //    makes relay refuse the WHOLE schema, withholding every fsmcp
+          //    tool from every grant, while an unrecognised word (`"hidden"`)
+          //    is ignored and the value renders -- fail-open, silent, and it
+          //    looks exactly like success from here.
           serverInfo: {
             name: 'fsmcp',
             version: '2.0.0',
@@ -109,6 +127,7 @@ rl.on('line', (line: string) => {
                 source: 'operator',
                 applies_to: ['fs_*'],
                 enumerable: false,
+                disclose: 'count',
               },
             },
           },
