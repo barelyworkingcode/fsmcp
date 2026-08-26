@@ -87,7 +87,9 @@ function splitComponents(fragment: string): string[] {
  *    target exists.
  *
  * Returns the resolved absolute path, or null if it could not be resolved
- * at all (a symlink cycle).
+ * at all -- a symlink cycle, or a symlink this process is not allowed to
+ * read. Both are the same fact to every caller ("this path has no canonical
+ * form I can determine"), and every caller treats it as outside the grant.
  */
 export function canonicalizePath(inputPath: string): string | null {
   const absolute = path.isAbsolute(inputPath) ? inputPath : path.resolve(inputPath);
@@ -132,7 +134,26 @@ export function canonicalizePath(inputPath: string): string | null {
 
     if (st.isSymbolicLink()) {
       if (++hops > MAX_SYMLINK_HOPS) return null;
-      const target = fs.readlinkSync(candidate);
+      let target: string;
+      try {
+        target = fs.readlinkSync(candidate);
+      } catch {
+        // A link this process cannot read (issue #36: measured as EACCES
+        // from `readlink` on a path under another user's home, reached by
+        // an fs_glob walk that had left the grant). `lstat` succeeding and
+        // `readlink` failing is a real, ordinary combination -- readdir
+        // permission on the parent is enough for the first and not for the
+        // second -- and it used to escape this function as a THROW, from
+        // three frames inside `validatePath`, in the middle of a tool's
+        // result loop. That is the failure shape C6 exists to remove: a
+        // path that cannot be resolved is a clean refusal, not an
+        // exception. It joins the symlink-cycle case as `null` because it
+        // is the same fact -- this path does not have a canonical form
+        // this process can determine -- and every caller already treats
+        // that as "outside", which is the fail-closed direction: an
+        // unreadable link is not evidence of containment.
+        return null;
+      }
       if (path.isAbsolute(target)) {
         const targetRoot = path.parse(target).root;
         resolved = targetRoot;
@@ -194,7 +215,7 @@ export function validatePath(filePath: string, allowedDirs: string[]): string | 
 
   const resolved = canonicalizePath(filePath);
   if (resolved === null) {
-    return `path ${filePath} could not be resolved (too many levels of symbolic links)`;
+    return `path ${filePath} could not be resolved (too many levels of symbolic links, or a symbolic link this server cannot read)`;
   }
 
   if (isWithinAnyDir(resolved, allowedDirs)) return null;
@@ -291,7 +312,7 @@ export function validatePathNoFollowFinal(filePath: string, allowedDirs: string[
 
   const resolvedDir = canonicalizePath(path.dirname(filePath));
   if (resolvedDir === null) {
-    return `path ${filePath} could not be resolved (too many levels of symbolic links)`;
+    return `path ${filePath} could not be resolved (too many levels of symbolic links, or a symbolic link this server cannot read)`;
   }
 
   const resolved = path.join(resolvedDir, base);
