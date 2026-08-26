@@ -134,6 +134,9 @@ numbered) is pinned by `TestAtomicReplaceBreaksHardLink`.
 | H6 | `_meta.args_sha256` mismatch → `integrity_failed`, nothing executed | `TestRegistryArgsSHA256MismatchRefusesIntegrityFailed` (new) | **missing** — no test touched `Registry.Call`'s `_meta` handling at all | covered |
 | H7 | `_meta.args_sha256` absent → call proceeds normally | `TestRegistryArgsSHA256AbsentProceedsNormally` (new) | **missing** | covered |
 | H8 | a panic in one call is caught as `io_error`; server survives | `TestPanicInOneCallDoesNotKillServer` (new, over the real `serve()` stdio loop), `TestRegistryPanicInHandlerIsCaughtAsIOError` (new, unit-level) | **missing, and the product itself had no `recover()` anywhere** — see "Production fix" below | covered |
+| H9 | oversized request frame refused | `TestServeRefusesAnOversizedFrameAndResyncs`, `TestReadFrameBoundaryIsExact` | **missing** | covered |
+| H10 | stream resyncs after one | `TestServeRefusesAnOversizedFrameAndResyncs` | **missing** | covered |
+| H11 | refusing does not accumulate | `TestReadFrameDoesNotAccumulateAnOversizedLine` | **missing** | covered |
 
 ---
 

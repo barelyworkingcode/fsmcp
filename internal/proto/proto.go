@@ -27,6 +27,12 @@ const (
 // would exceed the cap is replaced with this error rather than truncated.
 const CodeResponseTooLarge = -32000
 
+// CodeRequestTooLarge is the mirror of CodeResponseTooLarge for the inbound
+// direction: a frame longer than --max-request-bytes is refused rather than
+// accumulated. Distinct from CodeResponseTooLarge so an operator can tell
+// "this server would not say that much" from "this client said too much".
+const CodeRequestTooLarge = -32001
+
 // Request is an incoming JSON-RPC 2.0 message. ID is absent (nil) for a
 // notification, which never gets a reply, not even an error.
 type Request struct {

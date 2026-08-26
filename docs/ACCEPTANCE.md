@@ -186,6 +186,9 @@ both being refused.
 | H6 | `_meta.args_sha256` mismatch → `integrity_failed`, nothing executed |
 | H7 | `_meta.args_sha256` absent → the call proceeds normally |
 | H8 | a call that panics anywhere is caught and returned as `io_error` — one bad call never takes the server down |
+| H9 | a request frame longer than `--max-request-bytes` | refused `-32001`, drained to its newline, the server stays up |
+| H10 | the call after an oversized frame | served normally — the stream resyncs rather than desynchronising |
+| H11 | memory while refusing an oversized frame | tracks the limit, never the frame |
 
 H8 matters: v2 had a live crash where a malformed `_meta` threw outside the
 handler's `try` and killed the process.

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -224,7 +227,7 @@ func TestPanicInOneCallDoesNotKillServer(t *testing.T) {
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fs_stat","arguments":{"path":"file.txt"}}}` + "\n"
 
 	var stdout bytes.Buffer
-	if err := serve(strings.NewReader(stdin), &stdout, reg, fsapi.DefaultMaxResponseBytes); err != nil {
+	if err := serve(strings.NewReader(stdin), &stdout, reg, defaultMaxRequestBytes, fsapi.DefaultMaxResponseBytes); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
 	lines := rpcLines(t, stdout.String())
@@ -253,5 +256,120 @@ func TestPanicInOneCallDoesNotKillServer(t *testing.T) {
 	}
 	if secondPayload["ok"] != true {
 		t.Fatalf("fs_stat call after a panic: ok = %v, want true (%v)", secondPayload["ok"], secondPayload)
+	}
+}
+
+// --- the inbound bound (mirror of --max-response-bytes) ---
+
+// An oversized frame must be refused, and the SESSION must survive it. Frames
+// are newline-delimited, so the reader has to drain the offending line to its
+// terminator and pick up at the next one — otherwise one bad frame desynchronises
+// every call after it, which is worse than the allocation the bound prevents.
+func TestServeRefusesAnOversizedFrameAndResyncs(t *testing.T) {
+	rootDir := newTestRootDir(t)
+	root, err := fsapi.OpenRoot(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	reg := fsapi.NewRegistry(root, false)
+	fsapi.RegisterStat(reg)
+
+	const limit = 4096
+	huge := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_stat","arguments":{"path":"` +
+		strings.Repeat("A", limit*4) + `"}}}`
+	after := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+
+	var stdout bytes.Buffer
+	if err := serve(strings.NewReader(huge+"\n"+after+"\n"), &stdout, reg, limit, fsapi.DefaultMaxResponseBytes); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d responses, want 2 (the refusal and the call after it):\n%s", len(lines), stdout.String())
+	}
+
+	var refusal proto.Response
+	if err := json.Unmarshal([]byte(lines[0]), &refusal); err != nil {
+		t.Fatal(err)
+	}
+	if refusal.Error == nil || refusal.Error.Code != proto.CodeRequestTooLarge {
+		t.Errorf("first response = %s, want a CodeRequestTooLarge error", lines[0])
+	}
+
+	// The whole point of resyncing: the NEXT request is served normally.
+	var served proto.Response
+	if err := json.Unmarshal([]byte(lines[1]), &served); err != nil {
+		t.Fatal(err)
+	}
+	if served.Error != nil {
+		t.Errorf("the request after an oversized one failed: %s", lines[1])
+	}
+	if string(served.ID) != "2" {
+		t.Errorf("second response id = %s, want 2 — the stream did not resync", served.ID)
+	}
+}
+
+// A frame at the limit is accepted; one byte past it is not. Pinned because an
+// off-by-one here either rejects legitimate maximum-size calls from relay or
+// leaves the bound a byte looser than it says.
+func TestReadFrameBoundaryIsExact(t *testing.T) {
+	const max = 64
+	for _, tc := range []struct {
+		name         string
+		size         int
+		wantOversize bool
+	}{
+		{"one under", max - 1, false},
+		{"exactly at the limit", max, false},
+		{"one over", max + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The newline is the terminator, not part of the frame.
+			payload := strings.Repeat("x", tc.size)
+			r := bufio.NewReader(strings.NewReader(payload + "\n"))
+			line, oversized, err := readFrame(r, max)
+			if err != nil && err != io.EOF {
+				t.Fatalf("readFrame: %v", err)
+			}
+			if oversized != tc.wantOversize {
+				t.Errorf("oversized = %v, want %v (frame was %d bytes, limit %d)", oversized, tc.wantOversize, tc.size, max)
+			}
+			if !oversized && len(strings.TrimSpace(string(line))) != tc.size {
+				t.Errorf("line length = %d, want %d", len(strings.TrimSpace(string(line))), tc.size)
+			}
+			if oversized && line != nil {
+				t.Errorf("an oversized frame returned %d bytes; it must retain nothing", len(line))
+			}
+		})
+	}
+}
+
+// Refusing must be cheap, or the bound has only moved the cost. The frame here
+// is far larger than the limit, and the allocation must track the limit rather
+// than the frame.
+func TestReadFrameDoesNotAccumulateAnOversizedLine(t *testing.T) {
+	const max = 4096
+	const frame = 64 << 20 // 64 MiB, four orders of magnitude past the limit
+
+	r := bufio.NewReader(strings.NewReader(strings.Repeat("x", frame) + "\n"))
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, oversized, err := readFrame(r, max)
+	runtime.ReadMemStats(&after)
+
+	if err != nil && err != io.EOF {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if !oversized {
+		t.Fatal("a 64 MiB frame was not reported oversized")
+	}
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("draining a %d MiB frame allocated %d KiB", frame>>20, allocated>>10)
+	if allocated > frame/8 {
+		t.Errorf("draining allocated %d bytes for a %d byte frame — it is accumulating what it refuses", allocated, frame)
 	}
 }

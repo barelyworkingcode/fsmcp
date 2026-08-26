@@ -19,6 +19,14 @@ import (
 
 const defaultMaxResponseBytes = 8 * 1024 * 1024 // 8 MiB, coordinated with relay's bridge frame limit.
 
+// defaultMaxRequestBytes sits ABOVE relay's 10 MiB bridge frame limit, where
+// the response cap deliberately sits below it. The two bounds face opposite
+// directions: a reply must fit THROUGH relay, so it is capped under relay's
+// limit; a request arrives FROM relay carrying a caller's arguments plus the
+// _meta relay adds on top of them, so a cap at exactly 10 MiB would refuse a
+// legitimate maximum-size call by the width of that _meta.
+const defaultMaxRequestBytes = 12 * 1024 * 1024
+
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "fsmcp:", err)
@@ -32,6 +40,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	rootDir := fs.String("root", "", "directory to expose (required)")
 	readOnly := fs.Bool("read-only", false, "register only read-only tools")
 	maxResponseBytes := fs.Int("max-response-bytes", defaultMaxResponseBytes, "cap on a serialised JSON-RPC response line, in bytes")
+	maxRequestBytes := fs.Int("max-request-bytes", defaultMaxRequestBytes, "cap on an accepted JSON-RPC request line, in bytes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -48,6 +57,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 	if *maxResponseBytes <= 0 {
 		return fmt.Errorf("--max-response-bytes must be positive")
+	}
+	if *maxRequestBytes <= 0 {
+		return fmt.Errorf("--max-request-bytes must be positive")
 	}
 
 	if _, err := exec.LookPath("rg"); err != nil {
@@ -74,18 +86,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fsapi.RegisterMove(reg)
 	fsapi.RegisterDelete(reg)
 
-	return serve(stdin, stdout, reg, *maxResponseBytes)
+	return serve(stdin, stdout, reg, *maxRequestBytes, *maxResponseBytes)
 }
 
 // serve runs the newline-delimited JSON-RPC loop until stdin closes.
-func serve(stdin io.Reader, stdout io.Writer, reg *fsapi.Registry, maxResponseBytes int) error {
+func serve(stdin io.Reader, stdout io.Writer, reg *fsapi.Registry, maxRequestBytes, maxResponseBytes int) error {
 	reader := bufio.NewReader(stdin)
 	writer := bufio.NewWriter(stdout)
 	defer writer.Flush()
 
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(bytes.TrimSpace(line)) > 0 {
+		line, oversized, readErr := readFrame(reader, maxRequestBytes)
+		switch {
+		case oversized:
+			writeResponse(writer, maxResponseBytes, proto.NewErrorResponse(nil, proto.CodeRequestTooLarge,
+				"request exceeds max-request-bytes"))
+			if err := writer.Flush(); err != nil {
+				return err
+			}
+		case len(bytes.TrimSpace(line)) > 0:
 			handleLine(writer, reg, maxResponseBytes, line)
 			if err := writer.Flush(); err != nil {
 				return err
@@ -97,6 +116,48 @@ func serve(stdin io.Reader, stdout io.Writer, reg *fsapi.Registry, maxResponseBy
 			}
 			return readErr
 		}
+	}
+}
+
+// readFrame reads one newline-delimited frame, bounded by max bytes.
+//
+// This is deliberate: bufio.Reader.ReadBytes grows until it finds a newline,
+// with no ceiling, so a peer that sends a long line — or simply never sends a
+// newline — makes fsMCP allocate until it dies. Frames are newline-delimited,
+// which means "no newline yet" and "this message is not finished" are the same
+// observation, so the reader has no natural stopping point and must impose
+// one. --max-response-bytes already does this for the outbound direction;
+// without a bound here the server polices only what it says, never what it is
+// told.
+//
+// An oversized frame is DRAINED to its terminating newline rather than
+// abandoned, so the stream resyncs and one bad frame costs one call instead of
+// the session. Nothing of it is retained: the accumulator is dropped the moment
+// the limit is passed, so refusing a 5 GB line costs the read buffer, not 5 GB.
+// max counts the frame WITHOUT its terminating newline, which is what relay
+// measures its own 10 MiB frame limit against — the two numbers are meant to be
+// compared by an operator, so they must measure the same thing.
+func readFrame(r *bufio.Reader, max int) (line []byte, oversized bool, err error) {
+	var buf []byte
+	for {
+		// ReadSlice returns a view into the reader's own buffer, valid only
+		// until the next read — appending is what copies it out.
+		chunk, e := r.ReadSlice('\n')
+		size := len(buf) + len(chunk)
+		// e == nil means the delimiter was found, so chunk ends with it.
+		if e == nil && size > 0 {
+			size--
+		}
+		if !oversized && size > max {
+			oversized, buf = true, nil
+		}
+		if !oversized {
+			buf = append(buf, chunk...)
+		}
+		if e == bufio.ErrBufferFull {
+			continue
+		}
+		return buf, oversized, e
 	}
 }
 

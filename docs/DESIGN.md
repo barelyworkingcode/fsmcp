@@ -27,7 +27,7 @@ changed deliberately.
 ## Configuration
 
 ```
-fsmcp --root <dir> [--read-only] [--max-response-bytes N]
+fsmcp --root <dir> [--read-only] [--max-response-bytes N] [--max-request-bytes N]
 ```
 
 - `--root` is **required**. fsMCP refuses to start without it, and refuses to
@@ -37,6 +37,14 @@ fsmcp --root <dir> [--read-only] [--max-response-bytes N]
 - `--max-response-bytes` defaults to `8388608` (8 MiB). Relay's bridge frame
   limit is 10 MiB; the operator sets this so the two are coordinated rather
   than independently guessed.
+- `--max-request-bytes` defaults to `12582912` (12 MiB) and bounds an accepted
+  request line. It sits **above** relay's 10 MiB where the response cap sits
+  below it, because the two face opposite directions: a reply must fit
+  *through* relay, while a request arrives *from* relay carrying a caller's
+  arguments plus the `_meta` relay adds on top of them. A cap at exactly
+  10 MiB would refuse a legitimate maximum-size call by the width of that
+  `_meta`. Both bounds measure a frame **without** its terminating newline,
+  which is what relay measures too — they are meant to be compared.
 - **`ripgrep` is a hard requirement.** fsMCP resolves `rg` at startup and
   refuses to start without it. There is no pure-Go fallback: two search
   implementations that can disagree is a bug generator, and the previous
@@ -404,12 +412,24 @@ This also dissolves the lone-surrogate problem rather than defending it: a
 mangled `find` needle simply fails to match, and a mangled `replace` fails the
 hash. Fails closed both ways, with no surrogate check anywhere.
 
-## Response budget
+## Budgets, in both directions
 
 One cap, not three. `--max-response-bytes` bounds the serialised JSON-RPC line.
 Each tool bounds its own payload against it and reports `truncated` (search) or
 `eof` (read) so a caller can tell a bounded answer from a complete one. Base64
 expands 4/3; a read's default `length` accounts for that.
+
+The inbound direction is bounded too, for a reason the outbound one does not
+have. Frames are newline-delimited, so "no newline yet" and "this message is
+not finished" are the same observation — a reader has no natural stopping point
+and must impose one, or a peer that never sends a newline makes fsMCP allocate
+until it dies. An over-long frame is refused with `-32001` and **drained to its
+terminating newline**, so the stream resyncs and one bad frame costs one call
+rather than the session. Nothing of it is retained: draining a 64 MiB line
+allocates kilobytes.
+
+A server that polices only what it says, never what it is told, is bounded only
+in the direction it already controls.
 
 ## Comments
 
