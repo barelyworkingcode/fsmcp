@@ -138,14 +138,27 @@ function stripTrailingSep(p: string): string {
  * for leaving the ambiguity to resolve itself silently to whichever entry
  * happens to be enumerated first.
  *
- * Naming both colliding directories in the refusal is safe: this function
- * only ever sees `allowedDirs`, which by construction contains either plain
- * CLI directories (operator-side, already exempt from translation -- see
- * this file's own top-of-file doc) or `_meta` entries that already
- * canonicalize inside a CLI directory and were therefore supplied verbatim
- * by whoever is about to read this message. There is no path through
- * `narrowAllowedDirs` that lets this function see a THIRD PARTY's directory
- * neither the operator nor this call's own `_meta` already named.
+ * The refusal the CLIENT reads names only the label. The two colliding
+ * directories go to stderr instead, where the operator reads them.
+ *
+ * This used to name both directories to the client, on the reasoning that
+ * `allowedDirs` only ever holds an operator's own CLI directories or
+ * `_meta` entries the caller itself supplied, so the message could disclose
+ * nothing the reader did not already have. That reasoning holds for the
+ * standalone CLI case and fails for the one that matters. Under relay,
+ * `--allowed-dir` is not passed at all: the whole scope arrives through
+ * `_meta`, which **relay** populates from context an operator configured,
+ * and which the client cannot set (relay builds it from stored context --
+ * `relay/router.go:533` -- and never forwards a client's). So in the
+ * deployment this server exists for, the directories in a collision are the
+ * operator's host paths and the reader is the one party issue #7 exists to
+ * keep them from. A misconfiguration is a poor reason to hand over the
+ * thing every other surface here is careful not to.
+ *
+ * The label alone is also the more useful half for each reader. A client
+ * can do nothing with the host paths; it cannot fix the configuration, and
+ * every call fails until someone does. An operator needs both paths, and
+ * has stderr.
  */
 export function assignLabels(
   allowedDirs: string[],
@@ -163,10 +176,18 @@ export function assignLabels(
     // client to confuse. Only a DIFFERENT directory claiming an
     // already-used label is the failure this refuses.
     if (claimedBy !== undefined && claimedBy !== bare) {
+      // The operator's copy, with the detail needed to fix it. stderr is not
+      // the protocol stream (stdout is), so this cannot corrupt a response,
+      // and it is where a stdio MCP's host collects a child's diagnostics.
+      process.stderr.write(
+        `fsmcp: label "${label}" is claimed by two different allowed directories: ` +
+          `${claimedBy} and ${bare}. Every call is refused until each has a distinct label.\n`
+      );
       return errorResult(
-        `fsmcp: label "${label}" is claimed by two different allowed directories (${claimedBy} and ` +
-          `${bare}). Refusing every call under this configuration rather than silently resolving ` +
-          `the ambiguity to one of them -- give each directory a distinct label.`
+        `fsmcp: this server's configuration is ambiguous -- the label "${label}" is claimed by two ` +
+          `different allowed directories, so an address beginning "/${label}/" does not identify one ` +
+          `file. Refusing every call rather than silently resolving it to one of them. An operator ` +
+          `must give each directory a distinct label; the details are in this server's stderr.`
       );
     }
     hostDirByLabel.set(label, bare);

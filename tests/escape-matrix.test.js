@@ -1109,18 +1109,25 @@ test('P4: a duplicate label fails every call closed, not just the ambiguous addr
       // reaches a tool handler.
       const glob = await server.callTool('fs_glob', { pattern: '**/*' });
       assert.equal(glob.isError, true);
-      assert.match(allText(glob), /label "z" is claimed by two different allowed directories/);
+      assert.match(allText(glob), /the label "z" is claimed by two different allowed directories/);
 
       const read = await server.callTool('fs_read', { file_path: '/z/notes.txt' });
       assert.equal(read.isError, true);
-      assert.match(allText(read), /label "z" is claimed by two different allowed directories/);
+      assert.match(allText(read), /the label "z" is claimed by two different allowed directories/);
 
-      // Both colliding directories are named -- safe to reveal here because
-      // both came from this call's own _meta/CLI configuration (never a
-      // third party's path); naming them is what lets an operator actually
-      // fix the collision instead of guessing which two of N directories
-      // clashed.
-      assert.ok(allText(glob).includes(dirA) && allText(glob).includes(dirB));
+      // NEITHER colliding directory is named to the client. This used to
+      // name both, reasoning that allowedDirs only ever holds the
+      // operator's own CLI directories or _meta entries the caller itself
+      // supplied. That is true standalone and false in the deployment this
+      // server exists for: under relay, --allowed-dir is not passed at all
+      // and the whole scope arrives via _meta, which relay populates from
+      // operator context and the client cannot set. So the colliding
+      // directories are the operator's host paths and the reader is exactly
+      // the party issue #7 keeps them from. The operator's copy, with both
+      // paths, goes to stderr.
+      assert.ok(!allText(glob).includes(dirA), 'client message must not name a host directory');
+      assert.ok(!allText(glob).includes(dirB), 'client message must not name a host directory');
+      assert.ok(!allText(read).includes(dirA), 'client message must not name a host directory');
     } finally {
       server.close();
     }
@@ -1144,8 +1151,14 @@ test('P4: a duplicate label fails every call closed, not just the ambiguous addr
     try {
       const list = await server.callTool('fs_list', {});
       assert.equal(list.isError, true);
-      assert.match(allText(list), /label "d1" is claimed by two different allowed directories/);
-      assert.ok(allText(list).includes(dirX) && allText(list).includes(dirY));
+      assert.match(allText(list), /the label "d1" is claimed by two different allowed directories/);
+      // Same rule as the explicit-collision case above: the label, never the
+      // host directories. This shape is the one a human would never predict
+      // -- an explicit label= that happens to equal the d<N> another entry
+      // would have been auto-assigned -- which makes it the one most likely
+      // to fire against a real operator's configuration rather than a test's.
+      assert.ok(!allText(list).includes(dirX), 'client message must not name a host directory');
+      assert.ok(!allText(list).includes(dirY), 'client message must not name a host directory');
     } finally {
       server.close();
     }
