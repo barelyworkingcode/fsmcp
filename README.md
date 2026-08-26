@@ -8,14 +8,14 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 | Tool | Read-only | Description |
 |------|-----------|-------------|
 | `fs_read` | yes | Read a file: a line-numbered UTF-8 text page (default), or exact bytes as base64 (whole file up to 256KiB, or a byte window of any file) |
-| `fs_glob` | yes | Find files by glob pattern (relative patterns only -- see "A pattern is a pattern, not an address") |
-| `fs_grep` | yes | Search file contents with regex (bounded result: at most 1000 lines / 1MiB, and it says when it is bounded) |
+| `fs_glob` | yes | Find files by glob pattern (relative patterns only -- see "A pattern is a pattern, not an address") -- one escaped path per line |
+| `fs_grep` | yes | Search file contents with regex (bounded result: at most 1000 lines / 1MiB, and it says when it is bounded) -- escaped path field, verbatim matched content |
 | `fs_list` | yes | List one directory's immediate contents (non-recursive): type, size, mtime, name -- one escaped line per entry |
-| `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) |
+| `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) -- one escaped path per line |
 | `fs_write` | no | Write or create files (UTF-8 text or exact bytes via base64) |
-| `fs_edit` | no | Find-and-replace string editing (literal, UTF-8 text only) |
+| `fs_edit` | no | Find-and-replace string editing (literal, UTF-8 text only, 1MiB per string and 10MiB per file) |
 | `fs_mkdir` | no | Create a directory (recursive by default) |
-| `fs_move` | no | Move or rename a file or directory (renames only -- it deletes nothing) |
+| `fs_move` | no | Move or rename a file or directory (renames only -- it deletes nothing, and says so when source and destination are one file) |
 | `fs_delete` | no | Delete a file, symlink, or directory |
 
 An `access: read` grant in relay admits only the five `readOnlyHint: true` tools above; `access: write` admits all ten.
@@ -174,30 +174,80 @@ branching on `isError`.
 **An empty `new_string` is legitimate and unaffected** -- that is a deletion,
 and it still works.
 
-### `fs_list`'s line format
+### One result per line: the escaped path field
 
-`fs_list` emits one line per entry, tab-separated, `type\tsize\tmtime\tpath`.
-Two things about that record are worth knowing before parsing it.
+Four tools emit line-oriented text and a caller has nothing to parse it with
+except a split on `\n` and then on whatever separates the fields:
 
-**The path field is backslash-escaped.** A literal backslash is written `\\`, a
-newline `\n`, a carriage return `\r`, a tab `\t`. Nothing else is escaped, and
-no other field is. Decode by scanning left to right and consuming a backslash
-together with the character after it -- *not* by running the four
-replacements independently, which turns `\\n` (an escaped backslash followed by
-the letter n) into a newline that was never in the name.
+| tool | one line is |
+|---|---|
+| `fs_list` | `type\tsize\tmtime\tpath` |
+| `fs_glob`, `fs_find` | a path, and nothing else on the line |
+| `fs_grep` | a path (`files_with_matches`), `path:count`, or `path:line:content` |
+
+Five things about those lines are worth knowing before parsing them. The
+first four are shared; the last is `fs_list`'s alone.
+
+**The path field is backslash-escaped, in all four.** A literal backslash is
+written `\\`, a newline `\n`, a carriage return `\r`, a tab `\t`. Nothing else
+is escaped, and no field other than the path is. Decode by scanning left to
+right and consuming a backslash together with the character after it -- *not*
+by running the replacements independently, which turns `\\n` (an escaped
+backslash followed by the letter n) into a newline that was never in the name.
 
 A filename containing a newline is legal on every POSIX filesystem, APFS
 included, and creatable through fsMCP's own `fs_write` and `fs_move`. Emitted
-raw, one entry became two lines: a phantom record with no type and no size,
-and a real record truncated at the newline. Nothing errored -- the format
-silently stopped being the format, and the failure landed in the caller's
-parser rather than here. The alternative of skipping such an entry was
-rejected: it would make a real, reachable file invisible to the one tool whose
-job is to say what is there, while every other tool still operated on it by
-name. `fs_glob`, `fs_find` and `fs_grep` join their results with `\n` too and
-do **not** escape yet.
+raw, one result became two lines: a phantom record, and a real record
+truncated at the newline. Nothing errored -- the format silently stopped being
+the format, and the failure landed in the caller's parser rather than here.
+The alternative of skipping such an entry was rejected: it would make a real,
+reachable file invisible to the tools whose job is to say what is there, while
+every other tool still operated on it by name.
 
-**A symlink's size is always `0`.** `fs_list` uses `lstat`, never `stat` -- it
+**`fs_grep` escapes `:` as well, and never touches the matched content.** The
+colon is that tool's field separator, so a path containing one broke
+`path:line:content` and `path:count` independently of newlines and always did
+-- `/d0/a:b.txt:3:hit` reads as a file called `/d0/a` on line `b.txt`. It is
+escaped in every output mode, `files_with_matches` included, so one unescaper
+works on every `fs_grep` reply: **the path field never contains an unescaped
+colon, so the first unescaped colon on the line is where the path ends.**
+
+The content field is the opposite rule and it is not negotiable: it is the
+file's own matched bytes, exactly as `fs_read` would return them, and it is
+never escaped, translated, or altered. A colon in it is the file's colon. This
+is the rule PR #10 exists for -- a whole-result rewrite once silently
+corrupted a file whose bytes happened to contain the sandbox path -- and
+escaping content would be that mistake in new clothes: `fs_grep` would report
+a line that `fs_read` disagrees with, with no way to tell which is the file.
+
+One ambiguity survives and is stated rather than hidden. With `context` set,
+the ripgrep backend reproduces plain rg's separators, so a *context* line is
+`path-line-content`. The `-` is deliberately not escaped -- hyphens are
+everywhere in real paths, and escaping them would put a backslash in nearly
+every line of every context reply to make a rare case parseable -- so a path
+containing `-` cannot be told from the context separator. If you must parse
+paths mechanically, use `files_with_matches`, whose lines are one escaped path
+each.
+
+**Results end at the first blank line.** Every one of these tools may append a
+trailer: a `(showing X of Y ...)` cap note, or an `[fsmcp: ...]` advisory
+about a search that was cut short. Those are separated from the last result by
+one blank line, and no result line is ever empty -- so everything before the
+first empty line is results, one per line, and everything after it is fsMCP's
+own commentary. The trailer is not removed to make the payload uniform,
+because a bounded answer has to say so both structurally (`_meta.truncated`)
+and in words; what changed is that the rule is now written down.
+
+**`fs_find` asks ripgrep for NUL-separated paths** (`--null`), which is the
+same defect pointing inward. `rg --files` writes one path per line, and
+`fs_find` split that on `\n`, so a file called `we<LF>ird.txt` arrived as
+`./we` and `ird.txt`, both were dropped by the containment re-check, and the
+file was invisible to `fs_find` on every host with ripgrep installed -- while
+the built-in walker, which builds paths from directory entries, listed it
+fine. Escaping the output would have been a promise about a name `fs_find`
+never had.
+
+**A symlink's size is always `0`, in `fs_list`.** It uses `lstat`, never `stat` -- it
 must not follow the link -- and `st_size` for a symlink is the byte length of
 the *target path string*. So the size column used to be an exact measurement
 of a path the client is not allowed to know exists, on the one entry type
@@ -294,9 +344,10 @@ whichever tool was found to break first:
 
 | bound | default | what it protects |
 |---|---|---|
-| response bytes | **1 MiB** | the transport. ~10x under relay's 10 MiB frame cap. Applies to the encoded response, both encodings, and to `fs_write`'s inbound `content` -- a request line is a line too. |
+| response bytes | **1 MiB** | the transport. ~10x under relay's 10 MiB frame cap. Applies to the encoded response, both encodings, and to the inbound strings -- `fs_write`'s `content`, `fs_edit`'s `old_string` and `new_string` -- because a request line is a line too. |
 | base64 file ceiling | **256 KiB** | your context, not the transport. Base64 tokenizes at roughly 3 chars/token, so 1 MiB of file is ~460K tokens: more than twice a standard 200K window. 256 KiB is ~115K tokens -- an icon, a config blob, a certificate, a small PDF. |
 | `fs_read` allocation limit | **10 MiB** | the *process*. fsMCP is one synchronous loop; `readFileSync` of a huge file blocks and can kill the process every other caller is waiting on. Unchanged, and **not** made redundant by the two above: it answers a different question. |
+| `fs_read`/`fs_edit` read limit | **10 MiB** | the *process*, again. `fs_edit` had no read cap at all until issue #38 -- it loaded whatever was on disk with a bare `readFileSync`, which is the same unbounded synchronous allocation reached through a different door. |
 
 Measured, not estimated. Base64 inflates by exactly 4/3; text mode adds line
 numbers, a tab separator and truncation markers, and then **JSON escaping
@@ -333,6 +384,17 @@ returns a bounded result that says so **twice** -- inline for a human,
   Refusing is the wrong answer for a search: one that found too much has still
   done useful work, and `fs_grep` has never claimed to be a fidelity path the
   way `fs_read`'s base64 mode has.
+- **`fs_write` and `fs_edit`: they refuse, and the advice differs because the
+  tools differ.** `fs_write` can suggest writing the file in smaller pieces.
+  `fs_edit` has no offset, append or windowed mode, so that would be false
+  advice -- and a refusal naming a remedy that does not work is exactly how
+  `fs_move` used to talk callers into destroying files. An over-size
+  `old_string`/`new_string` is told what does work: split the *replacement*
+  into several smaller edits, each anchored on surrounding text, including
+  text a previous call just wrote. An over-size *file* is told the true and
+  unwelcome thing -- the whole file has to be loaded to find `old_string` at
+  all, so a file that large cannot be edited in place through fsMCP; it can
+  only be read, in base64 windows.
 - **Anything else:** a last-resort backstop in the registry replaces any
   result over the bound with an error naming the tool, and a second one at the
   stdout write ensures no line ever leaves this process over the frame limit.
@@ -760,6 +822,36 @@ comparison settles the case-only rename, the self-move and the `.`-alias at
 once, and a rename of one entry never touches `overwrite` at all. When the two
 names also resolve to the same string the reply says `nothing to move` rather
 than claiming a move that did not happen.
+
+**When they are one file under two different names, the reply says exactly
+that -- and refuses to guess which kind.** Two names can share `{dev, ino}`
+two ways, and fsMCP cannot tell them apart from `lstat`:
+
+- a **case-insensitive alias** (`a.txt` / `A.txt` on APFS), where `rename(2)`
+  really does rename the single entry;
+- a **hard-linked pair**, where `rename(2)` is specified to "return
+  successfully and perform no other action" -- both names survive and nothing
+  moves.
+
+`nlink` does not separate them: it is 2 or more for a hard-linked pair *and*
+for a case alias of a file that happens to have a link elsewhere, and it never
+says whether the other link is the destination you named. So the reply asserts
+neither. It used to say `Moved a.txt to b.txt`, with `relay audit` recording
+`ok`, while both names sat there untouched -- and an agent that believes it
+has moved a file and then acts on that belief is the failure this whole
+section is about. It now says the two paths are the same file, spells out both
+readings, and points at the one thing that settles it afterwards and that you
+can check with the tools you already have: **a case-only rename leaves one
+entry in the directory, a hard-linked pair leaves two.** It stays a success,
+because the end state you asked for holds and nothing was destroyed.
+
+This is also why the same-entry check runs *before* the `overwrite` guard, so
+a hard-linked destination that already exists succeeds without
+`overwrite: true`. That is deliberate. `overwrite` gates destruction, and here
+there is nothing to destroy -- the destination *is* the source. Demanding the
+flag would be asking permission to destroy a file when the only file involved
+is your own source, which is precisely the sentence that used to talk callers
+into losing data.
 
 **An existing directory destination is refused, and `overwrite: true` is not
 a way around it.** The refusal names the call you almost certainly meant:

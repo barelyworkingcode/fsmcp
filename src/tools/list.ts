@@ -6,6 +6,7 @@ import { NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { LabelEntry } from '../types';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 
 const MAX_ENTRIES = 5000;
 
@@ -16,55 +17,13 @@ function entryType(entry: fs.Dirent): string {
   return 'other';
 }
 
-/**
- * Issue #31: make a path safe to put in a tab-separated, one-line-per-entry
- * record.
- *
- * `fs_list` documents its output as `"type\tsize\tmtime\tpath"`, one line
- * per entry, and a caller has nothing to parse it with except a split on
- * `\n` and then on `\t`. A newline in a FILENAME -- legal on every POSIX
- * filesystem including APFS, and creatable through fsMCP's own `fs_write`
- * and `fs_move` -- was emitted raw, so one entry became two lines: a
- * phantom record with no type and no size, and a real record whose path
- * stopped at the newline. The format did not fail; it silently stopped
- * being the format, in the caller's parser rather than here.
- *
- * Escaping rather than skipping the entry (the other candidate in the
- * issue): refusing to list a file whose name contains a separator makes a
- * real, reachable file invisible to the one tool whose job is to say what
- * is there, and every other tool would still happily operate on it by name.
- * A parsing problem is not worth trading for a file that cannot be found.
- * Structured content instead of a text table is the clean answer and a much
- * larger change, worth it only if these tools are reworked as a group.
- *
- * The scheme is C-style and deliberately minimal: a literal backslash
- * becomes `\\`, and the three characters that carry structure in this format
- * -- newline, carriage return, tab -- become `\n`, `\r`, `\t`. Nothing else
- * is touched. The backslash pass must come FIRST and must be
- * unconditional, or the scheme is not decodable: a real file named
- * `a\nb` (backslash, n) would otherwise emit the identical bytes as a file
- * whose name contains an actual newline, and a caller unescaping would
- * conjure a newline into a name that never had one. That unconditional
- * pass is the one behaviour change for ordinary paths -- a path containing
- * a backslash now emits it doubled -- and it is the price of the format
- * being reversible at all.
- *
- * Applied to the already-translated virtual path (or the redaction
- * placeholder), never to the host path: what goes on the wire is what has
- * to be parseable, and escaping before translation would change the string
- * `hostToVirtualOrRedact` matches its prefix against.
- *
- * The tool description states these rules, because a caller cannot parse a
- * format whose escaping is unstated -- an escaping scheme nobody is told
- * about turns one silent corruption into a different one.
- */
-function escapePathField(p: string): string {
-  return p
-    .replace(/\\/g, '\\\\')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t');
-}
+// Issue #31's `escapePathField` used to live here, as a fact about this one
+// tool's record. Issue #37 is what happens when a shared property is written
+// down in one place: `fs_glob`, `fs_find` and `fs_grep` had the identical
+// exposure and did not adopt it. It is in `resultFormat.ts` now, unchanged in
+// behaviour for `fs_list`, with the full argument for the scheme (why escape
+// rather than skip, why the backslash pass is first and unconditional, why a
+// file's own CONTENT is never escaped) in its doc comment there.
 
 /**
  * List one directory's immediate children.
@@ -149,13 +108,9 @@ export function registerList(registry: ToolRegistry): void {
         'List the immediate contents of a directory (non-recursive). One line per entry, ' +
         'tab-separated: "type\\tsize\\tmtime\\tpath". type is one of file, directory, symlink, ' +
         'other. size is bytes, and is always 0 for a symlink (a link\'s own size measures its ' +
-        'target path, which is not yours to read). mtime is ISO 8601. The path field is ' +
-        'backslash-escaped so that one entry is always exactly one line, whatever the filename: ' +
-        'a literal backslash is written "\\\\", a newline "\\n", a carriage return "\\r" and a tab ' +
-        '"\\t"; no other character is escaped, and no other field is escaped. Unescape by ' +
-        'scanning left to right and consuming a backslash together with the character after it ' +
-        '-- do not run the four replacements independently, or "\\\\n" (an escaped backslash ' +
-        'followed by the letter n) decodes to a newline that is not in the name. ' +
+        'target path, which is not yours to read). mtime is ISO 8601. ' +
+        pathFieldEscapingRules('entry') + ' ' +
+        RESULT_TRAILER_RULE + ' ' +
         'Defaults to the allowed directories when path is omitted. ' +
         `Capped at ${MAX_ENTRIES} entries; when it caps, a blank line and a "(showing X of Y ` +
         `entries)" trailer follow the last entry.`,

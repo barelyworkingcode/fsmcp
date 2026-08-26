@@ -83,6 +83,62 @@ function directoryDestinationMessage(
   );
 }
 
+/**
+ * What to say after `rename(2)` succeeded on two names for ONE directory
+ * entry (issue #39).
+ *
+ * `Moved a.txt to b.txt` was the old answer and it asserted something that
+ * may not have happened. A hard-linked pair shares `{dev, ino}`, takes
+ * `isSameEntry`'s branch, and `rename(2)` is specified to "return
+ * successfully and perform no other action" for it -- so both names were
+ * still there afterwards, unchanged, while the reply said a move had
+ * happened and relay's audit recorded `ok`. An agent that believes it has
+ * moved a file and then acts on that belief is the failure mode; the syscall
+ * behaviour itself is correct and nothing was destroyed, which is why this
+ * is a wording fix and not a behaviour one.
+ *
+ * THE CONSTRAINT THAT SHAPES THIS SENTENCE: fsMCP cannot tell a hard-linked
+ * pair from a case-insensitive alias, and must not pretend it can. Both
+ * present as one `{dev, ino}` under two path strings. `nlink` is NOT a
+ * discriminator: it is 2+ for a hard-linked pair AND for a case alias of a
+ * file that happens to have a hard link anywhere else on the volume, and it
+ * says nothing about whether the OTHER link is the destination this call
+ * named. (`nlink === 1` would rule the hard-link case out, but a message
+ * that is precise in one branch and vague in the other trains a reader to
+ * read the vague branch as the precise one -- and the value is racy anyway,
+ * since another process may add or drop a link between the `lstat` and the
+ * `rename`.) `canonicalizePath` does not fold case either -- measured on
+ * APFS: `.../A.txt` resolves to `.../A.txt` even when the entry on disk is
+ * `a.txt` -- which is exactly why a case alias reaches this branch rather
+ * than the "already at" one above it.
+ *
+ * For a case alias the rename genuinely happened; for a hard link it
+ * genuinely did not. So the message asserts NEITHER, states both, and points
+ * at the one thing that does tell them apart AFTER the fact: the directory
+ * listing. A case alias leaves one entry, spelled the new way; a hard-linked
+ * pair leaves both. That is an observation the caller can make with the
+ * tools it already has, not a discriminator invented here.
+ *
+ * Still a SUCCESS, not an error: the requested end state holds (the
+ * destination exists with the intended content), nothing failed and nothing
+ * was destroyed, and turning it into an error would refuse a call that is
+ * legitimately a no-op -- one more audit line that reads as a failure when
+ * the truth is "already so", which is the same argument the literal
+ * self-move branch above already makes.
+ */
+function sameEntryMessage(source: string, destination: string): string {
+  return (
+    `${source} and ${destination} are two names for the SAME file (same device and inode), so ` +
+    `no data moved. fsMCP cannot tell which of the two possible situations this is, and does ` +
+    `not guess: if they are two spellings of one name (a case-only rename on a case-insensitive ` +
+    `volume -- macOS's default), rename(2) performed the rename and the entry is now spelled ` +
+    `${destination}; if they are two hard links to one file, rename(2) is specified to succeed ` +
+    `and do nothing, and BOTH names still exist. Either way nothing was destroyed and ` +
+    `${destination} holds the content you meant. List the containing directory if you need to ` +
+    `know which it was: a case-only rename leaves one entry, a hard-linked pair leaves two.`
+  );
+}
+
 export function registerMove(registry: ToolRegistry): void {
   registry.register(
     {
@@ -91,8 +147,11 @@ export function registerMove(registry: ToolRegistry): void {
         'Move or rename a file or directory. Refuses if the destination already exists unless ' +
         'overwrite is set to true, which replaces an existing file -- never a directory. ' +
         'Renaming a file to a different spelling of the same name (a case-only rename on a ' +
-        'case-insensitive filesystem) works and needs no flag. Deletes nothing: rename(2) is the ' +
-        'only syscall this tool makes.',
+        'case-insensitive filesystem) works and needs no flag. If source and destination turn ' +
+        'out to be two names for one file -- a case-only rename, or a hard-linked pair, which ' +
+        'this server cannot tell apart -- the reply says so instead of reporting a move: nothing ' +
+        'is destroyed either way, but with a hard link nothing moves either, and both names ' +
+        'still exist afterwards. Deletes nothing: rename(2) is the only syscall this tool makes.',
       inputSchema: schema(
         {
           source: stringProp(virtualPathDescription()),
@@ -223,6 +282,11 @@ export function registerMove(registry: ToolRegistry): void {
         destStat = null;
       }
 
+      // Issue #39: set when the two paths are ONE entry under two different
+      // names, so the reply below can say that instead of claiming a move.
+      // See the branch that sets it, and `sameEntryMessage`.
+      let sameEntryTwoNames = false;
+
       if (destStat !== null) {
         // The sandbox root is not a destination. checkPath(destination)
         // passes for an allowed_dir root itself, because a root is inside
@@ -251,6 +315,22 @@ export function registerMove(registry: ToolRegistry): void {
         // `mv` does in one line. Reached before the "destination already
         // exists" refusal precisely so that refusal can no longer be the
         // sentence that talks a caller into destroying the file.
+        //
+        // Issue #39 asked whether running BEFORE the `overwrite` guard is
+        // right, since it means a hard-linked destination that exists
+        // succeeds without `overwrite: true`. It is right, and the ordering
+        // is the point rather than an accident of it. `overwrite` gates
+        // DESTRUCTION -- it is the caller saying "yes, replace whatever is
+        // at the destination" -- and on this branch there is nothing to
+        // destroy: the destination IS the source, one inode with two names,
+        // and `rename(2)` either re-spells the single entry (case alias) or
+        // does nothing at all (hard link). Demanding the flag here would be
+        // asking permission to destroy a file when the only file involved is
+        // the caller's own source, which is precisely the sentence issue #23
+        // removed -- obeying "pass overwrite: true to replace it" was the
+        // call that destroyed the data. The flag stays attached to the case
+        // where it means something, and this branch runs first so it cannot
+        // be reached by the shape that used to be lethal.
         if (isSameEntry(sourceStat, destStat)) {
           const resolvedDest = canonicalizePath(destination);
           if (resolvedSource !== null && resolvedSource === resolvedDest) {
@@ -269,7 +349,10 @@ export function registerMove(registry: ToolRegistry): void {
           }
           // Different names for one entry: a case-only rename on a
           // case-insensitive volume, or a hard-link pair (see isSameEntry).
-          // Fall through to the single renameSync below.
+          // Fall through to the single renameSync below -- but remember that
+          // this is what happened, because "Moved X to Y" is not true of it
+          // (issue #39, and `sameEntryMessage` for what is).
+          sameEntryTwoNames = true;
         } else if (destStat.isDirectory()) {
           // Issue #23, defect 2. `mv file dir/` is the POSIX idiom every
           // agent knows, and fs_move used to read it as "replace that
@@ -384,6 +467,14 @@ export function registerMove(registry: ToolRegistry): void {
           );
         }
         return errorResult(`move failed: ${describeError(err, ctx.labels)}`);
+      }
+
+      if (sameEntryTwoNames) {
+        return translateResult(
+          textResult(sameEntryMessage(source, destination)),
+          [source, destination],
+          ctx.labels
+        );
       }
 
       return translateResult(textResult(`Moved ${source} to ${destination}`), [source, destination], ctx.labels);

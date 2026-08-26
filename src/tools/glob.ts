@@ -7,6 +7,7 @@ import { textResult, errorResult, scopeViolationResult, LabelEntry, MCPCallResul
 import { canonicalizePath, validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 import { grepBudgetMs } from './grep';
 
 const MAX_RESULTS = 1000;
@@ -320,7 +321,15 @@ export function registerGlob(registry: ToolRegistry): void {
     {
       name: 'fs_glob',
       description:
-        'Find files matching a glob pattern. The pattern is relative to the directory being searched and may not name a location: a pattern that begins at the filesystem root, or contains a ".." component in any spelling, is refused. Returns virtual paths ("/<label>/...", never a host filesystem path) sorted by modification time (newest first). Capped at 1000 results, and the walk itself is confined to the granted directories and bounded in wall-clock time.',
+        'Find files matching a glob pattern. The pattern is relative to the directory being ' +
+        'searched and may not name a location: a pattern that begins at the filesystem root, or ' +
+        'contains a ".." component in any spelling, is refused. Returns virtual paths ' +
+        '("/<label>/...", never a host filesystem path) sorted by modification time (newest ' +
+        'first), one per line and nothing else on the line. ' +
+        pathFieldEscapingRules('result') + ' ' +
+        RESULT_TRAILER_RULE + ' ' +
+        `Capped at ${MAX_RESULTS} results, and the walk itself is confined to the granted ` +
+        'directories and bounded in wall-clock time.',
       inputSchema: schema(
         {
           pattern: stringProp("Glob pattern, relative to the search directory (e.g. '**/*.ts'). May not start at the filesystem root and may not contain a '..' component."),
@@ -520,9 +529,18 @@ export function registerGlob(registry: ToolRegistry): void {
       // Rendered before the cap is applied, not after, so issue #19's byte
       // budget measures the strings that will actually be sent rather than
       // the host paths they were built from.
+      //
+      // Issue #37: escaped on the way out, the same scheme and the same
+      // rules `fs_list` has had since #31 -- adopted rather than
+      // re-derived, because "one result per line" was equally untrue here
+      // and a filename with a newline in it turned one hit into two lines,
+      // one of them a truncated path a caller would then try to read.
+      // Applied AFTER the virtual translation, never before: escaping first
+      // would change the string `hostToVirtualOrRedact` matches its prefix
+      // against.
       const rendered = withMtime
         .slice(0, MAX_RESULTS)
-        .map((f) => hostToVirtualOrRedact(f.path, ctx.labels));
+        .map((f) => escapePathField(hostToVirtualOrRedact(f.path, ctx.labels)));
 
       const timedOut = guard.outOfBudget();
 
