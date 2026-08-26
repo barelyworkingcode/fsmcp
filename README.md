@@ -68,6 +68,44 @@ When fsmcp is run with `--allowed-dir` **and** a caller supplies `_meta.allowed_
 
 `--allowed-dir /` combined with a caller-supplied `_meta.allowed_dirs: ["/"]` therefore stays confined to whatever narrower scope was actually intersected in -- `_meta` cannot use a `/` (or any other directory outside the CLI grant) to escape it.
 
+### A symlink out of the sandbox is refused, even one a human placed
+
+A symlink that lives inside an allowed directory but resolves outside it is
+refused -- on read, on write, and in the output of every search tool. This
+holds whoever created the link and however deliberately.
+
+The tempting reading is that a link someone put there by hand is an
+intentional grant, and should be followed. It is not treated as one, for two
+reasons.
+
+**Symlinks appear in a directory tree without anyone deciding.** `npm install`
+creates them throughout `node_modules/.bin`, git checkouts carry them,
+extracting a tarball restores them. "A human put it there" describes far less
+of the real population of links in a working directory than it sounds like it
+does, and nothing distinguishes the deliberate ones at the point the traversal
+is checked.
+
+**It would cost `allowed_dirs` its meaning.** Right now that field is the
+complete answer to *what can this client reach* -- an operator can read a
+grant and know. Following links makes the answer the transitive closure over
+whatever links happen to exist, which changes underneath the operator without
+any edit to the grant. Relay's own rule is that injecting a scope an MCP does
+not enforce is worse than no scope at all, because the UI then asserts a
+confinement that does not exist.
+
+So there is no flag for it, and adding one would need to answer both points
+above. The capability people actually want here -- *that other directory
+should be reachable too* -- is already spelled `allowed_dirs`: list the target
+directory alongside the first. That is reviewable in the profile, visible in
+the audit log, enforced by the same code path, and it cannot drift when a
+package manager creates a link.
+
+fsMCP also cannot *create* a symlink: its entire mutating syscall surface is
+`writeFileSync`, `mkdirSync`, `unlinkSync`, `renameSync` and `rmSync`, which
+`tests/no-link-primitive.test.js` asserts against the source tree. A client
+therefore cannot plant its own escape hatch and then walk through it --
+every hop of which would have been correctly validated on the way out.
+
 ## Configuration
 
 ### With Relay (recommended)
