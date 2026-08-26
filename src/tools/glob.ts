@@ -6,7 +6,7 @@ import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, 
 import { textResult, errorResult, scopeViolationResult, LabelEntry, MCPCallResult, ToolContext } from '../types';
 import { canonicalizePath, validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
-import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { capLines, MAX_SEARCH_RESULT_BYTES } from '../limits';
 import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 import { grepBudgetMs } from './grep';
 
@@ -554,7 +554,7 @@ export function registerGlob(registry: ToolRegistry): void {
       if (capped.capped) {
         const why =
           capped.reason === 'bytes'
-            ? `, cut at fs_glob's ${MAX_RESPONSE_BYTES}-byte response limit`
+            ? `, cut at fs_glob's ${MAX_SEARCH_RESULT_BYTES}-byte listing limit`
             : '';
         notes.push(`(showing ${capped.shown} of ${capped.total} matches${why})`);
       }

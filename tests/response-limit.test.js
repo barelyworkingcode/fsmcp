@@ -52,8 +52,8 @@ const MAIN_JS = path.join(__dirname, '..', 'dist', 'main.js');
 // `bridge.MaxMessageSize` in relay, reproduced here because it is the actual
 // thing that breaks.
 const RELAY_MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
-const MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
-const MAX_BASE64_FILE_BYTES = 256 * 1024;
+const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_BASE64_FILE_BYTES = 32 * 1024;
 
 function mkTmpDir(prefix) {
   // realpath'd for the same reason helpers.js does it: on macOS os.tmpdir()
@@ -135,7 +135,7 @@ test('issue #19: no fs_read response line is ever large enough to kill relay\'s 
   // Written as ordinary 100-byte lines rather than one enormous line, so
   // text mode's answer is the interesting one (a bounded PAGE with a
   // continuation offset) rather than the pre-existing per-line truncation.
-  const sizes = [1000000, 8000000];
+  const sizes = [200000, 8000000];
   const files = sizes.map((n) => {
     const p = path.join(root, `blob-${n}.log`);
     const line = 'A'.repeat(99) + '\n';
@@ -183,10 +183,12 @@ test('issue #19: no fs_read response line is ever large enough to kill relay\'s 
   assert.match(allText(bigB64), new RegExp(String(MAX_BASE64_FILE_BYTES)));
   assert.match(allText(bigB64), /byte_offset/);
 
-  // 1 MB in base64 is over the 256 KiB context ceiling too -- refused for the
-  // same reason and pointed at the same escape hatch.
-  const midB64 = byId.get(idFor.get('1000000:base64')).result;
-  assert.equal(midB64.isError, true, '1 MB is over the base64 per-call ceiling and must be refused');
+  // The mid size is over the base64 context ceiling too -- refused for the
+  // same reason and pointed at the same escape hatch. Kept deliberately
+  // larger than MAX_BASE64_FILE_BYTES and smaller than MAX_READ_BYTES, so it
+  // exercises the CONTEXT ceiling rather than the allocation one.
+  const midB64 = byId.get(idFor.get('200000:base64')).result;
+  assert.equal(midB64.isError, true, 'a file over the base64 per-call ceiling must be refused');
 
   // Text mode is not refused -- it PAGES. Both files come back as a bounded
   // page that says so.
@@ -266,7 +268,11 @@ test('issue #19: byte-bounded text paging loses nothing -- successive pages reas
     const r = await server.callTool('fs_read', { file_path: v, offset });
     assert.equal(r.isError, undefined, `page at offset ${offset} failed: ${allText(r)}`);
     pages++;
-    assert.ok(pages < 20, 'runaway paging loop -- the continuation offset is not advancing');
+    // Derived, not a constant: the guard exists to catch an offset that does
+    // not advance, and it must not double as an accidental assertion about
+    // the page size. At MAX_RESPONSE_BYTES the fixture needs ~57 pages.
+    assert.ok(pages < 4 * Math.ceil(original.length / MAX_RESPONSE_BYTES) + 10,
+      'runaway paging loop -- the continuation offset is not advancing');
 
     const text = allText(r);
     const noteMatch = text.match(/\n\[fsmcp: showing lines (\d+)-(\d+) of (\d+)[^\]]*\]$/);
@@ -354,7 +360,10 @@ test('issue #19: a file over the base64 ceiling is refused whole and readable in
     pieces.push(buf);
     byteOffset += buf.length;
     if (byteOffset >= total) break;
-    assert.ok(pieces.length < 10, 'runaway windowing loop');
+    // Derived: the guard catches an offset that stops advancing, and must
+    // not double as an assertion about the window size.
+    assert.ok(pieces.length < 4 * Math.ceil(size / MAX_BASE64_FILE_BYTES) + 5,
+      'runaway windowing loop');
   }
 
   assert.ok(pieces.length > 1, 'sanity: this fixture only means something if it took several windows');
@@ -548,10 +557,10 @@ test('issue #19: fs_write bounds the request it accepts, not just the bytes that
   const okTarget = path.join(root, 'fits.txt');
   const ok = await server.callTool('fs_write', {
     file_path: toVirtual(okTarget, root),
-    content: 'y'.repeat(1000000),
+    content: 'y'.repeat(50 * 1024),
   });
   assert.equal(ok.isError, undefined, allText(ok));
-  assert.equal(fs.statSync(okTarget).size, 1000000);
+  assert.equal(fs.statSync(okTarget).size, 50 * 1024);
 });
 
 test('issue #19: fs_write measures the wire form of content, not its character count', async (t) => {

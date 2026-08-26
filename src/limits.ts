@@ -66,60 +66,68 @@ import { MCPCallResult, errorResult } from './types';
  * The largest single payload fsMCP will put into one JSON-RPC message, or
  * accept out of one, measured in BYTES ON THE WIRE after JSON escaping.
  *
- * 1 MiB, ~10x under relay's 10 MiB `bridge.MaxMessageSize`. The margin is
- * deliberately generous rather than tight-but-provable, for three reasons:
+ * 64 KiB. The binding constraint is NOT the transport -- it is the context
+ * window of the model on the other end, which is a much smaller number and
+ * the one that actually gets destroyed.
  *
- *  1. This bounds the one LARGE field (fs_read's payload, fs_write's
- *     `content`), not the whole line. The JSON-RPC envelope, `_meta`, and the
- *     advisory content blocks main.ts appends for dropped/malformed
- *     `_meta.allowed_dirs` entries all ride along outside this number. They
- *     are small -- hundreds of bytes -- but they are not zero, and "provably
- *     exactly at the cap" is a bad place for a bound whose failure mode is a
- *     dead server for every client.
- *  2. fsMCP does not know what else is in the chain. Relay is one host; a
- *     future one may frame or re-encode, and a 10x margin survives a
- *     constant-factor surprise that a 1.02x margin does not.
- *  3. Nothing legitimate needs the other 9 MiB. A 1 MiB response is already
- *     ~350K tokens of text at 3 chars/token -- past a standard 200K context
- *     window on its own. See MAX_BASE64_FILE_BYTES.
+ * This started at 1 MiB, chosen as ~10x under relay's 10 MiB
+ * `bridge.MaxMessageSize`, and that was the wrong question to ask. 1 MiB of
+ * text is ~350K tokens at 3 chars/token: it crosses the wire perfectly and
+ * then blows out a 200K context window on arrival, which is a failure fsMCP
+ * can see coming and the agent cannot. 64 KiB is ~20K tokens -- a real
+ * fraction of a working context, not all of it -- and it is ~160x under
+ * relay's cap, so the transport argument is satisfied for free rather than
+ * being the thing that decides.
+ *
+ * Two properties keep this from being merely small:
+ *
+ *  1. **It bounds one payload, not the message.** The JSON-RPC envelope,
+ *     `_meta`, and the advisory blocks main.ts appends for dropped
+ *     `_meta.allowed_dirs` entries ride along outside this number. They are
+ *     small but not zero, and MAX_RESULT_BYTES below leaves room for them.
+ *  2. **Nothing becomes unreachable.** fs_read pages by line and windows by
+ *     byte, and the search tools cap and report "showing X of Y", so a
+ *     smaller default costs a caller more calls and never an answer. That is
+ *     the trade being made deliberately: paging is cheap, a destroyed context
+ *     is not.
  *
  * Enforced on the ENCODED response for both encodings, not on the file: for
  * base64 the encoded form is 4/3 the file's bytes, and for text mode line
  * numbering, the tab separator, the truncation markers and JSON escaping all
  * add bytes on top of the file's own (see wireBytes below).
  */
-export const MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
+export const MAX_RESPONSE_BYTES = 64 * 1024;
 
 /**
  * The largest FILE, in its own bytes on disk, that `fs_read` will return
  * through `encoding: "base64"` in a single call.
  *
- * 256 KiB. This is a CONTEXT limit, not a transport one, and it is
- * deliberately far below what MAX_RESPONSE_BYTES would allow (which is
- * floor(1 MiB * 3/4) = 786,432 bytes): base64 tokenizes at roughly 3
- * characters per token, so a 1 MiB file becomes ~1.4M base64 characters
- * ~= 460K tokens -- more than twice a standard 200K model context window.
- * The response would cross the wire intact and then destroy the context of
- * the agent that asked for it, which is a failure fsMCP can see coming and
- * the agent cannot. 256 KiB lands around 115K tokens: still half a window,
- * still enough for an icon, a config blob, a certificate or a small PDF, and
- * not enough to be absurd.
+ * 32 KiB. This is a CONTEXT limit, not a transport one, and it has to stay
+ * meaningfully below what MAX_RESPONSE_BYTES allows or it stops meaning
+ * anything: base64 inflates by exactly 4/3, so the transport bound alone
+ * would permit floor(64 KiB * 3/4) = 49,152 file bytes. At 32 KiB the encoded
+ * payload is 43,692 bytes, comfortably inside the response cap, and lands
+ * around 14K tokens at base64's ~3 chars/token.
+ *
+ * **This number is not independent of MAX_RESPONSE_BYTES and must not be
+ * raised without checking it.** It was 256 KiB when the response cap was
+ * 1 MiB. When the cap came down to 64 KiB this became 5.3x the cap -- so the
+ * ceiling could never fire, and every base64 read between 48 KiB and 256 KiB
+ * would have been refused by the transport check while the tool description
+ * still advertised a 256 KiB limit. A limit a caller is told about and which
+ * cannot be reached is worse than no limit: it sends them to the wrong
+ * remedy. The two numbers move together until issue #16 makes both flags.
  *
  * Not applied to fs_write's inbound base64 (which is bounded by
  * MAX_RESPONSE_BYTES alone). The asymmetry is intentional: nothing is being
  * loaded into anyone's context on a write, so the reason for this number does
- * not apply in that direction. The round-trip promise still holds in the
- * direction that matters -- every payload fs_read(base64) can produce is
- * comfortably inside what fs_write(base64) accepts.
+ * not apply in that direction.
  *
- * MAX_RESPONSE_BYTES is still enforced on base64 responses as a backstop even
- * though it cannot fire at these defaults (256 KiB encodes to 349,528 bytes,
- * a third of the response cap). That check is not dead code waiting to be
- * deleted: issue #16 makes both numbers operator flags, and an operator who
- * raises the base64 ceiling past 768 KiB needs the transport bound to be the
- * thing that stops them, not a comment.
+ * A file larger than this is still fully readable, byte for byte, through
+ * `byte_offset`/`byte_length` -- the windowing exists precisely so that a
+ * conservative whole-file ceiling costs calls rather than access.
  */
-export const MAX_BASE64_FILE_BYTES = 256 * 1024;
+export const MAX_BASE64_FILE_BYTES = 32 * 1024;
 
 /**
  * The largest file `encoding: "base64"` could return if only the transport
@@ -172,12 +180,43 @@ export function wireBytes(s: string): number {
 export const WIRE_NEWLINE_BYTES = 2;
 
 /**
- * Held back from MAX_RESPONSE_BYTES for the "(showing X of Y ...)" suffix and
- * any other note a tool appends after its lines have been measured. 4 KiB is
- * ~20x the longest note any tool in this codebase writes, and 0.4% of the
- * budget, so being generous costs nothing.
+ * Held back from a listing budget for the "(showing X of Y ...)" suffix and
+ * any other note a tool appends after its lines have been measured.
+ *
+ * 1 KiB, ~5x the longest note any tool in this codebase writes. It was 4 KiB
+ * when the budget it came out of was 1 MiB, where being generous cost 0.4%.
+ * Against MAX_SEARCH_RESULT_BYTES it would cost 25%, which is no longer
+ * "generous costs nothing" -- it is a quarter of the caller's answer spent on
+ * a sentence. Sized to the note it actually reserves for.
  */
-const RESULT_NOTE_RESERVE = 4 * 1024;
+const RESULT_NOTE_RESERVE = 1 * 1024;
+
+/**
+ * The largest LISTING a search tool will return: `fs_glob`, `fs_find`,
+ * `fs_grep` and `fs_list`.
+ *
+ * 16 KiB, a quarter of MAX_RESPONSE_BYTES, and deliberately its own number
+ * rather than a share of that one. The two bound different shapes of answer
+ * and deserve to move independently:
+ *
+ *  - MAX_RESPONSE_BYTES bounds ONE payload a caller asked for by name -- a
+ *    file it chose to read. Spending context on it is the caller's decision.
+ *  - This bounds a list the caller did NOT enumerate: every path matching a
+ *    pattern, every entry in a directory, every line matching a regex. The
+ *    caller cannot know the size before asking, and a broad pattern over a
+ *    real repository produces thousands of lines from a single call. That is
+ *    the shape most likely to fill a context by accident.
+ *
+ * Every tool this bounds already reports a bounded answer as bounded --
+ * "(showing X of Y matches, cut at ...)" plus `_meta.truncated` -- so a
+ * caller can always tell a floor from a complete answer and narrow its
+ * pattern. What it CANNOT do for a directory listing is page: `fs_list`,
+ * `fs_glob` and `fs_find` take no offset. So a large directory is reported
+ * truncated with no way to walk the remainder, and the answer is to narrow
+ * the pattern or list a subdirectory. Worth knowing before raising or
+ * lowering this; per issue #16 it becomes an operator flag.
+ */
+export const MAX_SEARCH_RESULT_BYTES = 16 * 1024;
 
 /** What `capLines` produced, and whether it is the whole answer. */
 export interface CappedLines {
@@ -219,7 +258,7 @@ export function capLines(
   lines: string[],
   maxLines: number,
   total: number = lines.length,
-  budgetBytes: number = MAX_RESPONSE_BYTES - RESULT_NOTE_RESERVE
+  budgetBytes: number = MAX_SEARCH_RESULT_BYTES - RESULT_NOTE_RESERVE
 ): CappedLines {
   const kept: string[] = [];
   let bytes = 0;
@@ -251,14 +290,26 @@ export function capLines(
  * The largest a whole tool RESULT may be, serialised: the payload budget plus
  * room for the object around it (`content`, `type`, `_meta`, a
  * "(showing X of Y)" note, an appended advisory block).
+ *
+ * The allowance is 16 KiB, not the 64 KiB it was: an envelope allowance has
+ * to stay SMALLER than the payload it wraps or the backstop stops bounding
+ * anything recognisable, and at a 64 KiB payload budget a 64 KiB allowance
+ * meant a result could be double its own limit and still pass. 16 KiB is
+ * still ~80x the largest envelope this codebase produces.
+ *
+ * **This must stay ABOVE MAX_RESPONSE_BYTES, and it is derived so it cannot
+ * drift below it.** It is the alarm for a tool that did not bound itself; if
+ * it were the smaller of the two, it would fire on ordinary correctly-bounded
+ * results instead, and an alarm that goes off in normal use is one everybody
+ * learns to ignore.
  */
-export const MAX_RESULT_BYTES = MAX_RESPONSE_BYTES + 64 * 1024;
+export const MAX_RESULT_BYTES = MAX_RESPONSE_BYTES + 16 * 1024;
 
 /**
  * The largest LINE fsMCP will ever write to stdout: a whole JSON-RPC message,
  * envelope included. Still ~8.7x under relay's 10 MiB.
  */
-export const MAX_FRAME_BYTES = MAX_RESULT_BYTES + 64 * 1024;
+export const MAX_FRAME_BYTES = MAX_RESULT_BYTES + 16 * 1024;
 
 /**
  * The universal backstop: no tool result crosses the wire over

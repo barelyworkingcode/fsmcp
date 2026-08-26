@@ -6,7 +6,7 @@ import { textResult, errorResult, scopeViolationResult, MCPCallResult, ToolConte
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
 import { decodeUtf8Strict } from '../encoding';
-import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { capLines, MAX_SEARCH_RESULT_BYTES } from '../limits';
 import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 
 // Issue #19, second repro: fs_grep in `output_mode: "content"` capped NOTHING
@@ -72,7 +72,7 @@ function renderGrepResult(
   if (capped.capped) {
     const why =
       capped.reason === 'bytes'
-        ? `, cut at fs_grep's ${MAX_RESPONSE_BYTES}-byte response limit`
+        ? `, cut at fs_grep's ${MAX_SEARCH_RESULT_BYTES}-byte listing limit`
         : '';
     notes.unshift(`(showing ${capped.shown} of ${capped.total} result lines${why})`);
   }

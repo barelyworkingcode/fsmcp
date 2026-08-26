@@ -37,7 +37,7 @@ const path = require('path');
 
 const { spawnServer } = require('./helpers');
 
-const MAX_STRING_WIRE_BYTES = 1024 * 1024;
+const MAX_STRING_WIRE_BYTES = 64 * 1024;
 const MAX_EDIT_READ_BYTES = 10 * 1024 * 1024;
 
 function allText(result) {

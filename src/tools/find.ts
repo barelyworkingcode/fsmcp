@@ -5,7 +5,7 @@ import { ToolRegistry, schema, stringProp, requireStringArg, optionalStringArg, 
 import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
 import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { checkPathV, decodeInboundPath, hostToVirtualOrRedact, translateResult } from '../vpath';
-import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { capLines, MAX_SEARCH_RESULT_BYTES } from '../limits';
 import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 import { grepBudgetMs, unsearchableReason } from './grep';
 
@@ -338,7 +338,7 @@ export function registerFind(registry: ToolRegistry): void {
       if (bounded.capped) {
         const why =
           bounded.reason === 'bytes'
-            ? `, cut at fs_find's ${MAX_RESPONSE_BYTES}-byte response limit`
+            ? `, cut at fs_find's ${MAX_SEARCH_RESULT_BYTES}-byte listing limit`
             : '';
         notes.push(`(showing ${bounded.shown} of ${bounded.total} matches${why})`);
       }

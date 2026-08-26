@@ -142,7 +142,7 @@ test('fs_edit: a write that fails partway does not destroy the original file', a
   const r = await server.callTool('fs_edit', {
     file_path: v(target),
     old_string: 'MARKER',
-    new_string: 'REPLACEMENT-MARKER'.repeat(5000),
+    new_string: 'REPLACEMENT-MARKER'.repeat(2000),
   });
 
   assert.equal(r.isError, true, 'the injected write failure must be reported, not swallowed');
@@ -321,16 +321,20 @@ test(
     const vol = makeSmallVolume(2);
     t.after(() => vol.cleanup());
 
-    // Sized against fs_write's 1 MiB message limit (issue #19), not against
-    // the volume: `content` is plain ASCII here, so its wire size is its
-    // length, and anything over 1048576 is now refused for being an
+    // Sized against fs_write's message limit (issue #19), not against the
+    // volume: `content` is plain ASCII here, so its wire size is its length,
+    // and anything over MAX_RESPONSE_BYTES is refused for being an
     // un-carryable request line rather than reaching the disk at all. That
     // refusal is a different assertion from this test's, so the payload is
-    // kept comfortably inside it and the EXISTING file is made bigger
-    // instead -- the pin is "the two copies do not fit at once", and which
-    // of the two is the large one was never the point.
-    const payloadSize = 1000000;
-    const existingSize = 1500000;
+    // kept comfortably inside it and the EXISTING file is made big enough to
+    // fill the volume instead -- the pin is "the two copies do not fit at
+    // once", and which of the two is the large one was never the point.
+    //
+    // Since #20 the temp file is SEEDED from the target before the new bytes
+    // are written over it, so on a full volume the seed is what fails. Either
+    // way the original must survive and the caller must be told ENOSPC.
+    const payloadSize = 50 * 1024;
+    const existingSize = 1900000;
 
     // Sanity half of the pin, run on the volume BEFORE `existing.txt` below
     // claims any of its space: this exact payload size fits when nothing

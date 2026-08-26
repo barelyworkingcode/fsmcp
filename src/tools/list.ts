@@ -5,7 +5,7 @@ import { textResult, errorResult, scopeViolationResult, ToolContext } from '../t
 import { NO_ALLOWED_DIRS_MESSAGE } from '../security';
 import { LabelEntry } from '../types';
 import { checkPathV, decodeInboundPath, describeError, hostToVirtualOrRedact, translateResult } from '../vpath';
-import { capLines, MAX_RESPONSE_BYTES } from '../limits';
+import { capLines, MAX_SEARCH_RESULT_BYTES } from '../limits';
 import { escapePathField, pathFieldEscapingRules, RESULT_TRAILER_RULE } from '../resultFormat';
 
 const MAX_ENTRIES = 5000;
@@ -189,7 +189,7 @@ export function registerList(registry: ToolRegistry): void {
       if (!capped.capped) return textResult(capped.text);
 
       const why =
-        capped.reason === 'bytes' ? `, cut at fs_list's ${MAX_RESPONSE_BYTES}-byte response limit` : '';
+        capped.reason === 'bytes' ? `, cut at fs_list's ${MAX_SEARCH_RESULT_BYTES}-byte listing limit` : '';
       const result = textResult(
         `${capped.text}\n\n(showing ${capped.shown} of ${capped.total} entries${why})`
       );

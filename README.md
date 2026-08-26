@@ -344,10 +344,20 @@ whichever tool was found to break first:
 
 | bound | default | what it protects |
 |---|---|---|
-| response bytes | **1 MiB** | the transport. ~10x under relay's 10 MiB frame cap. Applies to the encoded response, both encodings, and to the inbound strings -- `fs_write`'s `content`, `fs_edit`'s `old_string` and `new_string` -- because a request line is a line too. |
-| base64 file ceiling | **256 KiB** | your context, not the transport. Base64 tokenizes at roughly 3 chars/token, so 1 MiB of file is ~460K tokens: more than twice a standard 200K window. 256 KiB is ~115K tokens -- an icon, a config blob, a certificate, a small PDF. |
+| response bytes | **64 KiB** | **your context**, and the transport for free. 64 KiB is ~20K tokens at 3 chars/token -- a real fraction of a working window, not all of it. Applies to the encoded response, both encodings, and to the inbound strings (`fs_write`'s `content`, `fs_edit`'s `old_string`/`new_string`) because a request line is a line too. Incidentally ~160x under relay's 10 MiB frame cap, so the transport argument is satisfied without being the thing that decides. |
+| listing bytes | **16 KiB** | your context again, for the answers you did **not** enumerate: `fs_glob`, `fs_find`, `fs_grep`, `fs_list`. A broad pattern over a real repository produces thousands of lines from one call, and the caller cannot know the size before asking -- the shape most likely to fill a window by accident. Bounded answers always say so (`showing X of Y`, `_meta.truncated`). |
+| base64 file ceiling | **32 KiB** | your context, for bytes. Base64 tokenizes at ~3 chars/token, so 32 KiB of file is ~14K tokens. **Not independent of the response bound** -- base64 inflates by 4/3, so the transport alone would allow 48 KiB; this stays meaningfully below it. Raising one without the other makes a limit that can never fire, which is worse than none: it sends the caller to the wrong remedy. |
 | `fs_read` allocation limit | **10 MiB** | the *process*. fsMCP is one synchronous loop; `readFileSync` of a huge file blocks and can kill the process every other caller is waiting on. Unchanged, and **not** made redundant by the two above: it answers a different question. |
 | `fs_read`/`fs_edit` read limit | **10 MiB** | the *process*, again. `fs_edit` had no read cap at all until issue #38 -- it loaded whatever was on disk with a bare `readFileSync`, which is the same unbounded synchronous allocation reached through a different door. |
+
+**These are defaults, and they are deliberately conservative.** They are sized
+for the context window of a small local model, which is the thing that actually
+breaks -- not for the transport, which has an order of magnitude more room. A
+caller never loses access to anything: `fs_read` pages by line and windows by
+byte, and every search tool reports a bounded answer as bounded, so a smaller
+default costs calls rather than answers. Issue #16 makes all of them operator
+flags; until then, changing one means checking its neighbours in
+`src/limits.ts`, where the relationships are written down.
 
 Measured, not estimated. Base64 inflates by exactly 4/3; text mode adds line
 numbers, a tab separator and truncation markers, and then **JSON escaping
@@ -375,7 +385,7 @@ returns a bounded result that says so **twice** -- inline for a human,
 - **`fs_read`, base64 mode: it refuses.** A base64 payload has nowhere to put
   a "there is more" marker without breaking the `fs_read` → `fs_write`
   identity, so a silent prefix would be undetectable from the content itself.
-  A file over 256 KiB is refused whole and read with
+  A file over 32 KiB is refused whole and read with
   `byte_offset`/`byte_length` instead.
 - **`fs_grep`, `fs_glob`, `fs_list`, `fs_find`: they cap and report.**
   `(showing X of Y ...)` inline, `_meta.truncated` structurally, with the real
@@ -407,8 +417,8 @@ lower ceiling would turn "kills the server" into "flatly impossible":
 
 ```jsonc
 // _meta.total_bytes tells you when to stop.
-{"file_path": "/d0/scan.pdf", "encoding": "base64", "byte_offset": 0,      "byte_length": 262144}
-{"file_path": "/d0/scan.pdf", "encoding": "base64", "byte_offset": 262144, "byte_length": 262144}
+{"file_path": "/d0/scan.pdf", "encoding": "base64", "byte_offset": 0,     "byte_length": 32768}
+{"file_path": "/d0/scan.pdf", "encoding": "base64", "byte_offset": 32768, "byte_length": 32768}
 ```
 
 Each window is exact bytes, bare base64, with `_meta.bytes`,

@@ -304,9 +304,22 @@ test('the walk is bounded in wall-clock time, and a cut-short walk says so', asy
 
   // With the ordinary budget the same fixture is answered in full, so the
   // bound is a bound and not a cap on real work.
-  const full = textOf(await glob(root, '**/*.txt')).split('\n').filter(Boolean);
-  assert.strictEqual(full.length, 1000);
-  assert.ok(!/cut short/.test(full.join('\n')));
+  // With the ordinary budget the same fixture is answered without the WALK
+  // being cut short. The listing may still be bounded by the byte budget --
+  // 1000 paths do not fit in MAX_SEARCH_RESULT_BYTES -- and that is a
+  // different mechanism with a different message, which is exactly what this
+  // assertion separates: "cut short after Nms" must not appear, while
+  // "showing X of 1000" is fine and must name the true total.
+  const fullText = textOf(await glob(root, '**/*.txt'));
+  assert.ok(!/cut short/.test(fullText),
+    `the time bound must be a bound, not a cap on real work: ${fullText.slice(-200)}`);
+  const lines = fullText.split('\n').filter((l) => l.startsWith('/d'));
+  if (/showing \d+ of/.test(fullText)) {
+    assert.match(fullText, /showing \d+ of 1000 matches/,
+      `a byte-capped listing must still report the true total: ${fullText.slice(-200)}`);
+  } else {
+    assert.strictEqual(lines.length, 1000);
+  }
 });
 
 test('an absolute pattern naming the RESOLVED form of a symlinked grant is refused too', async (t) => {
