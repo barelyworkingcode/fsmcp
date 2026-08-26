@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp, intProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { checkPath } from '../security';
 
 const IMAGE_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico',
@@ -31,10 +31,8 @@ export function registerRead(registry: ToolRegistry): void {
     (args: Record<string, unknown>, ctx: ToolContext): ReturnType<typeof textResult> => {
       const filePath = args.file_path as string;
 
-      const pathErr = validatePath(filePath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
-
-      if (!path.isAbsolute(filePath)) return errorResult('file_path must be absolute');
+      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      if (pathErr) return pathErr;
 
       let stat: fs.Stats;
       try {

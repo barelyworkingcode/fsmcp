@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { ToolRegistry, schema, stringProp, boolProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { checkPath } from '../security';
 
 export function registerEdit(registry: ToolRegistry): void {
   registry.register(
@@ -30,10 +29,8 @@ export function registerEdit(registry: ToolRegistry): void {
       const newString = args.new_string as string;
       const replaceAll = (args.replace_all as boolean) ?? false;
 
-      if (!path.isAbsolute(filePath)) return errorResult('file_path must be absolute');
-
-      const pathErr = validatePath(filePath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
+      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      if (pathErr) return pathErr;
 
       let content: string;
       try {

@@ -1,9 +1,8 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { globSync } from 'glob';
 import { ToolRegistry, schema, stringProp } from '../registry';
-import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
+import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
 const MAX_RESULTS = 1000;
 
@@ -31,9 +30,8 @@ export function registerGlob(registry: ToolRegistry): void {
       let searchDirs: string[];
       if (args.path && args.path !== '.') {
         const p = args.path as string;
-        if (!path.isAbsolute(p)) return errorResult('path must be absolute');
-        const pathErr = validatePath(p, ctx.allowedDirs);
-        if (pathErr) return errorResult(pathErr);
+        const pathErr = checkPath(p, ctx.allowedDirs);
+        if (pathErr) return pathErr;
         if (!fs.existsSync(p)) return errorResult(`directory not found: ${p}`);
         searchDirs = [p];
       } else if (ctx.allowedDirs.length > 0) {
@@ -41,8 +39,10 @@ export function registerGlob(registry: ToolRegistry): void {
         if (searchDirs.length === 0) return errorResult('none of the allowed directories exist');
       } else {
         // No allowed dirs configured: an absent path must resolve to the
-        // (empty) scope, not to an unrestricted cwd fallback.
-        return errorResult(NO_ALLOWED_DIRS_MESSAGE);
+        // (empty) scope, not to an unrestricted cwd fallback. Empty scope is
+        // itself a scope refusal (C1's "no ⇒ no" row), not a different kind
+        // of error, so it carries scope_violation like any other one.
+        return scopeViolationResult(NO_ALLOWED_DIRS_MESSAGE);
       }
 
       // Run glob against each directory and collect unique matches.

@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ToolRegistry, schema, stringProp } from '../registry';
 import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath } from '../security';
+import { checkPath } from '../security';
 
 export function registerWrite(registry: ToolRegistry): void {
   registry.register(
@@ -26,10 +26,8 @@ export function registerWrite(registry: ToolRegistry): void {
       const filePath = args.file_path as string;
       const content = args.content as string;
 
-      if (!path.isAbsolute(filePath)) return errorResult('file_path must be absolute');
-
-      const pathErr = validatePath(filePath, ctx.allowedDirs);
-      if (pathErr) return errorResult(pathErr);
+      const pathErr = checkPath(filePath, ctx.allowedDirs);
+      if (pathErr) return pathErr;
 
       const dir = path.dirname(filePath);
       fs.mkdirSync(dir, { recursive: true });

@@ -2,8 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { ToolRegistry, schema, stringProp, intProp, enumProp } from '../registry';
-import { textResult, errorResult, ToolContext } from '../types';
-import { validatePath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
+import { textResult, errorResult, scopeViolationResult, ToolContext } from '../types';
+import { validatePath, checkPath, NO_ALLOWED_DIRS_MESSAGE } from '../security';
 
 // Detect ripgrep at load time.
 //
@@ -98,27 +98,28 @@ export function registerGrep(registry: ToolRegistry): void {
       let searchPaths: string[];
       if (args.path && args.path !== '.') {
         const p = args.path as string;
-        const pathErr = validatePath(p, ctx.allowedDirs);
-        if (pathErr) return errorResult(pathErr);
+        const pathErr = checkPath(p, ctx.allowedDirs);
+        if (pathErr) return pathErr;
         searchPaths = [p];
       } else if (ctx.allowedDirs.length > 0) {
         searchPaths = ctx.allowedDirs.filter((d) => fs.existsSync(d));
         if (searchPaths.length === 0) return errorResult('none of the allowed directories exist');
       } else {
         // No allowed dirs configured: an absent path must resolve to the
-        // (empty) scope, not to an unrestricted cwd fallback.
-        return errorResult(NO_ALLOWED_DIRS_MESSAGE);
+        // (empty) scope, not to an unrestricted cwd fallback. Empty scope is
+        // itself a scope refusal, not a different kind of error.
+        return scopeViolationResult(NO_ALLOWED_DIRS_MESSAGE);
       }
 
       if (rgAvailable) {
         return grepWithRg(
           pattern, searchPaths, globFilter, typeFilter,
-          outputMode, contextLines, headLimit
+          outputMode, contextLines, headLimit, ctx.allowedDirs
         );
       }
       return grepFallback(
         pattern, searchPaths, globFilter, typeFilter,
-        outputMode, contextLines, headLimit
+        outputMode, contextLines, headLimit, grepBudgetMs(), ctx.allowedDirs
       );
     }
   );
@@ -186,6 +187,66 @@ export function buildRgArgs(
   return rgArgs;
 }
 
+/**
+ * Re-validate every path fs_grep is about to hand back.
+ *
+ * fs_glob already does this for the same reason: whatever *walks* the
+ * filesystem chooses what gets reported, and a symlink inside an allowed
+ * directory that points outside it can come back looking like an in-scope
+ * path. Nothing here ever passes `--follow` to ripgrep, and ripgrep does not
+ * follow symlinks unless told to, so the ordinary run of this tool should
+ * never produce an out-of-scope hit in the first place -- but "the flag we
+ * didn't pass happens to default the right way" describes ripgrep's current
+ * behaviour, not a guarantee this file makes, and the very same reasoning
+ * (glob's fix, `0be03fe` era) says the output gets checked regardless of
+ * how confident the input side is.
+ *
+ * This parses the exact three shapes `grepWithRg`/`grepFallback` themselves
+ * produce, not ripgrep's own `--json` mode: a bare path
+ * (files_with_matches), `path:count` (count), and `path:lineno:content`
+ * (content, anchored on the numeric line number rather than colon-counting,
+ * because `content` can itself contain colons). `--` group separators that
+ * `-C`/`-A`/`-B` insert between non-contiguous matches are passed through
+ * unfiltered, since they name no path at all. A line that cannot be parsed
+ * into one of these shapes is dropped rather than guessed at: it cannot be
+ * proven in scope, so it is treated as if it were not.
+ */
+export function filterPathsInScope(
+  output: string,
+  outputMode: string,
+  allowedDirs: string[],
+): string {
+  if (!output) return output;
+  const lines = output.split('\n');
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (line === '') {
+      kept.push(line);
+      continue;
+    }
+    if (outputMode === 'content' && line === '--') {
+      kept.push(line);
+      continue;
+    }
+
+    let candidate: string | null;
+    if (outputMode === 'content') {
+      const m = /^(.+?):(\d+):/.exec(line);
+      candidate = m ? m[1] : null;
+    } else if (outputMode === 'count') {
+      const m = /^(.+):(\d+)$/.exec(line);
+      candidate = m ? m[1] : null;
+    } else {
+      candidate = line;
+    }
+
+    if (candidate !== null && path.isAbsolute(candidate) && validatePath(candidate, allowedDirs) === null) {
+      kept.push(line);
+    }
+  }
+  return kept.join('\n');
+}
+
 function grepWithRg(
   pattern: string,
   searchPaths: string[],
@@ -194,6 +255,7 @@ function grepWithRg(
   outputMode: string,
   contextLines: number | undefined,
   headLimit: number | undefined,
+  allowedDirs: string[],
 ) {
   const rgArgs = buildRgArgs(
     pattern, searchPaths, globFilter, typeFilter,
@@ -209,7 +271,8 @@ function grepWithRg(
       maxBuffer: 10 * 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return textResult(output.trimEnd());
+    const filtered = filterPathsInScope(output.trimEnd(), outputMode, allowedDirs);
+    return textResult(filtered === '' ? 'No matches found.' : filtered);
   } catch (err: unknown) {
     const e = (err ?? {}) as {
       status?: number | null;
@@ -267,6 +330,17 @@ function grepWithRg(
  * unbounded: without it, the same pattern kept matching against every line of
  * every file for as long as the process lived.
  *
+ * `allowedDirsForRevalidation` re-validates every file the walk turns up
+ * before it is ever opened or reported, the same containment fs_glob already
+ * applies to its own hits (see `filterPathsInScope` above for why this
+ * fallback needs it too, not just the ripgrep path). It is optional, and
+ * defaults to skipping that check, purely as a test seam: the ReDoS-budget
+ * tests below call this function directly with a bare tmp directory and no
+ * concept of allowed_dirs at all, and defaulting to "no allowed dirs" would
+ * make them fail closed for a reason that has nothing to do with what they
+ * are testing. The real call site in fs_grep's handler always passes
+ * `ctx.allowedDirs`.
+ *
  * Exported so a test can hand it a small budget directly.
  */
 export function grepFallback(
@@ -278,6 +352,7 @@ export function grepFallback(
   contextLines: number | undefined,
   headLimit: number | undefined,
   budgetMs: number = grepBudgetMs(),
+  allowedDirsForRevalidation?: string[],
 ) {
   const deadline = Date.now() + budgetMs;
   const expired = () => Date.now() >= deadline;
@@ -292,7 +367,10 @@ export function grepFallback(
   // The walk is inside the budget too: enumerating a very large tree is its
   // own way to not come back, and a file list that is itself a floor must not
   // be reported as "N of M".
-  const files = searchPaths.flatMap((p) => walkFiles(p, globFilter, typeFilter, deadline));
+  const walked = searchPaths.flatMap((p) => walkFiles(p, globFilter, typeFilter, deadline));
+  const files = allowedDirsForRevalidation === undefined
+    ? walked
+    : walked.filter((f) => validatePath(f, allowedDirsForRevalidation) === null);
   const walkTruncated = expired();
 
   const results: string[] = [];
