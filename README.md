@@ -566,6 +566,79 @@ would only ever have removed something inside the grant -- that refusal is
 "the sandbox must survive its occupant", not "you addressed something
 outside your scope".
 
+### A grant that does not exist is refused, not created
+
+`fs_write` creates the parent directories of the file it is asked to write,
+and `fs_mkdir` creates missing parents by default. Both are documented, both
+are useful, and both are bounded at the granted directory -- **because the
+granted directory is already there for the walk up to stop at.**
+
+If it is not there, there is no bound. `fs.mkdirSync(dir, { recursive: true })`
+climbs until it finds something that exists, and it knows nothing about
+`allowed_dirs`: a missing grant root is just another missing component on the
+way. So fsmcp refuses any call that would create a directory inside a granted
+directory that does not exist on the host:
+
+```
+allowed_dir = <R>/level1/level2/level3/grant     # only <R> exists
+
+fs_write { "file_path": "/d0/sub/file.txt", "content": "..." }
+-> the granted directory /d0 does not exist on the host, so fsmcp will not
+   write anything inside it. This is a problem with this server's
+   configuration, not with the path you asked for [...]
+```
+
+Before this rule, that call answered `Wrote 31 bytes to /d0/sub/file.txt` and
+created `<R>/level1`, `<R>/level1/level2` and `<R>/level1/level2/level3` --
+three directories **above** the boundary -- along with the grant root and the
+file. `fs_mkdir` did the same. Nothing errored, and `relay audit` recorded
+`ok`.
+
+**Why refuse rather than quietly create the missing directory?** Because the
+only way to create it is to create its missing parents too, and those are
+outside the grant by definition -- so "create just the root" is not available
+in the case that matters. And a grant that does not describe anything on the
+host is a mistake worth seeing:
+
+- **A typo in the profile.** `~/Documnets/project` gets created, the agent
+  works in it happily, and the operator never looks there.
+- **A volume that is not mounted.** Granting `/Volumes/Work/project` with the
+  drive unplugged creates that path on the *boot disk*. It then shadows the
+  mount point, so when the real volume is plugged in macOS mounts it as
+  `/Volumes/Work 1`. The agent's data and yours end up in two places with
+  confusingly similar names, and nothing reported an error at any point.
+
+**The refusal is about the grant, not about your path**, and says so at
+length on purpose. An agent told "no such file or directory" for
+`/d0/sub/file.txt` concludes it got the path wrong and tries again -- and
+nothing it can do from the client side will ever make the operator's grant
+exist. It is told the granted directory is missing, that retrying will not
+help, and that an operator has to fix it, so that it stops and surfaces the
+problem instead of looping.
+
+**It is not flagged as a scope violation.** `_meta.scope_violation` means
+"the client addressed something outside its scope", and here the client did
+not: the path was inside the grant, and the grant is what points at nothing.
+This is an operator configuration error and it comes back as an ordinary tool
+error, so that the audit log's one containment signal keeps meaning only
+containment. The trade-off is real -- an operator currently sees a generic
+`tool_error` rather than "your grant points at nothing" -- and the fix for
+that belongs in relay, as a signal of its own, not in borrowing this one.
+
+A grant that resolves to a regular file, or to a dangling symlink, is the
+same mistake and gets the same refusal. A grant that is a symlink to a real
+directory is an ordinary configuration and keeps working. With nested
+grants, one existing granted root anywhere above the path is enough: the
+create stops there, and everything it made is still inside something you
+granted.
+
+`fs_edit` and `fs_move` were checked for the same shape and do not have it --
+neither creates directories (`fs_edit` requires the file to exist,
+`renameSync` never creates parents), so against a missing grant they create
+nothing. They do still answer `file not found` / `source not found`, which is
+the retry-inducing message this rule exists to avoid; that is a wording
+defect, not a containment one.
+
 Writing *inside* the root is unaffected, including when the grant's parent
 directory is not writable at all.
 
