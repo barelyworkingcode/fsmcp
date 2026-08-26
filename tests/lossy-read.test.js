@@ -437,6 +437,44 @@ test('fs_edit refuses a non-UTF-8 file rather than rewriting it as (corrupted) U
   assert.deepEqual(fs.readFileSync(file), original, 'a refused edit must leave the file byte-identical');
 });
 
+/**
+ * `decodeUtf8Strict` (encoding.ts) is `fs_edit`'s read step. `TextDecoder`'s
+ * DEFAULT behaviour strips a leading byte-order-mark (EF BB BF) from the
+ * decoded string, treating it as metadata rather than content -- so a file
+ * starting with a BOM, edited anywhere else in its content, came back
+ * missing its BOM: three bytes gone with nothing in old_string/new_string
+ * asking for that. Same shape as issue #11 (decode loses information that
+ * the write step then can't put back), on a target issue #11's own fix
+ * never covered, because a BOM does not fail strict UTF-8 decoding -- it
+ * decodes just fine, to the WRONG string.
+ */
+test('fs_edit preserves a file\'s byte-order mark across an unrelated edit', async (t) => {
+  const root = mkTmpDir('fsmcp-lossy-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = spawnServer(['--allowed-dir', root]);
+  t.after(() => server.close());
+
+  const file = path.join(root, 'bom.txt');
+  const before = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('HELLO world', 'utf-8')]);
+  fs.writeFileSync(file, before);
+
+  const r = await server.callTool('fs_edit', {
+    file_path: toVirtual(file, root),
+    old_string: 'world',
+    new_string: 'there',
+  });
+  assert.equal(r.isError, undefined, `edit must succeed: ${allText(r)}`);
+
+  const after = fs.readFileSync(file);
+  const expected = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('HELLO there', 'utf-8')]);
+  assert.deepEqual(
+    after,
+    expected,
+    'the BOM must survive an edit that never touched it -- an edit changes only the bytes it ' +
+      'was asked to change'
+  );
+});
+
 test("fs_grep's Node fallback agrees with fs_read about what it declines to decode: a non-UTF-8 file is skipped, not lossily searched", async (t) => {
   const root = mkTmpDir('fsmcp-lossy-grep-');
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
