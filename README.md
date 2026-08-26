@@ -7,17 +7,10 @@ MCP server providing file system tools via stdio. Gives LLMs the ability to read
 ### File System
 | Tool | Read-only | Description |
 |------|-----------|-------------|
-<<<<<<< HEAD
-| `fs_read` | yes | Read a file: a line-numbered UTF-8 text view (default), or exact bytes as base64 |
+| `fs_read` | yes | Read a file: a line-numbered UTF-8 text page (default), or exact bytes as base64 (whole file up to 256KiB, or a byte window of any file) |
 | `fs_glob` | yes | Find files by glob pattern (relative patterns only -- see "A pattern is a pattern, not an address") |
-| `fs_grep` | yes | Search file contents with regex |
-| `fs_list` | yes | List one directory's immediate contents (non-recursive): type, size, mtime, name -- one escaped line per entry (see "`fs_list`'s line format" below) |
-=======
-| `fs_read` | yes | Read a file: a line-numbered UTF-8 text page (default), or exact bytes as base64 (whole file up to 256KiB, or a `byte_offset`/`byte_length` window of any file) |
-| `fs_glob` | yes | Find files by glob pattern |
 | `fs_grep` | yes | Search file contents with regex (bounded result: at most 1000 lines / 1MiB, and it says when it is bounded) |
-| `fs_list` | yes | List one directory's immediate contents (non-recursive): name, type, size, mtime |
->>>>>>> fix-19-response-limit
+| `fs_list` | yes | List one directory's immediate contents (non-recursive): type, size, mtime, name -- one escaped line per entry |
 | `fs_find` | yes | Fast fuzzy filename search (`rg --files` + in-process fuzzy ranking) |
 | `fs_write` | no | Write or create files (UTF-8 text or exact bytes via base64) |
 | `fs_edit` | no | Find-and-replace string editing (literal, UTF-8 text only) |
@@ -221,11 +214,9 @@ during the write is roughly the old file's size plus the new one's, so a
 volume sized with no headroom to spare for its largest file can start
 seeing `ENOSPC` on writes that used to fit.
 
-<<<<<<< HEAD
 That temp file is what makes the grant root itself an invalid target for a
 write -- see "The grant root is not a writable target" below.
 
-=======
 ## Response Limits: fsMCP Bounds the Message, Not the File
 
 Every result fsMCP returns is one line of JSON on stdout, and a host that
@@ -342,7 +333,6 @@ MCP that also runs under other hosts with their own framing rules or none.
 What it does instead is pick a default an order of magnitude under the
 smallest cap it is known to run behind, and write the relationship down --
 here, and in `src/limits.ts`.
->>>>>>> fix-19-response-limit
 
 ## Virtual Path Space
 
@@ -776,6 +766,25 @@ which is the thing this whole section exists to rule out. The composition that
 does work is spelled out in the message, and every step of it is audited on
 its own.
 
+### Neither end of a move may be a granted root
+
+`fs_move` refuses a `source` or a `destination` that resolves to one of the
+granted directories itself, in any spelling (`/d0`, `/d0/`, `/d0/.`,
+`/d0/notes/..`, or a symlink inside the grant that points at the grant).
+
+The two ends are refused for different reasons. A **destination** that is a root
+would have `fs_move` create a name at the sandbox root -- the same rule
+`fs_write` and `fs_mkdir` follow, and a scope violation. A **source** that is a
+root would move the granted folder out of existence, which is the rule
+`fs_delete` already enforces: the sandbox must survive its occupant. An agent
+may do as it likes inside the granted folder; the folder itself is the
+operator's boundary object, not the agent's to remove.
+
+Only the destination case is flagged `scope_violation` in the audit. Moving the
+root away never reaches outside the grant, so calling it a scope violation would
+put a boundary-object mistake in the same column an operator uses to spot a real
+containment event.
+
 ### A pattern is a pattern, not an address
 
 `fs_glob`'s `pattern` describes **names underneath** the directory being
@@ -858,25 +867,6 @@ are still not followed, and every hit is still checked against the grant
 before the client sees it. A symlink inside a symlinked root, pointing out of
 it, is refused exactly as it is anywhere else.
 
-
-### Neither end of a move may be a granted root
-
-`fs_move` refuses a `source` or a `destination` that resolves to one of the
-granted directories itself, in any spelling (`/d0`, `/d0/`, `/d0/.`,
-`/d0/notes/..`, or a symlink inside the grant that points at the grant).
-
-The two ends are refused for different reasons. A **destination** that is a root
-would have `fs_move` create a name at the sandbox root -- the same rule
-`fs_write` and `fs_mkdir` follow, and a scope violation. A **source** that is a
-root would move the granted folder out of existence, which is the rule
-`fs_delete` already enforces: the sandbox must survive its occupant. An agent
-may do as it likes inside the granted folder; the folder itself is the
-operator's boundary object, not the agent's to remove.
-
-Only the destination case is flagged `scope_violation` in the audit. Moving the
-root away never reaches outside the grant, so calling it a scope violation would
-put a boundary-object mistake in the same column an operator uses to spot a real
-containment event.
 
 ## Configuration
 
