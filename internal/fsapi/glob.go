@@ -14,7 +14,7 @@ import (
 // entirely on main.go's line-length backstop.
 const globMaxPaths = 1000
 
-const globDescription = `List files under the root whose relative path matches a glob pattern, via "rg --files -g <pattern>". The pattern must be relative to the root (or to "path", when given): an absolute pattern, or one containing a ".." component — including inside a brace alternative like "{/etc,sub}/*" — is refused.`
+const globDescription = `List files under the root whose relative path matches a glob pattern, via "rg --files -g <pattern>" (gitignore-style glob: a pattern without "/" matches a file name at any depth). Returns files only, never directories, as paths relative to the root. Hidden files and files a .gitignore would exclude are included. At most 1000 paths are returned; more sets "truncated": true, so narrow the pattern or "path". The pattern must be relative to the root (or to "path", when given): an absolute pattern, or one containing a ".." component — including inside a brace alternative like "{/etc,sub}/*" — is refused.`
 
 var globInputSchema = json.RawMessage(`{
 	"type":"object",

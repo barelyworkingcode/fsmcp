@@ -9,7 +9,7 @@ import (
 	"fsmcp/internal/proto"
 )
 
-const mkdirDescription = `Create a directory within the root, recursively, creating any missing parent directories.`
+const mkdirDescription = `Create a directory within the root, recursively, creating any missing parent directories. Succeeds without change when the directory already exists, and returns "created", the directories this call actually made, in creation order (empty when none). Fails with not_a_dir when a component of the path exists as a file or symlink.`
 
 var mkdirInputSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Path relative to the root."}},"required":["path"],"additionalProperties":false}`)
 

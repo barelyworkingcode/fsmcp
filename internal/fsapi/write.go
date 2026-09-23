@@ -18,7 +18,9 @@ var (
 const writeDescription = `Write content to a file within the root, replacing it atomically. ` +
 	`"if_sha256" is required: a 64-character lowercase hex sha256 the file must currently hash to, ` +
 	`or null to require that the file does not yet exist (this is how you create one). There is no ` +
-	`default, so this cannot be called without stating what you expect to be overwriting.`
+	`default, so this cannot be called without stating what you expect to be overwriting. The parent ` +
+	`directory must already exist (create it with fs_mkdir); a missing parent fails with not_found. ` +
+	`Returns the written file's sha256 and byte count, usable as the next call's if_sha256.`
 
 var writeInputSchema = json.RawMessage(`{
   "type": "object",
