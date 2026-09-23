@@ -8,7 +8,7 @@ import (
 	"fsmcp/internal/proto"
 )
 
-const listDescription = `List the direct contents of one directory within the root — non-recursive. Never hashes; use fs_stat for a file's sha256. name is a bare filename, never a path. A symlink entry reports size 0 for the reason fs_stat does: Lstat's size for a symlink is the byte length of its target path, a host detail the caller is not allowed to learn.`
+const listDescription = `List the direct contents of one directory within the root — non-recursive. Never hashes; use fs_stat for a file's sha256. name is a bare filename, never a path. A symlink entry reports size 0 for the reason fs_stat does: Lstat's size for a symlink is the byte length of its target path, a host detail the caller is not allowed to learn. Entries are sorted by name and include dotfiles. There is no paging: when the listing would exceed the response budget, it stops early and reports "truncated": true; narrow it with fs_glob instead.`
 
 var listInputSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Path relative to the root. \".\" or \"\" names the root itself."}},"required":["path"],"additionalProperties":false}`)
 

@@ -11,7 +11,7 @@ import (
 // grepDefaultMaxMatches is used when the caller omits max_matches.
 const grepDefaultMaxMatches = 200
 
-const grepDescription = `Search file contents under the root for a regex pattern, via "rg --json". "glob" optionally restricts which files are searched and follows the same rules as fs_glob's pattern: relative only, no ".." component. Matched text is returned exactly as rg reports it, byte for byte. max_matches (default 200) bounds the result; a search cut short by it reports "truncated": true.`
+const grepDescription = `Search file contents under the root for a regex pattern, via "rg --json". "glob" optionally restricts which files are searched and follows the same rules as fs_glob's pattern: relative only, no ".." component. The pattern is Rust regex syntax, matched line by line and case-sensitive. Hidden files and files a .gitignore would exclude are searched. Each match returns its root-relative path, 1-based line number, and the whole matching line exactly as rg reports it, byte for byte, including the trailing newline. max_matches (default 200) bounds the result; a search cut short by it reports "truncated": true. A search that runs past 30 seconds is stopped and reported as an error.`
 
 var grepInputSchema = json.RawMessage(`{
 	"type":"object",

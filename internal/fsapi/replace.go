@@ -14,9 +14,11 @@ import (
 const replaceDescription = `Apply one or more byte-level find/replace edits to a file within the root, atomically. ` +
 	`Operates on raw bytes, not runes or lines — it can edit a file that is not valid UTF-8. Each edit's ` +
 	`"find" must occur in the file: zero matches refuses, and more than one match refuses unless "all" is ` +
-	`true. The whole batch is all-or-nothing: if any edit fails, nothing is written. "if_sha256" is ` +
-	`required: a 64-character lowercase hex sha256 the file must currently hash to, or null to require ` +
-	`that the file does not yet exist.`
+	`true. Edits apply in order, each to the output of the previous one; an edit whose find equals its ` +
+	`replace is refused. The whole batch is all-or-nothing: if any edit fails, nothing is written. ` +
+	`"if_sha256" is required: the 64-character lowercase hex sha256 the file must currently hash to ` +
+	`(fs_stat or a whole-file fs_read returns it). fs_replace only edits an existing file; to create ` +
+	`one, use fs_write with if_sha256 null. Returns the new sha256, byte count, and per-edit match counts.`
 
 var replaceInputSchema = json.RawMessage(`{
   "type": "object",
