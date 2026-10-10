@@ -717,10 +717,10 @@ func plantForeignOwnedFile(t *testing.T, rootDir, name string, content []byte) {
 		t.Skip("needs passwordless sudo to plant a file owned by another user")
 	}
 	p := filepath.Join(rootDir, name)
-	if err := os.WriteFile(p, content, 0o664); err != nil {
+	if err := os.WriteFile(p, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(p, 0o664); err != nil {
+	if err := os.Chmod(p, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("sudo", "-n", "chown", "0:0", p).CombinedOutput(); err != nil {

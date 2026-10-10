@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -211,6 +212,15 @@ func TestWriteRefusesUnwritableTarget(t *testing.T) {
 			}
 			if err := os.Chmod(p, 0o444); err != nil {
 				t.Fatal(err)
+			}
+		}},
+		{"ACL entry denies write", func(t *testing.T, rootDir string) {
+			p := filepath.Join(rootDir, "locked.txt")
+			if err := os.WriteFile(p, []byte("original"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("/bin/chmod", "+a", "everyone deny write", p).CombinedOutput(); err != nil {
+				t.Fatalf("chmod +a: %v: %s", err, out)
 			}
 		}},
 	}

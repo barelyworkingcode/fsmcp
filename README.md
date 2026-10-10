@@ -123,7 +123,8 @@ is what makes editing a large file possible without transferring it.
 `fs_write` and `fs_replace` commit through a temp file in the same directory
 followed by `rename`. Mode, extended attributes and ACL are preserved exactly;
 `umask` does not eat mode bits. If they cannot be preserved, the write is
-refused and the file left unchanged.
+refused and the file left unchanged. A file the server's user **cannot write**
+(mode, owner or ACL) is refused and left unchanged, as a plain write would be.
 
 Three consequences, all deliberate:
 
@@ -132,8 +133,6 @@ Three consequences, all deliberate:
 - A file whose ACL **denies delete** cannot be written. That entry exists to
   stop the inode being replaced, so stripping it to force the write through
   would defeat the protection it enforces. The refusal says so.
-- A file the server's user **cannot write** (mode, owner or ACL) is refused
-  and left unchanged, as a plain write would be.
 - A replaced file is **owned by the server's user**. A writable file owned by
   someone else changes owner, because the replace creates a new inode.
 
