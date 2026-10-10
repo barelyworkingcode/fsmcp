@@ -383,6 +383,17 @@ write is refused with the flag named.
 This is review issue #20; prove it with a test that asserts `ls -le` and
 `xattr -l` output is identical before and after.
 
+A target the server's user cannot write is refused before any temp file exists.
+`rename(2)` consults only the directory, so the check opens the target for
+writing and so gets the answer a plain write would get (mode, owner, ACL). It
+is not a security boundary: a change between the check and the rename is a
+non-goal.
+
+**Ownership is not preserved.** A rename-based replace creates a new inode, so a
+replaced file comes back owned by the server's user. A writable file owned by
+someone else changes owner. This is a stated non-guarantee, alongside the
+hard-link break.
+
 Clean up the temp file on every failure path.
 
 ## Integrity across the hop: `_meta.args_sha256`

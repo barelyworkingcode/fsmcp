@@ -33,6 +33,11 @@ var errAttrsUnpreservable = errors.New("attributes could not be preserved")
 // inode, not the bytes — but fsMCP commits through a rename, which it forbids.
 var errTargetUndeletable = errors.New("target cannot be replaced")
 
+// errTargetNotWritable marks a replace refused because the target's mode,
+// owner or ACL denies the server's user write access. rename(2) never asks
+// that question, so without the refusal a read-only file would be replaced.
+var errTargetNotWritable = errors.New("target is not writable")
+
 // errTargetFlagged marks a replace refused because the target carries a BSD
 // file flag that forbids being replaced. Kept distinct from
 // errTargetUndeletable even though rename(2) reports both as EPERM: the
@@ -87,6 +92,28 @@ func AtomicReplace(root *Root, targetPath string, data []byte) error {
 	}
 	if exists && !fi.Mode().IsRegular() {
 		return errNotRegularFile
+	}
+	if exists {
+		// Deliberate: rename(2) only consults the directory, so a file the
+		// server's user cannot write would be replaced anyway. Opening it for
+		// write asks the kernel the same question a plain write would (mode,
+		// owner, ACL). This is an expectation check, not a security boundary;
+		// a change between it and the rename is a non-goal.
+		f, err := root.OpenFile(targetPath, os.O_WRONLY, 0)
+		if err != nil {
+			switch {
+			case errors.Is(err, syscall.EACCES):
+				return errTargetNotWritable
+			case errors.Is(err, syscall.EPERM):
+				// A file flag (uchg, uappnd) refuses the open with EPERM, not
+				// EACCES. Leave it to the rename, whose EPERM is classified
+				// as a flag further down so the remedy named is chflags.
+			default:
+				return err
+			}
+		} else {
+			f.Close()
+		}
 	}
 
 	tmpPath, err := reserveTempName(root, dir, !exists)

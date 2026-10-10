@@ -103,7 +103,10 @@ func TestAtomicReplaceNoTempFileLeftAfterAttrFailure(t *testing.T) {
 	if err := os.WriteFile(target, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(target, 0o000); err != nil {
+	// Write-only, not 0o000: an unwritable target is refused before any
+	// temp file exists, so only a writable-but-unreadable one reaches the
+	// attribute copy this test is about.
+	if err := os.Chmod(target, 0o200); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(target, 0o644) })
@@ -699,5 +702,80 @@ func TestAtomicReplaceDoesNotPreserveFileFlags(t *testing.T) {
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Flags != 0 {
 		t.Errorf("st_flags = 0x%08x, want 0 — DESIGN.md states flags are NOT preserved", st.Flags)
+	}
+}
+
+// plantForeignOwnedFile creates name in rootDir as a 0664 file owned by uid 0,
+// a file the test's user can see but not write, inside a directory the user
+// can. It skips when the machine cannot give a file to another user.
+func plantForeignOwnedFile(t *testing.T, rootDir, name string, content []byte) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		t.Skip("needs a non-root test user to plant a file it cannot write")
+	}
+	if err := exec.Command("sudo", "-n", "true").Run(); err != nil {
+		t.Skip("needs passwordless sudo to plant a file owned by another user")
+	}
+	p := filepath.Join(rootDir, name)
+	if err := os.WriteFile(p, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sudo", "-n", "chown", "0:0", p).CombinedOutput(); err != nil {
+		t.Fatalf("sudo chown: %v: %s", err, out)
+	}
+	t.Cleanup(func() { exec.Command("sudo", "-n", "rm", "-f", p).Run() })
+}
+
+// diskState is what a refused replace must leave exactly as it found it.
+type diskState struct {
+	content string
+	uid     uint32
+	mode    os.FileMode
+}
+
+func snapshotDisk(t *testing.T, p string) diskState {
+	t.Helper()
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return diskState{content: string(b), uid: fi.Sys().(*syscall.Stat_t).Uid, mode: fi.Mode()}
+}
+
+// assertDiskUnchanged compares against before and checks no temp file remains.
+// Callers run it before checking the returned error, so a replace that went
+// through fails here first.
+func assertDiskUnchanged(t *testing.T, rootDir, name string, before diskState) {
+	t.Helper()
+	after := snapshotDisk(t, filepath.Join(rootDir, name))
+	if after.content != before.content {
+		t.Errorf("bytes changed: %q -> %q", before.content, after.content)
+	}
+	if after.uid != before.uid {
+		t.Errorf("owner uid changed: %d -> %d", before.uid, after.uid)
+	}
+	if after.mode != before.mode {
+		t.Errorf("mode changed: %v -> %v", before.mode, after.mode)
+	}
+	assertNoTempFiles(t, rootDir)
+}
+
+func TestAtomicReplaceRefusesTargetOwnedByAnotherUser(t *testing.T) {
+	root, rootDir := newTestRoot(t)
+	plantForeignOwnedFile(t, rootDir, "foreign.txt", []byte("original"))
+	before := snapshotDisk(t, filepath.Join(rootDir, "foreign.txt"))
+
+	err := AtomicReplace(root, "foreign.txt", []byte("replacement"))
+
+	assertDiskUnchanged(t, rootDir, "foreign.txt", before)
+	if !errors.Is(err, errTargetNotWritable) {
+		t.Errorf("AtomicReplace = %v, want errTargetNotWritable", err)
 	}
 }

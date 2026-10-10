@@ -324,3 +324,18 @@ func TestReplaceDirectoryTargetRefused(t *testing.T) {
 }
 
 func strptr(s string) *string { return &s }
+
+func TestReplaceRefusesTargetOwnedByAnotherUser(t *testing.T) {
+	root, rootDir := newTestRoot(t)
+	plantForeignOwnedFile(t, rootDir, "locked.txt", []byte("original"))
+	before := snapshotDisk(t, filepath.Join(rootDir, "locked.txt"))
+	edits := []editArg{{Find: "original", Replace: strptr("changed")}}
+
+	hash := sha256Hex(t, []byte("original"))
+	result := handleReplace(root, replaceArgsJSON(t, "locked.txt", &hash, edits))
+
+	assertDiskUnchanged(t, rootDir, "locked.txt", before)
+	if msg := errorMessage(t, result); !strings.Contains(msg, "not writable") {
+		t.Errorf("message does not name write permission: %q", msg)
+	}
+}

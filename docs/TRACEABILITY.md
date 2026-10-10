@@ -55,6 +55,8 @@ nothing covers it. Every row below is the state *after* this pass; the
 | C9 | file-flag target refused, naming chflags | `TestAtomicReplaceDistinguishesAFileFlagFromAnACL`, `TestWriteNamesTheRightRemedyForEachCause` | **missing** — only the ACL cause was planted, so both shared one diagnosis | covered |
 | C10 | file flags not preserved across a replace | `TestAtomicReplaceDoesNotPreserveFileFlags` | **missing** | covered |
 | C11 | precondition streamed, not read | `TestCheckPreconditionDoesNotAllocateTheWholeFile`, `TestCheckPrecondition` | **missing** | covered |
+| C12 | unwritable target refused, file unchanged, no temp left | `TestAtomicReplaceRefusesTargetOwnedByAnotherUser`, `TestWriteRefusesUnwritableTarget`, `TestReplaceRefusesTargetOwnedByAnotherUser` | **missing** | covered |
+| C13 | owner not preserved for a writable foreign-owned target | documented, no test | n/a | n/a |
 
 Hard-link-breaks-on-replace ("known and deliberate", not independently
 numbered) is pinned by `TestAtomicReplaceBreaksHardLink`.
