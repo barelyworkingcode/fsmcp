@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"fsmcp/internal/proto"
 )
 
 // writeArgsJSON builds fs_write arguments with an explicit if_sha256 shape,
@@ -174,5 +177,56 @@ func TestWriteResultSHA256MatchesContent(t *testing.T) {
 	want := sha256Hex(t, []byte("check my hash"))
 	if decoded["sha256"] != want {
 		t.Errorf("sha256 = %v, want %v", decoded["sha256"], want)
+	}
+}
+
+// errorMessage returns the message of an error result, failing the test if the
+// result is not an io_error.
+func errorMessage(t *testing.T, result *proto.CallToolResult) string {
+	t.Helper()
+	assertErrorCode(t, result, "io_error")
+	var decoded struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded.Error.Message
+}
+
+func TestWriteRefusesUnwritableTarget(t *testing.T) {
+	cases := []struct {
+		name  string
+		plant func(t *testing.T, rootDir string)
+	}{
+		{"owned by another user", func(t *testing.T, rootDir string) {
+			plantForeignOwnedFile(t, rootDir, "locked.txt", []byte("original"))
+		}},
+		{"read-only file the user owns", func(t *testing.T, rootDir string) {
+			p := filepath.Join(rootDir, "locked.txt")
+			if err := os.WriteFile(p, []byte("original"), 0o444); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(p, 0o444); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root, rootDir := newTestRoot(t)
+			tc.plant(t, rootDir)
+			before := snapshotDisk(t, filepath.Join(rootDir, "locked.txt"))
+
+			hash := sha256Hex(t, []byte("original"))
+			result := handleWrite(root, writeArgsJSON(t, "locked.txt", "replacement", "", &hash))
+
+			assertDiskUnchanged(t, rootDir, "locked.txt", before)
+			if msg := errorMessage(t, result); !strings.Contains(msg, "not writable") {
+				t.Errorf("message does not name write permission: %q", msg)
+			}
+		})
 	}
 }

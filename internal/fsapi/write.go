@@ -139,6 +139,8 @@ func mapAtomicReplaceError(err error, p string) *proto.CallToolResult {
 		return proto.NewErrorResult(proto.ErrNotAFile, "not a regular file", p)
 	case errors.Is(err, errAttrsUnpreservable):
 		return proto.NewErrorResult(proto.ErrIOError, "the file's mode, extended attributes or ACL could not be preserved; nothing was written", p)
+	case errors.Is(err, errTargetNotWritable):
+		return proto.NewErrorResult(proto.ErrIOError, "this file is not writable by the user fsMCP runs as (its mode, owner or an ACL entry denies write), so it was not replaced; nothing was changed. Granting write permission (chmod u+w, or adjusting the ACL) makes it writable through fsMCP", p)
 	case errors.Is(err, errTargetFlagged):
 		return proto.NewErrorResult(proto.ErrIOError, "this file carries a BSD file flag that forbids replacing it (uchg/schg immutable, or uappnd/sappnd append-only), and fsMCP replaces a file by renaming over it, so it cannot be written; nothing was changed. Clearing the flag with chflags makes it writable through fsMCP", p)
 	case errors.Is(err, errTargetUndeletable):

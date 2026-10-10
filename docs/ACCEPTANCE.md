@@ -80,6 +80,8 @@ from a self-move.
 | C9 | a target protected by a **file flag** (`uchg`/`uappnd`) | refused, file unchanged, and the refusal names `chflags` — never a deny-delete ACL entry the file does not have |
 | C10 | BSD file flags across a successful replace | **not preserved** — a stated non-guarantee, since `cp -pN`'s `-N` is what stops a copied `uchg` stranding fsMCP's own temp file |
 | C11 | `if_sha256` on a very large file | verified by streaming for `fs_write`/`fs_delete`; memory does not scale with the file |
+| C12 | a target the server's user cannot write (mode, owner or ACL) | refused naming "not writable", file unchanged, no temp file left |
+| C13 | owner of a writable target owned by another user | **not preserved** — the replacement is owned by the server's user; a stated non-guarantee of a rename-based replace |
 
 **Known and deliberate:** a replace breaks a hard link to the target (new
 inode). Assert it rather than fix it — the alternative is in-place truncation,
