@@ -711,10 +711,10 @@ func TestAtomicReplaceDoesNotPreserveFileFlags(t *testing.T) {
 func plantForeignOwnedFile(t *testing.T, rootDir, name string, content []byte) {
 	t.Helper()
 	if os.Getuid() == 0 {
-		t.Skip("needs a non-root test user to plant a file it cannot write")
+		t.Fatal("CI PROBE: running as root")
 	}
 	if err := exec.Command("sudo", "-n", "true").Run(); err != nil {
-		t.Skip("needs passwordless sudo to plant a file owned by another user")
+		t.Fatal("CI PROBE: no passwordless sudo")
 	}
 	p := filepath.Join(rootDir, name)
 	if err := os.WriteFile(p, content, 0o644); err != nil {
